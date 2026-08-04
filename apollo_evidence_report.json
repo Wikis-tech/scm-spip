@@ -1,0 +1,48 @@
+{
+  "timestamp": "2026-08-01T14:28:52.875Z",
+  "requestUrl": "POST https://api.apollo.io/api/v1/mixed_people/api_search",
+  "requestPayload": {
+    "q_organization_domains": [
+      "mtn.ng"
+    ]
+  },
+  "responseMetadata": {
+    "status": 200,
+    "statusText": "OK",
+    "latencyMs": 706,
+    "headers": {
+      "cache-control": "max-age=0, private, must-revalidate",
+      "cf-cache-status": "DYNAMIC",
+      "cf-ray": "a2458822791feb4f-CDG",
+      "connection": "keep-alive",
+      "content-length": "31",
+      "content-security-policy": "frame-ancestors 'self' chrome-extension://alhgpfoeiimagjlnfekdhkjlkiomcapa chrome-extension://ececkagaccnfmkopaiemklekhoimmgpn *.salesforce.com *.lightning.force.com; report-uri https://o101058.ingest.us.sentry.io/api/222018/security/?sentry_key=86bb17dd8c2449719dd6b498f3431191&sentry_environment=production&sentry_release=08e787aab8da5816697888909f84aa17a1bac497",
+      "content-type": "application/json; charset=utf-8",
+      "date": "Sat, 01 Aug 2026 14:28:52 GMT",
+      "etag": "W/\"7e9f20f60ca1b3e2bc4fe20e5ab28447\"",
+      "server": "cloudflare",
+      "set-cookie": "__cf_bm=pIKAhlf4A.HvVyfbh_lfrRZwt2aHcDD9IMuC9gelWtw-1785594532.2325017-1.0.1.1-fkdS1zhXFrRhEkPZqeCWgj7K29ac2FdMdOXl4vGapMc4uKEYICDmz8wOV2DTiG2YI1EuSBR07m6JL5wSKM0Nwz4FkjWLcL_yE_OChOPUNfJYAtM3sLjNeiibgslM.MgP; HttpOnly; SameSite=None; Secure; Path=/; Domain=apollo.io; Expires=Sat, 01 Aug 2026 14:58:52 GMT",
+      "strict-transport-security": "max-age=31536000",
+      "vary": "Origin",
+      "x-24-hour-requests-left": "599",
+      "x-24-hour-usage": "1",
+      "x-content-type-options": "nosniff",
+      "x-frame-options": "ALLOWALL",
+      "x-hourly-requests-left": "199",
+      "x-hourly-usage": "1",
+      "x-http-request-id": "-7881551756796616254",
+      "x-minute-requests-left": "49",
+      "x-minute-usage": "1",
+      "x-rate-limit-24-hour": "600",
+      "x-rate-limit-hourly": "200",
+      "x-rate-limit-minute": "50",
+      "x-request-id": "a5438307-e301-4555-875a-ad41d93b711b",
+      "x-runtime": "0.312861",
+      "x-transaction-id": "6f889e28-74a3-4712-aa7d-ba5bb8908d4b"
+    },
+    "total_entries": 0,
+    "total_pages": 0,
+    "peopleLength": 0
+  },
+  "first5Records": []
+}

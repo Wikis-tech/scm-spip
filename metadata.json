@@ -1,0 +1,6 @@
+{
+  "name": "SCM Prospect Intelligence Platform",
+  "description": "An institutional CRM and corporate prospect intelligence platform tailored for SCM Capital's Business Development and Asset Management teams.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
