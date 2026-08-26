@@ -9,6 +9,7 @@ import {
 } from "./types";
 import { providerRegistry } from "./providers/providerRegistry";
 import { calculateProductRecommendations } from "../../utils/recommendationEngine";
+import { discoveryApolloProvider } from "../apollo/discoveryApolloProvider.ts";
 
 export interface DBClientContext {
   db: any;
@@ -16,8 +17,10 @@ export interface DBClientContext {
   discoveredLeadsTable: any;
   discoveryQueuesTable: any;
   prospectsTable: any;
+  apolloEnrichmentCacheTable?: any;
   eqFn: any;
   inArrayFn?: any;
+  orFn?: any;
   dbDiscoveredLeadsFallback: any[];
   dbProspectsFallback: any[];
 }
@@ -354,8 +357,16 @@ export class DiscoveryQueueEngine {
       resultBatch.push(leadOutput);
     }
 
+    // 9. Enrich selected candidates via DiscoveryApolloProvider (Cache-first with local fallback)
+    let finalEnrichedBatch = resultBatch;
+    try {
+      finalEnrichedBatch = await discoveryApolloProvider.enrichLeadsBatch(resultBatch, ctx);
+    } catch (enrichErr: any) {
+      console.warn("[SCM QUEUE ENGINE] Non-critical Apollo enrichment warning, returning local catalog batch:", enrichErr?.message || enrichErr);
+    }
+
     return {
-      batch: resultBatch,
+      batch: finalEnrichedBatch,
       totalEvaluated,
       queueCycleReset
     };

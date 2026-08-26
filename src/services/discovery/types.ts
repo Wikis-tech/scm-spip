@@ -58,6 +58,10 @@ export interface DiscoveredLeadOutput {
   revenueRange: string;
   createdAt: string;
   existingProspect?: any;
+  enrichmentStatus?: "Enriched" | "Unavailable" | "Pending";
+  lastSyncedAt?: string;
+  apolloOrgId?: string;
+  linkedinUrl?: string;
 }
 
 export interface OfficerQueueState {

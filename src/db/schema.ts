@@ -362,6 +362,24 @@ export const pushSubscriptions = pgTable('push_subscriptions', {
   createdAt: timestamp('created_at').defaultNow(),
 });
 
+export const apolloEnrichmentCache = pgTable('apollo_enrichment_cache', {
+  apolloOrgId: text('apollo_org_id').primaryKey(),
+  companyName: text('company_name').notNull(),
+  domain: text('domain'),
+  website: text('website'),
+  industry: text('industry'),
+  employeeCount: text('employee_count'),
+  revenueEstimate: text('revenue_estimate'),
+  headquarters: text('headquarters'),
+  linkedinUrl: text('linkedin_url'),
+  executivesJson: jsonb('executives_json').default([]),
+  rawApolloData: jsonb('raw_apollo_data').default({}),
+  cacheStatus: text('cache_status').notNull().default('Active'),
+  lastSyncedAt: text('last_synced_at').notNull(),
+  createdAt: text('created_at').notNull(),
+});
+
+
 
 
 

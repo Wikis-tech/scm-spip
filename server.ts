@@ -5,7 +5,7 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import { db, createPool } from "./src/db/index.ts";
-import { users, prospects, contacts, activities, meetings, tasks, newsArticles, discoveredLeads, discoverySessions, discoveryQueues, auditLogs, reminders, savedSessions, serenaAuditLogs, systemAuditLogs, weeklyReports, workspaces, workspaceNotes, workspaceProposals, workspacePresentations, workspaceAiConversations, workspaceSearchHistory, aiSearchHistory, notifications, pushSubscriptions } from "./src/db/schema.ts";
+import { users, prospects, contacts, activities, meetings, tasks, newsArticles, discoveredLeads, discoverySessions, discoveryQueues, apolloEnrichmentCache, auditLogs, reminders, savedSessions, serenaAuditLogs, systemAuditLogs, weeklyReports, workspaces, workspaceNotes, workspaceProposals, workspacePresentations, workspaceAiConversations, workspaceSearchHistory, aiSearchHistory, notifications, pushSubscriptions } from "./src/db/schema.ts";
 import { eq, and, desc, asc, sql, inArray, or } from "drizzle-orm";
 import { 
   sendVerificationEmail, 
@@ -5415,8 +5415,10 @@ app.post("/api/discovery/scan", async (req, res) => {
       discoveredLeadsTable: discoveredLeads,
       discoveryQueuesTable: discoveryQueues,
       prospectsTable: prospects,
+      apolloEnrichmentCacheTable: apolloEnrichmentCache,
       eqFn: eq,
       inArrayFn: inArray,
+      orFn: or,
       dbDiscoveredLeadsFallback: dbDiscoveredLeads,
       dbProspectsFallback: dbProspects
     };
@@ -5468,7 +5470,11 @@ app.post("/api/discovery/scan", async (req, res) => {
         latestNews: lead.latestNews,
         source: lead.source,
         revenueRange: lead.revenueRange,
-        createdAt: lead.createdAt
+        createdAt: lead.createdAt,
+        enrichmentStatus: lead.enrichmentStatus || "Unavailable",
+        lastSyncedAt: lead.lastSyncedAt || new Date().toISOString(),
+        apolloOrgId: lead.apolloOrgId || null,
+        linkedinUrl: lead.linkedinUrl || "Unavailable"
       };
 
       if (isDatabaseHealthy) {
@@ -5588,8 +5594,10 @@ app.delete("/api/discovery/lead/:id", async (req, res) => {
       discoveredLeadsTable: discoveredLeads,
       discoveryQueuesTable: discoveryQueues,
       prospectsTable: prospects,
+      apolloEnrichmentCacheTable: apolloEnrichmentCache,
       eqFn: eq,
       inArrayFn: inArray,
+      orFn: or,
       dbDiscoveredLeadsFallback: dbDiscoveredLeads,
       dbProspectsFallback: dbProspects
     };

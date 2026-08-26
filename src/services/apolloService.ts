@@ -3,6 +3,7 @@
 
 import fs from "fs";
 import path from "path";
+import { apolloClient } from "./apollo/apolloClient.ts";
 
 export interface ApolloCompany {
   id: string;
@@ -183,94 +184,27 @@ function getApolloApiKey(): string {
 
 async function apolloFetch(url: string, method: string, body: any): Promise<{ status: number; ok: boolean; data: any; statusText: string }> {
   const start = Date.now();
-  const apolloApiKey = getApolloApiKey();
-  
-  let targetUrl = url;
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    "Cache-Control": "no-cache"
-  };
-  
-  if (apolloApiKey) {
-    headers["X-Api-Key"] = apolloApiKey;
-  }
-  
-  const safeBody = { ...body };
+  getApolloApiKey(); // Sync diagnostics
 
-  const fetchOptions: any = {
-    method,
-    headers
-  };
+  const res = await apolloClient.request(url, method as "GET" | "POST", body);
 
-  if (method === "GET") {
-    const params = new URLSearchParams();
-    if (body) {
-      Object.keys(body).forEach(k => {
-        if (body[k] !== undefined && body[k] !== null) {
-          params.append(k, String(body[k]));
-        }
-      });
-    }
-    const queryStr = params.toString();
-    if (queryStr) {
-      targetUrl = `${url}?${queryStr}`;
-    }
-    apolloDiagnostics.lastPayload = `Query Parameters: ${params.toString()}`;
+  const responseTime = res.latencyMs;
+  apolloDiagnostics.lastResponseTimeMs = responseTime;
+  apolloDiagnostics.apolloStatusCode = res.status;
+  apolloDiagnostics.lastEndpointCalled = `${method} ${url}`;
+
+  if (res.error) {
+    apolloDiagnostics.lastError = res.error;
   } else {
-    // POST request
-    apolloDiagnostics.lastPayload = JSON.stringify(safeBody, null, 2);
-    fetchOptions.body = JSON.stringify(body);
+    apolloDiagnostics.lastError = null;
   }
 
-  apolloDiagnostics.lastEndpointCalled = `${method} ${targetUrl}`;
-  console.log(`[APOLLO AUDIT] Outbound Request: ${method} ${targetUrl}`);
-  console.log(`[APOLLO AUDIT] Request Headers: ${JSON.stringify(Object.keys(headers))}`);
-  console.log(`[APOLLO AUDIT] Request Payload Preview:`, method === "GET" ? apolloDiagnostics.lastPayload : JSON.stringify(safeBody, null, 2));
-
-  try {
-    const response = await fetch(targetUrl, fetchOptions);
-    
-    const responseTime = Date.now() - start;
-    apolloDiagnostics.lastResponseTimeMs = responseTime;
-    apolloDiagnostics.apolloStatusCode = response.status;
-    
-    console.log(`[APOLLO AUDIT] Response Status: ${response.status} ${response.statusText}`);
-    console.log(`[APOLLO AUDIT] Response Latency: ${responseTime}ms`);
-
-    const text = await response.text();
-    apolloDiagnostics.lastResponseBodyPreview = text.substring(0, 1000);
-    
-    let data: any = null;
-    try {
-      data = JSON.parse(text);
-    } catch (e) {
-      console.warn(`[APOLLO AUDIT] Response was not JSON format.`);
-    }
-
-    if (!response.ok) {
-      const errMsg = `API Error Details: ${text.substring(0, 300)}`;
-      apolloDiagnostics.lastError = `Status ${response.status}: ${response.statusText}`;
-      console.error(`[APOLLO AUDIT] Response Error Body:`, errMsg);
-    } else {
-      apolloDiagnostics.lastError = null;
-    }
-    
-    return {
-      status: response.status,
-      ok: response.ok,
-      data,
-      statusText: response.statusText
-    };
-  } catch (err: any) {
-    const responseTime = Date.now() - start;
-    apolloDiagnostics.lastResponseTimeMs = responseTime;
-    apolloDiagnostics.apolloStatusCode = 500;
-    const errString = err.message || String(err);
-    apolloDiagnostics.lastError = `Network/Exception: ${errString}`;
-    apolloDiagnostics.lastResponseBodyPreview = `Exception: ${errString}`;
-    console.error("[APOLLO FETCH EXCEPTIONAL]", err);
-    throw err;
-  }
+  return {
+    status: res.status,
+    ok: res.ok,
+    data: res.data,
+    statusText: res.statusText,
+  };
 }
 
 /**
