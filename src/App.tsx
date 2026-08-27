@@ -151,13 +151,7 @@ export default function App() {
   const [isLoading, setIsLoading] = useState<boolean>(true);
 
   const scmFetch = (url: string, options: RequestInit = {}) => {
-    const headers = {
-      ...(options.headers || {}),
-      'x-user-id': currentUser?.id || '',
-      'x-user-role': currentUser?.role || '',
-      'x-user-email': currentUser?.email || ''
-    };
-    return fetch(url, { ...options, headers });
+    return fetch(url, options);
   };
 
   // Load all SCM records from full-stack API
@@ -315,9 +309,6 @@ export default function App() {
         method: 'PATCH',
         headers: { 
           'Content-Type': 'application/json',
-          'x-user-id': currentUser?.id || '',
-          'x-user-role': currentUser?.role || '',
-          'x-user-email': currentUser?.email || ''
         },
         body: JSON.stringify(updates)
       });
@@ -338,9 +329,6 @@ export default function App() {
       const res = await scmFetch(`/api/prospects/${id}`, { 
         method: 'DELETE',
         headers: {
-          'x-user-id': currentUser?.id || '',
-          'x-user-role': currentUser?.role || '',
-          'x-user-email': currentUser?.email || ''
         }
       });
       const data = await res.json().catch(() => ({}));
@@ -849,9 +837,15 @@ export default function App() {
     }
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem('scm_auth_user');
-    setCurrentUser(null);
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch (error) {
+      console.warn('[SPIP AUTH] Server logout request failed; clearing the local session.', error);
+    } finally {
+      localStorage.removeItem('scm_auth_user');
+      setCurrentUser(null);
+    }
   };
 
   const handleToggleSidebar = () => {
