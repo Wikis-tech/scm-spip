@@ -20,12 +20,15 @@ jobs:
         with:
           node-version: 22
       - name: Apply Phase 1/2 runtime patch
-        run: node scripts/stabilize-phase1-phase2.mjs
+        run: |
+          node scripts/stabilize-phase1-phase2.mjs
+          node scripts/fix-phase12-types.mjs
       - name: Install dependencies
         run: npm install --no-package-lock
       - name: Runtime assertions
         run: |
           grep -q "app.get('/api/admin/executive-dashboard-summary'" src/server/phase2Routes.ts
+          grep -q "Promise<any\[\]>" src/server/phase2Routes.ts
           grep -q "Executive Summary Unavailable" src/pages/ExecutiveSummary.tsx
           grep -q "headers.set('Authorization'" src/main.tsx
           grep -q "registerPhase2Routes(app, supabaseServer)" server.ts
