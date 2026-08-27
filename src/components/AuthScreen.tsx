@@ -142,29 +142,33 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess }) => {
 
     setIsLoading(true);
     setErrorMsg('');
+    setInfoMsg('');
     try {
-      const response = await fetch('/api/auth/register-v2', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          fullName: fullName.trim(),
-          email: normalizedEmail,
-          password,
-          department: department.trim() || 'Asset Management',
-          jobTitle: jobTitle.trim() || '',
-        }),
+      // Use Supabase's public signup flow so the corporate mailbox remains part of the
+      // trust boundary. A second PENDING approval gate still blocks platform access.
+      const { data, error } = await supabase.auth.signUp({
+        email: normalizedEmail,
+        password,
+        options: {
+          emailRedirectTo: window.location.origin,
+          data: {
+            full_name: fullName.trim().slice(0, 150),
+            department: (department.trim() || 'Asset Management').slice(0, 120),
+            job_title: jobTitle.trim().slice(0, 120) || null,
+          },
+        },
       });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        const message = payload?.error || payload?.message || 'Unable to submit your access request. Please try again.';
-        throw new Error(friendlyAuthError(String(message)));
-      }
+
+      if (error) throw new Error(friendlyAuthError(error.message));
+      if (!data.user) throw new Error('Unable to submit your access request. Please try again.');
+
+      await supabase.auth.signOut();
       setPassword('');
       setConfirmPassword('');
       setFullName('');
       setJobTitle('');
       setMode('login');
-      setInfoMsg(payload?.message || 'Access request submitted. Wait for SPIP administrator approval before signing in.');
+      setInfoMsg('Access request submitted. Confirm your SCM corporate email if prompted, then wait for administrator approval.');
     } catch (error: any) {
       const message = error?.message || 'Unable to submit your access request. Please try again.';
       setErrorMsg(friendlyAuthError(String(message)));

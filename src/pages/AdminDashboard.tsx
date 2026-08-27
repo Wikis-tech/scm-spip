@@ -438,7 +438,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
   };
 
   return (
-    <div className="space-y-6 select-none font-sans" id="scm-admin-panel">
+    <div className="space-y-6 font-sans" id="scm-admin-panel">
       {/* Toast Notification */}
       {message && (
         <div className={`fixed top-4 right-4 z-50 flex items-center gap-2.5 px-4 py-3 rounded-lg border shadow-xl animate-in fade-in slide-in-from-top-3 duration-200 ${
@@ -456,7 +456,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
         <div>
           <div className="flex items-center gap-2 text-primary-brand mb-1">
             <ShieldCheck className="w-5 h-5 text-red-500" />
-            <span className="text-[10px] font-black uppercase tracking-widest text-red-400">Enterprise Control Deck</span>
+            <span className="text-[10px] font-black uppercase tracking-widest text-red-400">Administration</span>
           </div>
           <h1 className="text-xl font-bold text-white font-display">User & Access Management</h1>
           <p className="text-slate-400 text-xs mt-0.5">
@@ -482,20 +482,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
       </div>
 
       {/* Statistics Cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
-        <div className="bg-slate-900/60 border border-slate-800/80 p-4 rounded-xl flex items-center justify-between">
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-4">
+        <div className="bg-white border border-slate-200 p-4 rounded-2xl shadow-sm flex items-center justify-between">
           <div>
             <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide block">Corporate Logins</span>
-            <span className="text-2xl font-black text-white block mt-1 font-display">
+            <span className="text-2xl font-black text-slate-900 block mt-1 font-display">
               {summary ? summary.users.total : loading ? '...' : usersList.length}
             </span>
           </div>
-          <div className="p-2.5 bg-slate-800 rounded-lg">
+          <div className="p-2.5 bg-slate-100 rounded-xl">
             <Users className="w-4 h-4 text-blue-400" />
           </div>
         </div>
 
-        <div className="bg-slate-900/60 border border-slate-800/80 p-4 rounded-xl flex items-center justify-between">
+        <div className="bg-white border border-slate-200 p-4 rounded-2xl shadow-sm flex items-center justify-between">
           <div>
             <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide block">Pending Approvals</span>
             <span className={`text-2xl font-black block mt-1 font-display ${pendingApprovals.length > 0 ? 'text-amber-400 animate-pulse' : 'text-white'}`}>
@@ -507,52 +507,52 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
           </div>
         </div>
 
-        <div className="bg-slate-900/60 border border-slate-800/80 p-4 rounded-xl flex items-center justify-between">
+        <div className="bg-white border border-slate-200 p-4 rounded-2xl shadow-sm flex items-center justify-between">
           <div>
-            <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide block">SCM Leads Suspendd</span>
-            <span className="text-2xl font-black text-white block mt-1 font-display">
+            <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide block">Active Prospects</span>
+            <span className="text-2xl font-black text-slate-900 block mt-1 font-display">
               {summary ? summary.prospects : 'Clean'}
             </span>
           </div>
-          <div className="p-2.5 bg-slate-800 rounded-lg">
+          <div className="p-2.5 bg-slate-100 rounded-xl">
             <TrendingUp className="w-4 h-4 text-emerald-400" />
           </div>
         </div>
 
-        <div className="bg-slate-900/60 border border-slate-800/80 p-4 rounded-xl flex items-center justify-between">
+        <div className="bg-white border border-slate-200 p-4 rounded-2xl shadow-sm flex items-center justify-between">
           <div>
-            <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide block">Security Event Log</span>
-            <span className="text-2xl font-black text-white block mt-1 font-display">
+            <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide block">Audit Events</span>
+            <span className="text-2xl font-black text-slate-900 block mt-1 font-display">
               {auditLogs.length}
             </span>
           </div>
-          <div className="p-2.5 bg-slate-800 rounded-lg">
+          <div className="p-2.5 bg-slate-100 rounded-xl">
             <History className="w-4 h-4 text-red-400" />
           </div>
         </div>
 
-        <div className="col-span-2 lg:col-span-1 bg-slate-900/60 border border-slate-800/80 p-4 rounded-xl flex items-center justify-between">
+        <div className="col-span-2 lg:col-span-1 bg-white border border-slate-200 p-4 rounded-2xl shadow-sm flex items-center justify-between">
           <div>
-            <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide block">Supabase DB Host</span>
+            <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide block">Data Service</span>
             <span className="text-xs font-mono font-bold text-emerald-400 block mt-2 flex items-center gap-1">
               <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block"></span>
-              {summary?.systemHealth.databaseConnected ? 'ONLINE' : 'FALLBACK'}
+              {summary?.systemHealth.databaseConnected ? 'ONLINE' : 'UNAVAILABLE'}
             </span>
           </div>
-          <div className="p-2.5 bg-slate-800 rounded-lg">
+          <div className="p-2.5 bg-slate-100 rounded-xl">
             <Database className="w-4 h-4 text-emerald-400" />
           </div>
         </div>
       </div>
 
-      {/* Control Navigation Menu */}
-      <div className="flex border-b border-slate-850">
+      {/* Administration Navigation */}
+      <div className="flex overflow-x-auto border-b border-slate-200 bg-white rounded-t-xl px-1">
         <button
           onClick={() => setActiveSubTab('users')}
           className={`px-4 py-2.5 text-xs font-bold uppercase tracking-wider border-b-2 -mb-[2px] transition-colors ${
             activeSubTab === 'users' 
               ? 'border-red-500 text-red-400 font-black' 
-              : 'border-transparent text-slate-400 hover:text-white'
+              : 'border-transparent text-slate-500 hover:text-slate-900'
           }`}
         >
           User Directory ({usersList.length})
@@ -562,7 +562,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
           className={`px-4 py-2.5 text-xs font-bold uppercase tracking-wider border-b-2 -mb-[2px] transition-colors relative ${
             activeSubTab === 'approvals' 
               ? 'border-red-500 text-red-400 font-black' 
-              : 'border-transparent text-slate-400 hover:text-white'
+              : 'border-transparent text-slate-500 hover:text-slate-900'
           }`}
         >
           Pending Queue
@@ -575,7 +575,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
           className={`px-4 py-2.5 text-xs font-bold uppercase tracking-wider border-b-2 -mb-[2px] transition-colors ${
             activeSubTab === 'audit' 
               ? 'border-red-500 text-red-400 font-black' 
-              : 'border-transparent text-slate-400 hover:text-white'
+              : 'border-transparent text-slate-500 hover:text-slate-900'
           }`}
         >
           System Audit Log ({auditLogs.length})
@@ -585,17 +585,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
           className={`px-4 py-2.5 text-xs font-bold uppercase tracking-wider border-b-2 -mb-[2px] transition-colors ${
             activeSubTab === 'search-analytics' 
               ? 'border-red-500 text-red-400 font-black' 
-              : 'border-transparent text-slate-400 hover:text-white'
+              : 'border-transparent text-slate-500 hover:text-slate-900'
           }`}
         >
-          AI Search Analytics
+          Research Analytics
         </button>
         <button
           onClick={() => setActiveSubTab('system')}
           className={`px-4 py-2.5 text-xs font-bold uppercase tracking-wider border-b-2 -mb-[2px] transition-colors ${
             activeSubTab === 'system' 
               ? 'border-red-500 text-red-400 font-black' 
-              : 'border-transparent text-slate-400 hover:text-white'
+              : 'border-transparent text-slate-500 hover:text-slate-900'
           }`}
         >
           Security Diagnostics
@@ -614,17 +614,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
                 placeholder="Search SCM officers by name, corporate email, or department..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full bg-slate-900 border border-slate-800 text-slate-200 placeholder-slate-500 rounded-lg pl-9 pr-4 py-2 text-xs focus:outline-none focus:border-slate-750"
+                className="w-full bg-white border border-slate-200 text-slate-900 placeholder-slate-400 rounded-xl pl-9 pr-4 py-2.5 text-xs focus:outline-none focus:border-[#8c1018] focus:ring-2 focus:ring-red-100"
               />
             </div>
             <div className="flex gap-2">
-              <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 px-3 rounded-lg">
+              <div className="flex items-center gap-1.5 bg-white border border-slate-200 px-3 rounded-xl">
                 <Filter className="w-3.5 h-3.5 text-slate-500" />
                 <span className="text-[10px] text-slate-400 font-semibold uppercase">Role:</span>
                 <select 
                   value={roleFilter} 
                   onChange={(e) => setRoleFilter(e.target.value)}
-                  className="bg-transparent text-slate-200 text-xs border-none outline-none cursor-pointer py-1 font-medium"
+                  className="bg-transparent text-slate-700 text-xs border-none outline-none cursor-pointer py-2 font-semibold"
                 >
                   <option value="ALL">All Roles</option>
                   <option value="Admin">Admin</option>
@@ -634,13 +634,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
                 </select>
               </div>
 
-              <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 px-3 rounded-lg">
+              <div className="flex items-center gap-1.5 bg-white border border-slate-200 px-3 rounded-xl">
                 <Filter className="w-3.5 h-3.5 text-slate-500" />
                 <span className="text-[10px] text-slate-400 font-semibold uppercase">Status:</span>
                 <select 
                   value={statusFilter} 
                   onChange={(e) => setStatusFilter(e.target.value)}
-                  className="bg-transparent text-slate-200 text-xs border-none outline-none cursor-pointer py-1 font-medium"
+                  className="bg-transparent text-slate-700 text-xs border-none outline-none cursor-pointer py-2 font-semibold"
                 >
                   <option value="ALL">All Statuses</option>
                   <option value="Approved">Approved</option>
@@ -655,11 +655,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
           </div>
 
           {/* Users Table */}
-          <div className="bg-slate-900/40 border border-slate-800 rounded-xl overflow-hidden">
+          <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
-                  <tr className="border-b border-slate-850 bg-slate-950/40 text-slate-400 uppercase tracking-wider text-[9px] font-black">
+                  <tr className="border-b border-slate-200 bg-slate-50 text-slate-500 uppercase tracking-wider text-[9px] font-black">
                     <th className="py-3 px-4">Officer Details</th>
                     <th className="py-3 px-4">System Role</th>
                     <th className="py-3 px-4">Department</th>
@@ -667,7 +667,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
                     <th className="py-3 px-4 text-right">Governing Actions</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-850 text-xs text-slate-300">
+                <tbody className="divide-y divide-slate-100 text-xs text-slate-700">
                   {filteredUsers.length === 0 ? (
                     <tr>
                       <td colSpan={5} className="text-center py-8 text-slate-500 italic">
@@ -679,14 +679,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
                       const isSelf = user.email.toLowerCase() === currentUser.email.toLowerCase();
                       const isSuper = user.permissionLevel === 'SUPER_ADMIN';
                       return (
-                        <tr key={user.id} className="hover:bg-slate-900/20 transition-all">
+                        <tr key={user.id} className="hover:bg-slate-50 transition-all">
                           <td className="py-3.5 px-4">
                             <div className="flex items-center gap-3">
                               <div className="w-8 h-8 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center font-black text-slate-200 capitalize font-display">
                                 {user.fullName.split(' ').map(n => n ? n[0] : '').join('')}
                               </div>
                               <div>
-                                <span className="font-bold text-white block flex items-center gap-1">
+                                <span className="font-bold text-slate-900 block flex items-center gap-1">
                                   {user.fullName} 
                                   {isSelf && <span className="text-[9px] bg-slate-800 px-1 py-0.2 rounded border border-slate-700 text-slate-400 uppercase tracking-wide">Me</span>}
                                   {isSuper && <span className="text-[9px] bg-red-950/50 border border-red-900 text-red-400 px-1 py-0.2 rounded uppercase tracking-wide">SUPER_ADMIN</span>}
@@ -695,7 +695,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
                               </div>
                             </div>
                           </td>
-                          <td className="py-3.5 px-4 font-semibold text-slate-200">
+                          <td className="py-3.5 px-4 font-semibold text-slate-700">
                             {user.role}
                           </td>
                           <td className="py-3.5 px-4 text-slate-400">
@@ -812,7 +812,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
                     </tr>
                   ) : (
                     pendingApprovals.map((user) => (
-                      <tr key={user.id} className="hover:bg-slate-900/20 transition-all">
+                      <tr key={user.id} className="hover:bg-slate-50 transition-all">
                         <td className="py-3.5 px-4 font-bold text-white">
                           {user.fullName}
                         </td>
@@ -868,13 +868,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
                 className="w-full bg-slate-900 border border-slate-800 text-slate-200 placeholder-slate-500 rounded-lg pl-9 pr-4 py-2 text-xs focus:outline-none focus:border-slate-750"
               />
             </div>
-            <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 px-3 rounded-lg shrink-0">
+            <div className="flex items-center gap-1.5 bg-white border border-slate-200 px-3 rounded-xl shrink-0">
               <Filter className="w-3.5 h-3.5 text-slate-500" />
               <span className="text-[10px] text-slate-400 font-semibold uppercase">Action:</span>
               <select 
                 value={auditActionFilter} 
                 onChange={(e) => setAuditActionFilter(e.target.value)}
-                className="bg-transparent text-slate-200 text-xs border-none outline-none cursor-pointer py-1 font-medium"
+                className="bg-transparent text-slate-700 text-xs border-none outline-none cursor-pointer py-2 font-semibold"
               >
                 <option value="ALL">All Operations</option>
                 <option value="User Login">Successful Login</option>
@@ -1085,13 +1085,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
               />
             </div>
             <div className="flex gap-2">
-              <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 px-3 rounded-lg">
+              <div className="flex items-center gap-1.5 bg-white border border-slate-200 px-3 rounded-xl">
                 <Filter className="w-3.5 h-3.5 text-slate-500" />
                 <span className="text-[10px] text-slate-400 font-semibold uppercase">Type:</span>
                 <select
                   value={aiTypeFilter}
                   onChange={(e) => setAiTypeFilter(e.target.value)}
-                  className="bg-transparent text-slate-200 text-xs border-none outline-none cursor-pointer py-1 font-medium bg-slate-900"
+                  className="bg-transparent text-slate-700 text-xs border-none outline-none cursor-pointer py-2 font-semibold bg-slate-900"
                 >
                   <option value="ALL">All Types</option>
                   <option value="Apollo Search">Apollo Search</option>
@@ -1101,13 +1101,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
                 </select>
               </div>
 
-              <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 px-3 rounded-lg">
+              <div className="flex items-center gap-1.5 bg-white border border-slate-200 px-3 rounded-xl">
                 <Filter className="w-3.5 h-3.5 text-slate-500" />
                 <span className="text-[10px] text-slate-400 font-semibold uppercase">Status:</span>
                 <select
                   value={aiStatusFilter}
                   onChange={(e) => setAiStatusFilter(e.target.value)}
-                  className="bg-transparent text-slate-200 text-xs border-none outline-none cursor-pointer py-1 font-medium bg-slate-900"
+                  className="bg-transparent text-slate-700 text-xs border-none outline-none cursor-pointer py-2 font-semibold bg-slate-900"
                 >
                   <option value="ALL">All Statuses</option>
                   <option value="Success">Success</option>
