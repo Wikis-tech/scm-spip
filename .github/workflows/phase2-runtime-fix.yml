@@ -20,7 +20,9 @@ jobs:
         with:
           node-version: 22
       - name: Apply Phase 2 integration
-        run: node scripts/phase2-runtime-fix.mjs
+        run: |
+          node scripts/phase2-runtime-fix.mjs
+          node scripts/phase2-ui-permissions-fix.mjs
       - name: Install dependencies
         run: npm install --no-package-lock
       - name: Phase 2 assertions
@@ -30,6 +32,9 @@ jobs:
           grep -q "Identity is sourced from the ACTIVE Supabase profile" server.ts
           grep -q "ManagementReports" src/App.tsx
           grep -q "res.status === 401 || res.status === 403" src/App.tsx
+          grep -q "currentUser.permissionLevel === 'SUPER_ADMIN'" src/components/Sidebar.tsx
+          grep -q "Management Reports" src/components/Sidebar.tsx
+          grep -q "Permission-controlled administration" src/pages/AdminDashboard.tsx
           if grep -q "Failed to synchronize authenticated profile" server.ts; then
             echo "Legacy profile synchronization still blocks or pollutes authentication path"
             exit 1
@@ -42,7 +47,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add server.ts src/App.tsx src/pages/AdminDashboard.tsx
+          git add server.ts src/App.tsx src/components/Sidebar.tsx src/pages/AdminDashboard.tsx src/pages/WeeklyReport.tsx
           if git diff --cached --quiet; then
             echo "No runtime integration changes to commit"
           else
