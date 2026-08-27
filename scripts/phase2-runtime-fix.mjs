@@ -25,6 +25,18 @@ if (server.includes(blockingSync)) {
   server = server.replace(blockingSync, nonBlockingSync);
 }
 
+// Phase 1B already installs a database trigger that mirrors profile changes into the
+// legacy users directory. Doing an additional direct PostgreSQL write on every API request
+// made valid Supabase sessions wait up to the PostgreSQL connection timeout. Remove that
+// redundant request-path write entirely; CRM data routes remain protected by their health gate.
+const legacyRequestSync = `    try {\n      await db.insert(users).values({\n        id: authUser.id,\n        fullName: profile.full_name,\n        email,\n        role: legacyRole,\n        department: profile.department || 'Asset Management',\n        avatarUrl: profile.avatar_url || '',\n        status: 'Approved'\n      }).onConflictDoUpdate({\n        target: users.id,\n        set: {\n          fullName: profile.full_name,\n          email,\n          role: legacyRole,\n          department: profile.department || 'Asset Management',\n          avatarUrl: profile.avatar_url || '',\n          status: 'Approved'\n        }\n      });\n    } catch (syncError: any) {\n      // The Supabase profile is authoritative for authentication. A legacy CRM directory\n      // synchronization failure must not destroy an otherwise valid authenticated session.\n      // Direct CRM routes still fail closed behind the database health gate below.\n      console.warn('[SPIP SECURITY] Legacy CRM profile synchronization deferred:', syncError?.message || syncError);\n    }\n\n`;
+if (server.includes(legacyRequestSync)) {
+  server = server.replace(
+    legacyRequestSync,
+    `    // Identity is sourced from the ACTIVE Supabase profile above. The Phase 1B profile\n    // trigger owns legacy users-directory synchronization, so authentication never waits\n    // for the separate direct PostgreSQL connection.\n\n`
+  );
+}
+
 if (!server.includes('registerPhase2Routes(app, supabaseServer);')) {
   server = replaceOrFail(
     server,
@@ -33,6 +45,11 @@ if (!server.includes('registerPhase2Routes(app, supabaseServer);')) {
     'Phase 2 route registration'
   );
 }
+
+server = server.replace(
+  '[SCM DATABASE NOTICE] PostgreSQL database offline - operating in local memory fallback mode:',
+  '[SCM DATABASE NOTICE] Direct PostgreSQL connection unavailable; CRM data routes remain fail-closed:'
+);
 
 fs.writeFileSync('server.ts', server);
 
