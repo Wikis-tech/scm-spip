@@ -25,6 +25,7 @@ import {
   CheckSquare
 } from 'lucide-react';
 import { Prospect, Contact, Activity, Meeting, DashboardMetrics, Task } from '../types';
+import { OfficerDashboardCharts } from '../components/analytics/BusinessCharts';
 
 interface DashboardProps {
   metrics: DashboardMetrics;
@@ -147,7 +148,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
       <div className="bg-gradient-to-r from-red-950 via-slate-900 to-slate-950 text-white rounded-2xl p-6 shadow-xl relative overflow-hidden flex flex-col md:flex-row items-center justify-between border border-red-900/40">
         <div className="relative z-10 max-w-xl text-left">
           <div className="flex items-center gap-2 text-red-400 font-bold tracking-widest text-[9px] uppercase">
-            <Sparkles className="w-3.5 h-3.5" /> Sector Lead Advisory Workspace
+            <Sparkles className="w-3.5 h-3.5" /> Asset Management Workspace
           </div>
           <h2 className="font-display font-bold text-lg sm:text-2xl mt-1 leading-tight tracking-tight">
             Asset Management Division
@@ -167,7 +168,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
             onClick={() => setActiveTab('intelligence')}
             className="bg-[#b1191f] hover:bg-[#921419] text-white font-black text-[11px] px-4 py-2 rounded-lg transition-all flex items-center gap-1.5 shadow-lg shadow-black/30"
           >
-            <Zap className="w-3.5 h-3.5 text-amber-300 animate-pulse fill-amber-300" /> AI Target Finder
+            <Zap className="w-3.5 h-3.5 text-amber-300 animate-pulse fill-amber-300" /> Find Prospects
           </button>
         </div>
         {/* Subtle decorative background blur */}
@@ -194,6 +195,8 @@ export const Dashboard: React.FC<DashboardProps> = ({
           </div>
         ))}
       </div>
+
+      <OfficerDashboardCharts prospects={prospects} activities={activities} meetings={meetings} tasks={tasks} />
 
       {/* 3. Core Bento Grid Area */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">

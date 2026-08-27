@@ -54,26 +54,33 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   if (isAdminUser) {
     navItems = [
-      { id: 'executive-summary', label: 'Executive Summary', icon: Award, highlight: true },
+      { id: 'executive-summary', label: 'Executive Summary', icon: Award },
+      { id: 'dashboard', label: 'My Dashboard', icon: BarChart3 },
+      { id: 'prospects', label: 'Prospects', icon: Building2 },
+      { id: 'client-360', label: 'Client 360', icon: Users2 },
       { id: 'workspaces', label: 'Research Workspaces', icon: Briefcase },
+      { id: 'crm', label: 'CRM', icon: Users2 },
+      { id: 'pipeline', label: 'Pipeline', icon: CheckSquare },
+      { id: 'intelligence', label: 'Company Research', icon: SearchCode },
+      { id: 'calendar', label: 'Calendar', icon: Calendar },
+      { id: 'reports', label: 'Reports', icon: TrendingUp },
       { id: 'admin-reports', label: 'Management Reports', icon: FileSpreadsheet },
-      { id: 'admin-users', label: 'Administration', icon: Users2 },
+      { id: 'admin-users', label: 'Administration', icon: ShieldCheck },
       { id: 'settings', label: 'Settings', icon: Settings2 },
     ];
   } else {
     navItems = [
       { id: 'dashboard', label: 'Dashboard', icon: BarChart3 },
       { id: 'prospects', label: 'Prospects', icon: Building2 },
+      { id: 'client-360', label: 'Client 360', icon: Users2 },
       { id: 'workspaces', label: 'Research Workspaces', icon: Briefcase },
       { id: 'crm', label: 'CRM', icon: Users2 },
       { id: 'pipeline', label: 'Pipeline', icon: CheckSquare },
-      { id: 'intelligence', label: 'Intelligence', icon: SearchCode, highlight: true },
+      { id: 'intelligence', label: 'Company Research', icon: SearchCode },
       { id: 'calendar', label: 'Calendar', icon: Calendar },
       { id: 'reports', label: 'Reports', icon: TrendingUp },
     ];
-    if (isRelationshipOfficer) {
-      navItems.push({ id: 'weekly-report', label: 'Weekly Report', icon: FileText });
-    }
+    if (isRelationshipOfficer) navItems.push({ id: 'weekly-report', label: 'Weekly Report', icon: FileText });
     navItems.push({ id: 'settings', label: 'Settings', icon: Settings2 });
   }
 

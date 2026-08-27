@@ -290,10 +290,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
         fetchAdminData();
       } else {
         const err = await response.json();
-        showToast(err.error || "Purge execution failed.", 'error');
+        showToast(err.error || "Suspend execution failed.", 'error');
       }
     } catch (err) {
-      showToast("Purge pipeline failure.", "error");
+      showToast("Suspend pipeline failure.", "error");
     }
   };
 
@@ -455,9 +455,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
             <ShieldCheck className="w-5 h-5 text-red-500" />
             <span className="text-[10px] font-black uppercase tracking-widest text-red-400">Enterprise Control Deck</span>
           </div>
-          <h1 className="text-xl font-bold text-white font-display">SCM Platform Governance Center</h1>
+          <h1 className="text-xl font-bold text-white font-display">User & Access Management</h1>
           <p className="text-slate-400 text-xs mt-0.5">
-            Permission-controlled administration for Super Admin and HOD Admin roles.
+            Manage users, approvals, permissions, audit activity and platform access.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -466,7 +466,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-slate-300 bg-slate-800 hover:bg-slate-750 border border-slate-750 rounded-lg transition-all"
           >
             <RefreshCw className="w-3.5 h-3.5" />
-            Sync Registry
+            Refresh Directory
           </button>
           <button 
             onClick={exportUsersToCSV}
@@ -506,7 +506,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
 
         <div className="bg-slate-900/60 border border-slate-800/80 p-4 rounded-xl flex items-center justify-between">
           <div>
-            <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide block">SCM Leads Purged</span>
+            <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide block">SCM Leads Suspendd</span>
             <span className="text-2xl font-black text-white block mt-1 font-display">
               {summary ? summary.prospects : 'Clean'}
             </span>

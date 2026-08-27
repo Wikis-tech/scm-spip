@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { BarChart3, CalendarDays, FileSpreadsheet, RefreshCw, Users, TrendingUp, Target, CircleDollarSign, ClipboardCheck, Activity } from 'lucide-react';
 import type { UserProfile } from '../types';
 import { AdminReports } from './AdminReports';
+import { ManagementRecharts } from '../components/analytics/BusinessCharts';
 
 interface ManagementReportsProps {
   currentUser: UserProfile;
@@ -117,7 +118,7 @@ export const ManagementReports: React.FC<ManagementReportsProps> = ({ currentUse
         <div className="px-5 md:px-7 py-6 border-b border-slate-200 bg-gradient-to-r from-slate-950 via-slate-900 to-[#651018] text-white">
           <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-5">
             <div>
-              <div className="text-[10px] font-black uppercase tracking-[0.25em] text-red-200">SCM CAPITAL • PHASE 2</div>
+              <div className="text-[10px] font-black uppercase tracking-[0.25em] text-red-200">SCM CAPITAL • MANAGEMENT</div>
               <h1 className="text-2xl md:text-3xl font-black mt-2">Management Reporting Center</h1>
               <p className="text-sm text-slate-300 mt-2 max-w-2xl">Weekly governance, monthly management summaries and staff performance oversight in one permission-controlled workspace.</p>
             </div>
@@ -164,6 +165,8 @@ export const ManagementReports: React.FC<ManagementReportsProps> = ({ currentUse
           </div>
 
           {error && <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm font-semibold text-red-700">{error}</div>}
+
+          {(monthly || staff) && <ManagementRecharts monthly={monthly} staff={staff} />}
 
           {tab === 'monthly' && monthly && (
             <div className="space-y-5">

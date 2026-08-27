@@ -23,6 +23,9 @@ import { verifyData } from "./src/services/verificationService.ts";
 import { calculateProductRecommendations } from "./src/utils/recommendationEngine.ts";
 import { registerPhase2Routes } from "./src/server/phase2Routes.ts";
 import { registerPhase2WeeklyRoutes } from "./src/server/phase2WeeklyRoutes.ts";
+import { registerPublicAuthRoutes } from "./src/server/publicAuthRoutes.ts";
+import { registerPhase3Routes } from "./src/server/phase3Routes.ts";
+import { registerPhase3CrudRoutes } from "./src/server/phase3CrudRoutes.ts";
 import { discoveryQueueEngine, DBClientContext } from "./src/services/discovery/discoveryQueueEngine.ts";
 
 // Helper to validate corporate email domain and format
@@ -345,6 +348,10 @@ const supabaseServer = createSupabaseClient(
   { auth: { persistSession: false, autoRefreshToken: false } }
 );
 
+// Registration is registered before the authentication middleware because it creates
+// a PENDING account and never returns a signed-in session.
+registerPublicAuthRoutes(app, supabaseServer);
+
 const PUBLIC_API_PATHS = new Set([
   '/api/auth/config',
   '/api/auth/login',
@@ -446,6 +453,10 @@ app.use(async (req, res, next) => {
 // server client and are registered before the legacy PostgreSQL health gate.
 registerPhase2Routes(app, supabaseServer);
 registerPhase2WeeklyRoutes(app, supabaseServer);
+// Phase 3 core CRM routes also run on the canonical Supabase data plane, before
+// the legacy direct-PostgreSQL health gate.
+registerPhase3Routes(app, supabaseServer);
+registerPhase3CrudRoutes(app, supabaseServer);
 
 const PORT = Number(process.env.PORT || 3000);
 

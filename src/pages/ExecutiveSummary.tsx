@@ -28,6 +28,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { UserProfile } from '../types';
+import { ExecutiveRecharts } from '../components/analytics/BusinessCharts';
 
 interface ExecutiveSummaryProps {
   currentUser: UserProfile;
@@ -106,13 +107,7 @@ export const ExecutiveSummary: React.FC<ExecutiveSummaryProps> = ({ currentUser 
     try {
       setLoading(true);
       setError(null);
-      const res = await fetch('/api/admin/executive-dashboard-summary', {
-        headers: {
-          'x-user-id': currentUser.id,
-          'x-user-role': currentUser.role,
-          'x-user-email': currentUser.email
-        }
-      });
+      const res = await fetch('/api/admin/executive-dashboard-summary');
 
       if (!res.ok) {
         let detail = '';
@@ -150,7 +145,7 @@ export const ExecutiveSummary: React.FC<ExecutiveSummaryProps> = ({ currentUser 
     return (
       <div id="exec-summary-loading" className="flex flex-col items-center justify-center p-20 space-y-4 min-h-[70vh]">
         <div className="w-12 h-12 border-4 border-slate-200 border-t-primary-brand rounded-full animate-spin"></div>
-        <span className="text-xs font-semibold text-slate-500 animate-pulse uppercase tracking-widest font-mono">Synthesizing Executive Ledger...</span>
+        <span className="text-xs font-semibold text-slate-500 animate-pulse uppercase tracking-widest font-mono">Synthesizing Management Overview...</span>
       </div>
     );
   }
@@ -206,7 +201,9 @@ export const ExecutiveSummary: React.FC<ExecutiveSummaryProps> = ({ currentUser 
         </button>
       </div>
 
-      {/* Section 6: Management Insights Banner (Placed prominently at top as requested) */}
+      <ExecutiveRecharts data={data} />
+
+      {/* Management insights */}
       <div id="exec-section-insights" className="bg-gradient-to-r from-slate-900 via-slate-850 to-brand-neutral text-white p-6 rounded-2xl border border-slate-800 shadow-xl relative overflow-hidden">
         <div className="absolute right-0 bottom-0 translate-y-6 translate-x-6 opacity-5 pointer-events-none">
           <Sparkles className="w-72 h-72 text-white" />
@@ -215,7 +212,7 @@ export const ExecutiveSummary: React.FC<ExecutiveSummaryProps> = ({ currentUser 
           <div className="p-1.5 bg-red-600/30 text-red-400 rounded-lg border border-red-500/20">
             <Sparkles className="w-4 h-4" />
           </div>
-          <span className="text-[10px] font-black uppercase tracking-widest text-red-400">Autonomous Business Intelligence Insights</span>
+          <span className="text-[10px] font-black uppercase tracking-widest text-red-400">Management Insights</span>
         </div>
         
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

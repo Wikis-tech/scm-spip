@@ -32,7 +32,7 @@ export const Header: React.FC<HeaderProps> = ({
   useEffect(() => {
     const updateTime = () => {
       const now = new Date();
-      setTimeStr(now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' UTC');
+      setTimeStr(now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }));
     };
     updateTime();
     const interval = setInterval(updateTime, 1000);
@@ -325,7 +325,7 @@ export const Header: React.FC<HeaderProps> = ({
                 <div className="p-3 bg-slate-50 text-[#0d1527] border-b border-slate-150 flex items-center justify-between">
                   <span className="font-bold tracking-wider font-display text-[10px] uppercase flex items-center gap-1.5">
                     <span className="w-2 h-2 rounded-full bg-red-600 animate-pulse"></span>
-                    SCM Communication Center
+                    Notifications & Reminders
                   </span>
                   <button 
                     onClick={() => setShowReminders(false)} 
@@ -884,7 +884,7 @@ export const Header: React.FC<HeaderProps> = ({
         {/* Gemini Engine Connected */}
         <div className="flex items-center gap-1.5 bg-red-50 text-[#b1191f] border border-red-100 px-2.5 py-1 rounded text-[11px] font-semibold">
           <Cpu className="w-3.5 h-3.5 text-[#b1191f]" />
-          <span className="hidden lg:inline uppercase tracking-wider font-bold text-[9px]">Gemini 3.5 AI Enabled</span>
+          <span className="hidden lg:inline uppercase tracking-wider font-bold text-[9px]">Research Tools</span>
         </div>
 
         {/* User Role Authorization Signifier */}

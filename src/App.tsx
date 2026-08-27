@@ -15,6 +15,7 @@ import { Reports } from './pages/Reports';
 import { Settings } from './pages/Settings';
 import { Tasks } from './pages/Tasks';
 import { CRM } from './pages/CRM';
+import { Client360 } from './pages/Client360';
 import { Pipeline } from './pages/Pipeline';
 import { CalendarPage } from './pages/CalendarPage';
 import { AdminDashboard } from './pages/AdminDashboard';
@@ -125,18 +126,6 @@ export default function App() {
     };
   }, []);
 
-  // Redirect Admin from 'dashboard' to 'executive-summary' and remove legacy sidebar views
-  useEffect(() => {
-    if (currentUser) {
-      const isAdminUser = currentUser.permissionLevel === 'SUPER_ADMIN' || currentUser.permissionLevel === 'HOD_ADMIN';
-      if (isAdminUser) {
-        if (activeTab === 'dashboard') {
-          setActiveTab('executive-summary');
-        }
-      }
-    }
-  }, [currentUser, activeTab]);
-
   // Auto-register background service worker and push subscription for authenticated user
   useEffect(() => {
     if (currentUser && isPushSupported()) {
@@ -194,11 +183,11 @@ export default function App() {
     try {
       const [resMetrics, resProspects, resContacts, resActivities, resMeetings, resTasks, resNews, resLeads, resStaff] = await Promise.all([
         scmFetch('/api/dashboard/metrics').then(r => r.json()).catch(() => ({})),
-        scmFetch('/api/prospects').then(r => r.json()).catch(() => []),
-        scmFetch('/api/contacts').then(r => r.json()).catch(() => []),
-        scmFetch('/api/activities').then(r => r.json()).catch(() => []),
-        scmFetch('/api/meetings').then(r => r.json()).catch(() => []),
-        scmFetch('/api/tasks').then(r => r.json()).catch(() => []),
+        scmFetch('/api/crm/prospects').then(r => r.json()).catch(() => []),
+        scmFetch('/api/crm/contacts').then(r => r.json()).catch(() => []),
+        scmFetch('/api/crm/activities').then(r => r.json()).catch(() => []),
+        scmFetch('/api/crm/meetings').then(r => r.json()).catch(() => []),
+        scmFetch('/api/crm/tasks').then(r => r.json()).catch(() => []),
         scmFetch('/api/news').then(r => r.json()).catch(() => []),
         scmFetch('/api/discovery/leads').then(r => r.json()).catch(() => []),
         isAdminUser 
@@ -291,7 +280,7 @@ export default function App() {
         assignedOfficerName: currentUser.fullName,
         assignedOfficerEmail: currentUser.email 
       };
-      const res = await scmFetch('/api/prospects', {
+      const res = await scmFetch('/api/crm/prospects', {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
@@ -331,7 +320,7 @@ export default function App() {
 
   const handleUpdateProspect = async (id: string, updates: Partial<Prospect>) => {
     try {
-      const res = await scmFetch(`/api/prospects/${id}`, {
+      const res = await scmFetch(`/api/crm/prospects/${id}`, {
         method: 'PATCH',
         headers: { 
           'Content-Type': 'application/json',
@@ -352,7 +341,7 @@ export default function App() {
 
   const handleDeleteProspect = async (id: string) => {
     try {
-      const res = await scmFetch(`/api/prospects/${id}`, { 
+      const res = await scmFetch(`/api/crm/prospects/${id}`, { 
         method: 'DELETE',
         headers: {
         }
@@ -372,7 +361,7 @@ export default function App() {
   // Contacts Action Methods
   const handleAddContact = async (contact: Partial<Contact>) => {
     try {
-      const res = await scmFetch('/api/contacts', {
+      const res = await scmFetch('/api/crm/contacts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(contact)
@@ -391,7 +380,7 @@ export default function App() {
 
   const handleUpdateContact = async (id: string, updates: Partial<Contact>) => {
     try {
-      const res = await scmFetch(`/api/contacts/${id}`, {
+      const res = await scmFetch(`/api/crm/contacts/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updates)
@@ -410,7 +399,7 @@ export default function App() {
 
   const handleDeleteContact = async (id: string) => {
     try {
-      const res = await scmFetch(`/api/contacts/${id}`, { method: 'DELETE' });
+      const res = await scmFetch(`/api/crm/contacts/${id}`, { method: 'DELETE' });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         throw new Error(data.error || data.message || 'Deletion rejected.');
@@ -428,7 +417,7 @@ export default function App() {
     if (!currentUser) return;
     try {
       const body = { ...activity, officerId: currentUser.id, officerName: currentUser.fullName };
-      const res = await scmFetch('/api/activities', {
+      const res = await scmFetch('/api/crm/activities', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
@@ -445,7 +434,7 @@ export default function App() {
 
   const handleUpdateActivity = async (id: string, updates: Partial<Activity>) => {
     try {
-      const res = await scmFetch(`/api/activities/${id}`, {
+      const res = await scmFetch(`/api/crm/activities/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updates)
@@ -462,7 +451,7 @@ export default function App() {
 
   const handleDeleteActivity = async (id: string) => {
     try {
-      const res = await scmFetch(`/api/activities/${id}`, { method: 'DELETE' });
+      const res = await scmFetch(`/api/crm/activities/${id}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Action restricted.');
       await refreshDatabase();
       return true;
@@ -477,7 +466,7 @@ export default function App() {
     if (!currentUser) return;
     try {
       const body = { ...meeting, officerId: currentUser.id, officerName: currentUser.fullName };
-      const res = await scmFetch('/api/meetings', {
+      const res = await scmFetch('/api/crm/meetings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
@@ -494,7 +483,7 @@ export default function App() {
 
   const handleUpdateMeeting = async (id: string, updates: Partial<Meeting>) => {
     try {
-      const res = await scmFetch(`/api/meetings/${id}`, {
+      const res = await scmFetch(`/api/crm/meetings/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updates)
@@ -511,7 +500,7 @@ export default function App() {
 
   const handleDeleteMeeting = async (id: string) => {
     try {
-      const res = await scmFetch(`/api/meetings/${id}`, { method: 'DELETE' });
+      const res = await scmFetch(`/api/crm/meetings/${id}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Meeting cancel rejected.');
       await refreshDatabase();
       return true;
@@ -524,7 +513,7 @@ export default function App() {
   // Task Action Triggers
   const handleAddTask = async (task: Partial<Task>) => {
     try {
-      const res = await scmFetch('/api/tasks', {
+      const res = await scmFetch('/api/crm/tasks', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(task)
@@ -538,7 +527,7 @@ export default function App() {
 
   const handleUpdateTask = async (id: string, updates: Partial<Task>) => {
     try {
-      const res = await scmFetch(`/api/tasks/${id}`, {
+      const res = await scmFetch(`/api/crm/tasks/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updates)
@@ -552,7 +541,7 @@ export default function App() {
 
   const handleDeleteTask = async (id: string) => {
     try {
-      const res = await scmFetch(`/api/tasks/${id}`, { method: 'DELETE' });
+      const res = await scmFetch(`/api/crm/tasks/${id}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Task cancel failed.');
       await refreshDatabase();
     } catch (err) {
@@ -632,7 +621,7 @@ export default function App() {
       return (
         <div className="flex flex-col items-center justify-center p-20 space-y-4">
           <div className="w-10 h-10 border-4 border-slate-200 border-t-primary-brand rounded-full animate-spin"></div>
-          <span className="text-xs font-semibold text-slate-500 animate-pulse uppercase tracking-widest font-mono">Loading CRM Database...</span>
+          <span className="text-xs font-semibold text-slate-500 animate-pulse uppercase tracking-widest font-mono">Loading secure CRM data...</span>
         </div>
       );
     }
@@ -654,9 +643,9 @@ export default function App() {
       return (
         <div className="p-12 text-center flex flex-col items-center justify-center min-h-[55vh] font-sans">
           <div className="bg-slate-900 border border-slate-800 p-8 rounded-2xl max-w-md shadow-xl">
-            <span className="text-xs font-bold text-red-500 font-mono tracking-widest uppercase block mb-3">ACCESS DENIED • SECURE GATEWAY</span>
-            <h3 className="text-white text-lg font-bold">Unauthorized Administration Request</h3>
-            <p className="text-xs text-slate-400 mt-2 leading-relaxed">This module is reserved strictly for SCM Capital Enterprise Administrators. Your profile does not hold the required security clearance keys.</p>
+            <span className="text-xs font-bold text-red-500 font-mono tracking-widest uppercase block mb-3">ACCESS RESTRICTED</span>
+            <h3 className="text-white text-lg font-bold">You do not have access to this page</h3>
+            <p className="text-xs text-slate-400 mt-2 leading-relaxed">This section is available only to authorized SPIP administrators.</p>
           </div>
         </div>
       );
@@ -743,6 +732,8 @@ export default function App() {
             onDeleteTask={handleDeleteTask}
           />
         );
+      case 'client-360':
+        return <Client360 currentUser={currentUser} />;
       case 'pipeline':
         return (
           <Pipeline

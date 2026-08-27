@@ -131,8 +131,8 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess }) => {
       setErrorMsg('Registration is restricted to @scmcapitalng.com email addresses.');
       return;
     }
-    if (password.length < 8) {
-      setErrorMsg('Use a password with at least 8 characters.');
+    if (password.length < 12) {
+      setErrorMsg('Use a password with at least 12 characters.');
       return;
     }
     if (password !== confirmPassword) {
@@ -143,25 +143,31 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess }) => {
     setIsLoading(true);
     setErrorMsg('');
     try {
-      const { error } = await supabase.auth.signUp({
-        email: normalizedEmail,
-        password,
-        options: {
-          data: {
-            full_name: fullName.trim(),
-            department: department.trim() || 'Asset Management',
-            job_title: jobTitle.trim() || null,
-          },
-        },
+      const response = await fetch('/api/auth/register-v2', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fullName: fullName.trim(),
+          email: normalizedEmail,
+          password,
+          department: department.trim() || 'Asset Management',
+          jobTitle: jobTitle.trim() || '',
+        }),
       });
-      if (error) throw new Error(friendlyAuthError(error.message));
-      await supabase.auth.signOut();
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const message = payload?.error || payload?.message || 'Unable to submit your access request. Please try again.';
+        throw new Error(friendlyAuthError(String(message)));
+      }
       setPassword('');
       setConfirmPassword('');
+      setFullName('');
+      setJobTitle('');
       setMode('login');
-      setInfoMsg('Account request submitted. Confirm your email if Supabase sends a confirmation message, then wait for SPIP administrator approval.');
+      setInfoMsg(payload?.message || 'Access request submitted. Wait for SPIP administrator approval before signing in.');
     } catch (error: any) {
-      setErrorMsg(friendlyAuthError(error?.message));
+      const message = error?.message || 'Unable to submit your access request. Please try again.';
+      setErrorMsg(friendlyAuthError(String(message)));
     } finally {
       setIsLoading(false);
     }
@@ -193,7 +199,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess }) => {
   const handleResetPassword = async (event: React.FormEvent) => {
     event.preventDefault();
     if (newPassword.length < 8) {
-      setErrorMsg('Use a password with at least 8 characters.');
+      setErrorMsg('Use a password with at least 12 characters.');
       return;
     }
     if (newPassword !== confirmNewPassword) {
@@ -285,7 +291,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess }) => {
 
             {mode === 'reset_password' && (
               <>
-                <Field icon={<Lock className="w-4 h-4" />} label="New password" type="password" value={newPassword} onChange={setNewPassword} placeholder="Minimum 8 characters" />
+                <Field icon={<Lock className="w-4 h-4" />} label="New password" type="password" value={newPassword} onChange={setNewPassword} placeholder="Minimum 12 characters" />
                 <Field icon={<Lock className="w-4 h-4" />} label="Confirm new password" type="password" value={confirmNewPassword} onChange={setConfirmNewPassword} placeholder="Confirm new password" />
               </>
             )}
