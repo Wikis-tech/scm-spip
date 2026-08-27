@@ -791,11 +791,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
             </span>
           </div>
 
-          <div className="bg-slate-900/40 border border-slate-800 rounded-xl overflow-hidden">
+          <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
-                  <tr className="border-b border-slate-850 bg-slate-950/40 text-slate-400 uppercase tracking-wider text-[9px] font-black">
+                  <tr className="border-b border-slate-200 bg-slate-50 text-slate-500 uppercase tracking-wider text-[9px] font-black">
                     <th className="py-3 px-4">Awaiting Full Name</th>
                     <th className="py-3 px-4">Corporate SCM Email</th>
                     <th className="py-3 px-4">Requested Role</th>
@@ -803,7 +803,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
                     <th className="py-3 px-4 text-right">Verification Gate</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-850 text-xs text-slate-300">
+                <tbody className="divide-y divide-slate-100 text-xs text-slate-700">
                   {pendingApprovals.length === 0 ? (
                     <tr>
                       <td colSpan={5} className="text-center py-10 text-emerald-400 italic font-mono text-[11px]">
@@ -865,7 +865,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
                 placeholder="Search logs by operator, actions, target-id, metadata metrics..."
                 value={auditSearchQuery}
                 onChange={(e) => setAuditSearchQuery(e.target.value)}
-                className="w-full bg-slate-900 border border-slate-800 text-slate-200 placeholder-slate-500 rounded-lg pl-9 pr-4 py-2 text-xs focus:outline-none focus:border-slate-750"
+                className="w-full bg-white border border-slate-200 text-slate-900 placeholder-slate-400 rounded-xl pl-9 pr-4 py-2.5 text-xs focus:outline-none focus:border-[#8c1018] focus:ring-2 focus:ring-red-100"
               />
             </div>
             <div className="flex items-center gap-1.5 bg-white border border-slate-200 px-3 rounded-xl shrink-0">
