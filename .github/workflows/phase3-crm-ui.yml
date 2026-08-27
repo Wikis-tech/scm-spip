@@ -30,10 +30,12 @@ jobs:
         run: node scripts/phase3-compatibility-fix.mjs
       - name: Apply authentication security hardening
         run: node scripts/phase3-security-hardening.mjs
-      - name: Install dependencies
-        run: npm install --no-package-lock
+      - name: Prepare dependency graph
+        run: npm install --package-lock-only --ignore-scripts
       - name: Dependency audit gate
         run: npm audit --omit=dev --audit-level=high
+      - name: Install dependencies
+        run: npm install --no-package-lock
       - name: Phase 3 functional assertions
         run: |
           grep -q "registerPublicAuthRoutes(app, supabaseServer)" server.ts
