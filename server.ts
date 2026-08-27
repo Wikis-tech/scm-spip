@@ -146,8 +146,8 @@ async function getProspectsForUser(req: any) {
       )
     );
   } catch (err: any) {
-    if (isAdmin) return dbProspects;
-    return dbProspects.filter(p => p.assignedOfficerId === userId && p.status !== 'Archived');
+    console.error('[SPIP DATABASE] Prospect query failed:', err?.message || err);
+    throw err;
   }
 }
 
@@ -160,8 +160,8 @@ async function getMeetingsForUser(req: any) {
     }
     return await db.select().from(meetings).where(eq(meetings.officerId, userId));
   } catch (err: any) {
-    if (isAdmin) return dbMeetings;
-    return dbMeetings.filter(m => m.officerId === userId);
+    console.error('[SPIP DATABASE] Meeting query failed:', err?.message || err);
+    throw err;
   }
 }
 
@@ -174,8 +174,8 @@ async function getTasksForUser(req: any) {
     }
     return await db.select().from(tasks).where(eq(tasks.officerId, userId));
   } catch (err: any) {
-    if (isAdmin) return dbTasks;
-    return dbTasks.filter(t => t.officerId === userId);
+    console.error('[SPIP DATABASE] Task query failed:', err?.message || err);
+    throw err;
   }
 }
 
@@ -188,8 +188,8 @@ async function getActivitiesForUser(req: any) {
     }
     return await db.select().from(activities).where(eq(activities.officerId, userId));
   } catch (err: any) {
-    if (isAdmin) return dbActivities;
-    return dbActivities.filter(a => a.officerId === userId);
+    console.error('[SPIP DATABASE] Activity query failed:', err?.message || err);
+    throw err;
   }
 }
 
@@ -207,8 +207,8 @@ async function getContactsForUser(req: any) {
     }
     return [];
   } catch (err: any) {
-    if (isAdmin) return dbContacts;
-    return dbContacts;
+    console.error('[SPIP DATABASE] Contact query failed:', err?.message || err);
+    throw err;
   }
 }
 
@@ -221,8 +221,8 @@ async function getRemindersForUser(req: any) {
     }
     return await db.select().from(reminders).where(eq(reminders.userId, userId));
   } catch (err: any) {
-    if (isAdmin) return dbReminders;
-    return dbReminders.filter(r => r.userId === userId);
+    console.error('[SPIP DATABASE] Reminder query failed:', err?.message || err);
+    throw err;
   }
 }
 

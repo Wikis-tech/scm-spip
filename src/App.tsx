@@ -25,34 +25,11 @@ import { Workspaces } from './pages/Workspaces';
 import { HelpCircle, Sparkles, ShieldCheck } from 'lucide-react';
 import { UserProfile, UserRole, Prospect, Contact, Activity, Meeting, DashboardMetrics, Task, NewsArticle, DiscoveredLead, StaffPerformance } from './types';
 import { registerServiceWorkerAndSubscribe, isPushSupported } from './services/pushService';
-
-// Mock users list matching our seeded profiles and SCM roles
-const simulationUsers: UserProfile[] = [
-  { id: 'user-1', fullName: 'Julian Draxler', email: 'julian.draxler@scmcapitalng.com', role: 'Director', department: 'Executive Management' },
-  { id: 'user-2', fullName: 'John Dept', email: 'john.dept@scmcapitalng.com', role: 'Relationship Manager', department: 'Wealth Advisory Unit' },
-  { id: 'user-3', fullName: 'Adewale Thompson', email: 'adewale.thompson@scmcapitalng.com', role: 'Business Development Officer', department: 'Institutional Sales Unit' }
-];
+import { supabase } from './lib/supabase';
 
 export default function App() {
   // Navigation states
-  const [activeTab, setActiveTab] = useState<string>(() => {
-    const saved = localStorage.getItem('scm_auth_user');
-    if (saved) {
-      try {
-        const user = JSON.parse(saved);
-        const isSuperAdmin = user.email === 'wisdom.okoh@scmcapitalng.com' || 
-                             user.email === 'omololu.ajediran@scmcapitalng.com';
-        const isAdminUser = isSuperAdmin || 
-                            user.role === 'Admin' || 
-                            user.role === 'SUPER_ADMIN' ||
-                            user.role === 'Administrator';
-        if (isAdminUser) {
-          return 'executive-summary';
-        }
-      } catch (e) {}
-    }
-    return 'dashboard';
-  });
+  const [activeTab, setActiveTab] = useState<string>('dashboard');
   const [crmSubTab, setCrmSubTab] = useState<string>('contacts');
   const [searchTerm, setSearchTerm] = useState<string>('');
   
@@ -88,21 +65,70 @@ export default function App() {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // Simulated User state - load from persistent session or start as null to prompt AuthScreen
-  const [currentUser, setCurrentUser] = useState<UserProfile | null>(() => {
-    const saved = localStorage.getItem('scm_auth_user');
-    return saved ? JSON.parse(saved) : null;
+  // Authenticated identity comes from the persisted Supabase session, never from localStorage profile data.
+  const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+
+  const mapProfileToUser = (profile: any): UserProfile => ({
+    id: profile.id,
+    fullName: profile.full_name,
+    email: profile.email,
+    role: profile.permission_level === 'SUPER_ADMIN'
+      ? 'SUPER_ADMIN'
+      : profile.permission_level === 'HOD_ADMIN'
+        ? 'Admin'
+        : 'Business Development Officer',
+    permissionLevel: profile.permission_level,
+    department: profile.department || 'Asset Management',
+    avatarUrl: profile.avatar_url || '',
+    status: profile.status === 'ACTIVE' ? 'Active' : profile.status,
   });
+
+  useEffect(() => {
+    let mounted = true;
+
+    const restoreSession = async () => {
+      try {
+        const { data: sessionData } = await supabase.auth.getSession();
+        const session = sessionData.session;
+        if (!session?.user?.id) {
+          if (mounted) setCurrentUser(null);
+          return;
+        }
+
+        const { data: profile, error } = await supabase
+          .from('profiles')
+          .select('id, full_name, email, permission_level, department, status, avatar_url')
+          .eq('id', session.user.id)
+          .single();
+
+        if (error || !profile || profile.status !== 'ACTIVE') {
+          await supabase.auth.signOut();
+          if (mounted) setCurrentUser(null);
+          return;
+        }
+
+        if (mounted) setCurrentUser(mapProfileToUser(profile));
+      } finally {
+        if (mounted) setAuthReady(true);
+      }
+    };
+
+    restoreSession();
+    const { data } = supabase.auth.onAuthStateChange((event) => {
+      if (event === 'SIGNED_OUT') setCurrentUser(null);
+    });
+
+    return () => {
+      mounted = false;
+      data.subscription.unsubscribe();
+    };
+  }, []);
 
   // Redirect Admin from 'dashboard' to 'executive-summary' and remove legacy sidebar views
   useEffect(() => {
     if (currentUser) {
-      const isSuperAdmin = currentUser.email === 'wisdom.okoh@scmcapitalng.com' || 
-                           currentUser.email === 'omololu.ajediran@scmcapitalng.com';
-      const isAdminUser = isSuperAdmin || 
-                          currentUser.role === 'Admin' || 
-                          currentUser.role === 'SUPER_ADMIN' ||
-                          currentUser.role === 'Administrator';
+      const isAdminUser = currentUser.permissionLevel === 'SUPER_ADMIN' || currentUser.permissionLevel === 'HOD_ADMIN';
       if (isAdminUser) {
         if (activeTab === 'dashboard') {
           setActiveTab('executive-summary');
@@ -150,8 +176,12 @@ export default function App() {
   
   const [isLoading, setIsLoading] = useState<boolean>(true);
 
-  const scmFetch = (url: string, options: RequestInit = {}) => {
-    return fetch(url, options);
+  const scmFetch = async (url: string, options: RequestInit = {}) => {
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+    const headers = new Headers(options.headers || {});
+    if (token) headers.set('Authorization', `Bearer ${token}`);
+    return fetch(url, { ...options, headers });
   };
 
   // Load all SCM records from full-stack API
@@ -159,12 +189,7 @@ export default function App() {
     if (!currentUser) return;
     setIsLoading(true);
 
-    const isSuperAdmin = currentUser.email === 'wisdom.okoh@scmcapitalng.com' || 
-                         currentUser.email === 'omololu.ajediran@scmcapitalng.com';
-    const isAdminUser = isSuperAdmin || 
-                        currentUser.role === 'Admin' || 
-                        currentUser.role === 'SUPER_ADMIN' ||
-                        currentUser.role === 'Administrator';
+    const isAdminUser = currentUser.permissionLevel === 'SUPER_ADMIN' || currentUser.permissionLevel === 'HOD_ADMIN';
 
     try {
       const [resMetrics, resProspects, resContacts, resActivities, resMeetings, resTasks, resNews, resLeads, resStaff] = await Promise.all([
@@ -220,16 +245,14 @@ export default function App() {
           const res = await scmFetch('/api/auth/me');
           if (!res.ok) {
             console.warn('[SCM SECURITY] Session is no longer active or approved. Logging out.');
-            localStorage.removeItem('scm_auth_user');
-            setCurrentUser(null);
+                        setCurrentUser(null);
             return;
           }
           const data = await res.json();
           if (data.user) {
             // Synchronize with latest profile/status changes
             setCurrentUser(data.user);
-            localStorage.setItem('scm_auth_user', JSON.stringify(data.user));
-          }
+                      }
           await refreshDatabase();
         } catch (err) {
           console.error('[SCM AUTH ENGINE] Network lags verifying user identity. Loading from cache:', err);
@@ -266,9 +289,6 @@ export default function App() {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'x-user-id': currentUser.id || '',
-          'x-user-role': currentUser.role || '',
-          'x-user-email': currentUser.email || ''
         },
         body: JSON.stringify(body)
       });
@@ -611,11 +631,7 @@ export default function App() {
       );
     }
 
-    const isSuperAdmin = currentUser.email === 'wisdom.okoh@scmcapitalng.com' || 
-                         currentUser.email === 'omololu.ajediran@scmcapitalng.com';
-    const isAdminUser = isSuperAdmin || 
-                        currentUser.role === 'Admin' || 
-                        currentUser.role === 'SUPER_ADMIN';
+    const isAdminUser = currentUser.permissionLevel === 'SUPER_ADMIN' || currentUser.permissionLevel === 'HOD_ADMIN';
 
     // Guard against non-admin accessing admin modules
     const adminTabs = [
@@ -839,11 +855,8 @@ export default function App() {
 
   const handleLogout = async () => {
     try {
-      await fetch('/api/auth/logout', { method: 'POST' });
-    } catch (error) {
-      console.warn('[SPIP AUTH] Server logout request failed; clearing the local session.', error);
+      await supabase.auth.signOut();
     } finally {
-      localStorage.removeItem('scm_auth_user');
       setCurrentUser(null);
     }
   };
@@ -854,25 +867,23 @@ export default function App() {
     localStorage.setItem('scm_sidebar_collapsed', String(newValue));
   };
 
-  // Render AuthScreen if no persistent B2B session exists
+  if (!authReady) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-950 text-white">
+        <div className="text-sm text-slate-300">Loading secure SPIP session...</div>
+      </div>
+    );
+  }
+
+  // Render AuthScreen if there is no authenticated Supabase session.
   if (!currentUser) {
     return (
-      <AuthScreen 
+      <AuthScreen
         onLoginSuccess={(user) => {
-          localStorage.setItem('scm_auth_user', JSON.stringify(user));
           setCurrentUser(user);
-          const isSuperAdmin = user.email === 'wisdom.okoh@scmcapitalng.com' || 
-                               user.email === 'omololu.ajediran@scmcapitalng.com';
-          const isAdminUser = isSuperAdmin || 
-                              user.role === 'Admin' || 
-                              user.role === 'SUPER_ADMIN' ||
-                              user.role === 'Administrator';
-          if (isAdminUser) {
-            setActiveTab('executive-summary');
-          } else {
-            setActiveTab('dashboard');
-          }
-        }} 
+          const isAdminUser = user.permissionLevel === 'SUPER_ADMIN' || user.permissionLevel === 'HOD_ADMIN';
+          setActiveTab(isAdminUser ? 'executive-summary' : 'dashboard');
+        }}
       />
     );
   }
