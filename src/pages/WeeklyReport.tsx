@@ -79,7 +79,7 @@ export const WeeklyReport: React.FC<WeeklyReportProps> = ({ currentUser }) => {
   };
 
   const isWithinEditPeriod = () => {
-    if (currentUser.role === 'Admin' || currentUser.email === 'wisdom.okoh@scmcapitalng.com' || currentUser.email === 'omololu.ajediran@scmcapitalng.com') {
+    if (currentUser.permissionLevel === 'SUPER_ADMIN' || currentUser.permissionLevel === 'HOD_ADMIN') {
       return true;
     }
     const now = new Date();

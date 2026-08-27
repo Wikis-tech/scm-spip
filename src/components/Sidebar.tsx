@@ -45,13 +45,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
 }) => {
   const [roleMenuOpen, setRoleMenuOpen] = useState(false);
 
-  const isSuperAdmin = currentUser.email === 'wisdom.okoh@scmcapitalng.com' || 
-                       currentUser.email === 'omololu.ajediran@scmcapitalng.com';
-
-  const isAdminUser = isSuperAdmin || 
-                      currentUser.role === 'Admin' || 
-                      currentUser.role === 'SUPER_ADMIN' ||
-                      currentUser.role === 'Administrator';
+  const isSuperAdmin = currentUser.permissionLevel === 'SUPER_ADMIN';
+  const isAdminUser = isSuperAdmin || currentUser.permissionLevel === 'HOD_ADMIN';
 
   const isRelationshipOfficer = currentUser.role === 'Relationship Manager' || currentUser.role === 'Business Development Officer';
 
@@ -61,7 +56,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     navItems = [
       { id: 'executive-summary', label: 'Executive Summary', icon: Award, highlight: true },
       { id: 'workspaces', label: 'Research Workspaces', icon: Briefcase },
-      { id: 'admin-reports', label: 'Weekly Reports', icon: FileSpreadsheet },
+      { id: 'admin-reports', label: 'Management Reports', icon: FileSpreadsheet },
       { id: 'admin-users', label: 'Administration', icon: Users2 },
       { id: 'settings', label: 'Settings', icon: Settings2 },
     ];

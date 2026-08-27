@@ -401,32 +401,9 @@ app.use(async (req, res, next) => {
     const isAdmin = isSuperAdmin || permissionLevel === 'HOD_ADMIN';
     const legacyRole = isSuperAdmin ? 'SUPER_ADMIN' : permissionLevel === 'HOD_ADMIN' ? 'Admin' : 'Business Development Officer';
 
-    try {
-      await db.insert(users).values({
-        id: authUser.id,
-        fullName: profile.full_name,
-        email,
-        role: legacyRole,
-        department: profile.department || 'Asset Management',
-        avatarUrl: profile.avatar_url || '',
-        status: 'Approved'
-      }).onConflictDoUpdate({
-        target: users.id,
-        set: {
-          fullName: profile.full_name,
-          email,
-          role: legacyRole,
-          department: profile.department || 'Asset Management',
-          avatarUrl: profile.avatar_url || '',
-          status: 'Approved'
-        }
-      });
-    } catch (syncError: any) {
-      // The Supabase profile is authoritative for authentication. A legacy CRM directory
-      // synchronization failure must not destroy an otherwise valid authenticated session.
-      // Direct CRM routes still fail closed behind the database health gate below.
-      console.warn('[SPIP SECURITY] Legacy CRM profile synchronization deferred:', syncError?.message || syncError);
-    }
+    // Identity is sourced from the ACTIVE Supabase profile above. The Phase 1B profile
+    // trigger owns legacy users-directory synchronization, so authentication never waits
+    // for the separate direct PostgreSQL connection.
 
     (req as any).user = {
       userId: authUser.id,
@@ -638,7 +615,7 @@ async function checkDatabaseHealth() {
     await seedDefaultAdmins();
   } catch (err: any) {
     isDatabaseHealthy = false;
-    console.log("[SCM DATABASE NOTICE] PostgreSQL database offline - operating in local memory fallback mode:", err.message);
+    console.log("[SCM DATABASE NOTICE] Direct PostgreSQL connection unavailable; CRM data routes remain fail-closed:", err.message);
   } finally {
     if (tempClient) tempClient.release();
     if (tempPool) await tempPool.end();
