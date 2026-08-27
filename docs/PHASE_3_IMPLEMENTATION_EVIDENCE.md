@@ -68,6 +68,10 @@ The hardened Phase 3 workflow successfully passed:
 - TypeScript validation
 - production build
 
+## Preview validation
+
+The hardened Vercel preview for commit `839efff1e5828b9fccebf32ab03c901d2889078f` reached READY and the root document returned HTTP 200. Vercel reported no build failure; only a bundle-size optimization warning remains.
+
 ## Production hold
 
 Do **not** merge PR #6 until both migrations have been executed successfully in the SCM SPIP Supabase project. The connected Supabase integration in the current ChatGPT workspace does not have permission to project ref `erkdqtgvhdvkhhosphir`, so the migrations cannot be truthfully marked as applied from this environment. Once they are applied, PR #6 can be merged and the production runtime/security test suite should be repeated against `scm-spip.vercel.app`.
