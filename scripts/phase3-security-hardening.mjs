@@ -27,17 +27,17 @@ const replacement = `const handleRegister = async (event: React.FormEvent) => {
     setErrorMsg('');
     setInfoMsg('');
     try {
-      // Use Supabase's public signup flow instead of exposing a public endpoint backed by
-      // the service-role admin API. Email confirmation + PENDING approval are both required.
+      // Use Supabase's public signup flow so the corporate mailbox remains part of the
+      // trust boundary. A second PENDING approval gate still blocks platform access.
       const { data, error } = await supabase.auth.signUp({
         email: normalizedEmail,
         password,
         options: {
           emailRedirectTo: window.location.origin,
           data: {
-            full_name: fullName.trim(),
-            department: department.trim() || 'Asset Management',
-            job_title: jobTitle.trim() || null,
+            full_name: fullName.trim().slice(0, 150),
+            department: (department.trim() || 'Asset Management').slice(0, 120),
+            job_title: jobTitle.trim().slice(0, 120) || null,
           },
         },
       });
@@ -45,8 +45,6 @@ const replacement = `const handleRegister = async (event: React.FormEvent) => {
       if (error) throw new Error(friendlyAuthError(error.message));
       if (!data.user) throw new Error('Unable to submit your access request. Please try again.');
 
-      // If identities are disabled by Supabase's anti-enumeration behavior, do not reveal
-      // whether an address already exists. The administrator can verify the pending queue.
       await supabase.auth.signOut();
       setPassword('');
       setConfirmPassword('');
@@ -70,6 +68,18 @@ auth = auth.replace(registerPattern, replacement);
 fs.writeFileSync(authPath, auth);
 
 const publicAuthPath = 'src/server/publicAuthRoutes.ts';
-fs.writeFileSync(publicAuthPath, `import type { Express } from 'express';\nimport type { SupabaseClient } from '@supabase/supabase-js';\n\n/**\n * Legacy Phase 3 registration endpoint.\n *\n * Registration now uses Supabase's public signup flow so email confirmation remains\n * authoritative. Never expose auth.admin.createUser from an unauthenticated endpoint.\n */\nexport function registerPublicAuthRoutes(app: Express, _supabase: SupabaseClient) {\n  app.post('/api/auth/register-v2', (_req, res) => {\n    return res.status(410).json({\n      error: 'This registration route has been retired. Use the secure SPIP access request screen.'\n    });\n  });\n}\n`);
+fs.writeFileSync(publicAuthPath, `import type { Express } from 'express';\nimport type { SupabaseClient } from '@supabase/supabase-js';\n\n/**\n * Legacy Phase 3 registration endpoint.\n * Registration now uses Supabase's public signup flow with mailbox confirmation.\n * Never expose service-role account creation from an unauthenticated endpoint.\n */\nexport function registerPublicAuthRoutes(app: Express, _supabase: SupabaseClient) {\n  app.post('/api/auth/register-v2', (_req, res) => {\n    return res.status(410).json({\n      error: 'This registration route has been retired. Use the secure SPIP access request screen.'\n    });\n  });\n}\n`);
+
+// Require proof of control of the SCM mailbox before an administrator can activate a
+// pending account. This prevents accidental approval of an unverified identity.
+const phase2Path = 'src/server/phase2Routes.ts';
+let phase2 = fs.readFileSync(phase2Path, 'utf8');
+const oldApprovalBlock = `      if (nextStatus === 'ACTIVE') {\n        patch.approved_at = new Date().toISOString();\n        patch.approved_by = actor.userId;\n      }`;
+const newApprovalBlock = `      if (nextStatus === 'ACTIVE') {\n        const { data: authRecord, error: authLookupError } = await supabase.auth.admin.getUserById(targetId);\n        const confirmedAt = authRecord?.user?.email_confirmed_at || authRecord?.user?.confirmed_at;\n        if (authLookupError || !authRecord?.user) {\n          return res.status(503).json({ error: 'Unable to verify this corporate identity before approval.' });\n        }\n        if (!confirmedAt) {\n          return res.status(400).json({ error: 'This user must confirm their SCM corporate email before an administrator can activate the account.' });\n        }\n        patch.approved_at = new Date().toISOString();\n        patch.approved_by = actor.userId;\n      }`;
+if (!phase2.includes(newApprovalBlock)) {
+  if (!phase2.includes(oldApprovalBlock)) throw new Error('Could not locate Phase 2 approval block for hardening');
+  phase2 = phase2.replace(oldApprovalBlock, newApprovalBlock);
+  fs.writeFileSync(phase2Path, phase2);
+}
 
 console.log('Phase 3 security hardening applied.');
