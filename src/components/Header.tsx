@@ -889,13 +889,17 @@ export const Header: React.FC<HeaderProps> = ({
 
         {/* User Role Authorization Signifier */}
         <div className="flex items-center text-slate-550 border border-slate-200/80 px-2 py-1 rounded bg-slate-50 select-none">
-          {currentUser.role === 'Director' || currentUser.role === 'Admin' ? (
+          {currentUser.permissionLevel === 'SUPER_ADMIN' ? (
+            <span className="text-red-700 font-bold text-[10px] uppercase tracking-wide flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-red-600"></span> Super Admin
+            </span>
+          ) : currentUser.permissionLevel === 'HOD_ADMIN' ? (
             <span className="text-emerald-600 font-bold text-[10px] uppercase tracking-wide flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> Writing Allowed
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> HOD Admin
             </span>
           ) : (
             <span className="text-amber-600 font-bold text-[10px] uppercase tracking-wide flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span> Standard RM Role
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span> Staff Access
             </span>
           )}
         </div>

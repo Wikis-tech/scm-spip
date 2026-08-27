@@ -115,10 +115,21 @@ export const ExecutiveSummary: React.FC<ExecutiveSummaryProps> = ({ currentUser 
       });
 
       if (!res.ok) {
-        if (res.status === 403) {
-          throw new Error("Access Denied: You do not have permission to view the executive oversight summary.");
+        let detail = '';
+        try {
+          const body = await res.json();
+          detail = body?.error ? String(body.error) : '';
+        } catch {}
+        if (res.status === 401) {
+          throw new Error('Your secure session could not be verified. Please sign in again.');
         }
-        throw new Error("Failed to load executive summary data from the server.");
+        if (res.status === 403) {
+          throw new Error(detail || 'Access denied: administrator privileges are required.');
+        }
+        if (res.status === 503) {
+          throw new Error(detail || 'The executive data service is temporarily unavailable. Your login is still active.');
+        }
+        throw new Error(detail || 'Failed to load executive summary data from the server.');
       }
 
       const payload = await res.json();
@@ -150,7 +161,7 @@ export const ExecutiveSummary: React.FC<ExecutiveSummaryProps> = ({ currentUser 
         <div className="p-4 bg-red-50 text-red-600 rounded-full">
           <ShieldAlert className="w-12 h-12" />
         </div>
-        <h2 className="text-xl font-bold text-slate-900 tracking-tight">Oversight Authentication Required</h2>
+        <h2 className="text-xl font-bold text-slate-900 tracking-tight">Executive Summary Unavailable</h2>
         <p className="text-slate-500 max-w-md text-sm">{error}</p>
         <button 
           onClick={fetchExecutiveData}
