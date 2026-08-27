@@ -198,7 +198,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
       });
       if (uRes.ok) {
         const uData = await uRes.json();
-        setUsersList(uData);
+        setUsersList(Array.isArray(uData) ? uData : []);
+      } else {
+        const payload = await uRes.json().catch(() => ({}));
+        showToast(payload.error || 'Unable to load the SCM user directory.', 'error');
       }
 
       // Fetch audit logs

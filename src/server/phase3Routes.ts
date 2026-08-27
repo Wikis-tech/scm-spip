@@ -42,6 +42,27 @@ function canManageProspect(user: any, prospect: any): boolean {
   return String(prospect?.assigned_officer_id || '') === String(user.userId);
 }
 
+function mapProspectRow(row: any) {
+  if (!row) return row;
+  return {
+    id: row.id, name: row.name, industry: row.industry, orgType: row.org_type, location: row.location,
+    website: row.website, phone: row.phone, email: row.email, source: row.source,
+    assignedOfficerId: row.assigned_officer_id, assignedOfficerName: row.assigned_officer_name,
+    status: row.status, priority: row.priority, notes: row.notes,
+    conversionProbability: Number(row.conversion_probability || 0),
+    opportunityValue: Number(row.opportunity_value || 0),
+    treasuryPotential: row.treasury_potential, mmfPotential: row.mmf_potential, wealthPotential: row.wealth_potential,
+    literacyPotential: row.literacy_potential, opportunityScore: Number(row.opportunity_score || 0),
+    primaryContactId: row.primary_contact_id, stageEnteredDate: row.stage_entered_date, stageUpdatedDate: row.stage_updated_date,
+    actualRevenue: Number(row.actual_revenue || 0), lastActivityDate: row.last_activity_date, nextAction: row.next_action,
+    productInterests: row.product_interests || [], campaignId: row.campaign_id, convertedAt: row.converted_at,
+    convertedProduct: row.converted_product, initialInvestment: Number(row.initial_investment || 0),
+    currentAum: Number(row.current_aum || 0), relationshipHealth: row.relationship_health,
+    apolloOrganizationId: row.apollo_organization_id, websiteDomain: row.website_domain,
+    createdAt: row.created_at, updatedAt: row.updated_at,
+  };
+}
+
 async function findDuplicate(supabase: SupabaseClient, input: any, excludeId?: string) {
   const { data, error } = await supabase
     .from('prospects')
@@ -74,7 +95,7 @@ export function registerPhase3Routes(app: Express, supabase: SupabaseClient) {
     if (!user?.isAdmin) query = query.eq('assigned_officer_id', user?.userId || '');
     const { data, error } = await query;
     if (error) return res.status(500).json({ error: 'Unable to load CRM prospects.' });
-    return res.json(data || []);
+    return res.json((data || []).map(mapProspectRow));
   });
 
   app.post('/api/crm/prospects/check-duplicate', async (req, res) => {
@@ -133,7 +154,7 @@ export function registerPhase3Routes(app: Express, supabase: SupabaseClient) {
 
       const { data, error } = await supabase.from('prospects').insert(payload).select('*').single();
       if (error) throw error;
-      return res.status(201).json(data);
+      return res.status(201).json(mapProspectRow(data));
     } catch (error: any) {
       console.error('[PHASE 3] Prospect creation failed:', error?.message || error);
       return res.status(500).json({ error: 'Unable to create the prospect.' });
@@ -198,7 +219,7 @@ export function registerPhase3Routes(app: Express, supabase: SupabaseClient) {
 
     const { data, error } = await supabase.from('prospects').update(patch).eq('id', prospectId).select('*').single();
     if (error) return res.status(500).json({ error: 'Unable to update the prospect.' });
-    return res.json(data);
+    return res.json(mapProspectRow(data));
   });
 
   app.post('/api/crm/prospects/:id/convert', async (req, res) => {
@@ -243,7 +264,7 @@ export function registerPhase3Routes(app: Express, supabase: SupabaseClient) {
     }).eq('id', prospectId).select('*').single();
 
     if (error) return res.status(500).json({ error: 'Conversion was recorded but the prospect status could not be updated.' });
-    return res.status(201).json({ prospect: data, conversion });
+    return res.status(201).json({ prospect: mapProspectRow(data), conversion });
   });
 
   app.get('/api/crm/campaigns', async (_req, res) => {
