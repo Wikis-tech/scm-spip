@@ -116,6 +116,161 @@ async function safeSelect(supabase: SupabaseClient, table: string, columns = '*'
 }
 
 export function registerPhase2Routes(app: Express, supabase: SupabaseClient) {
+  // Phase 1/2 stabilization: the executive dashboard must not depend on the separate
+  // direct PostgreSQL connection. Supabase is the canonical identity/data plane for
+  // administration and management reporting, so this route is intentionally registered
+  // before the legacy CRM database health gate in server.ts.
+  app.get('/api/admin/executive-dashboard-summary', async (req, res) => {
+    if (!requireAdmin(req, res)) return;
+
+    const safeRows = async (table: string, columns = '*'): Promise<any[]> => {
+      try {
+        const { data, error } = await supabase.from(table).select(columns);
+        if (error) {
+          console.warn(`[PHASE 2 EXECUTIVE] ${table} unavailable: ${error.message}`);
+          return [];
+        }
+        return (data as any[]) || [];
+      } catch (error: any) {
+        console.warn(`[PHASE 2 EXECUTIVE] ${table} unavailable: ${error?.message || error}`);
+        return [];
+      }
+    };
+
+    try {
+      const [profiles, prospects, meetings, reports, workspaces, searchHistory, proposals, presentations] = await Promise.all([
+        safeRows('profiles', 'id, full_name, email, permission_level, department, status, approved_at, created_at'),
+        safeRows('prospects', 'id, name, assigned_officer_id, assigned_officer_name, status, actual_revenue, opportunity_value, created_at, updated_at'),
+        safeRows('meetings', 'id, officer_id, prospect_name, date, status, created_at'),
+        safeRows('weekly_reports', 'id, user_id, user_name, user_email, week_start_date, week_end_date, status, submitted_at, funds_secured, prospects_added, meetings_held, products_sold'),
+        safeRows('workspaces', 'id, owner_user_id, status, created_at, updated_at'),
+        safeRows('workspace_search_history', 'id, workspace_id, user_id, created_at'),
+        safeRows('workspace_proposals', 'id, workspace_id, created_at'),
+        safeRows('workspace_presentations', 'id, workspace_id, created_at'),
+      ]);
+
+      const activeProfiles = profiles.filter((p: any) => p.status === 'ACTIVE');
+      const activeProspects = prospects.filter((p: any) => !['Lost', 'Archived', 'Seed Data'].includes(String(p.status)));
+      const closedProspects = prospects.filter((p: any) => ['Won', 'Converted'].includes(String(p.status)));
+      const totalFundsSecured = closedProspects.reduce((sum: number, p: any) => sum + Number(p.actual_revenue || 0), 0);
+      const submittedReports = reports.filter((r: any) => ['Submitted', 'Reviewed'].includes(String(r.status)));
+
+      const officers = activeProfiles
+        .filter((p: any) => p.permission_level === 'STAFF')
+        .map((profile: any) => {
+          const officerProspects = prospects.filter((p: any) => p.assigned_officer_id === profile.id);
+          const officerMeetings = meetings.filter((m: any) => m.officer_id === profile.id);
+          const officerClosed = officerProspects.filter((p: any) => ['Won', 'Converted'].includes(String(p.status)));
+          const officerReports = reports
+            .filter((r: any) => r.user_id === profile.id)
+            .sort((a: any, b: any) => String(b.submitted_at || b.week_end_date || '').localeCompare(String(a.submitted_at || a.week_end_date || '')));
+          const products = new Set<string>();
+          officerReports.forEach((r: any) => String(r.products_sold || '').split(/[,;\n]/).map((v: string) => v.trim()).filter(Boolean).forEach((v: string) => products.add(v)));
+          return {
+            id: profile.id,
+            fullName: profile.full_name,
+            role: profile.permission_level === 'STAFF' ? 'Business Development Officer' : profile.permission_level,
+            prospects: officerProspects.length,
+            meetings: officerMeetings.length,
+            investmentsClosed: officerClosed.length,
+            amountSecured: officerClosed.reduce((sum: number, p: any) => sum + Number(p.actual_revenue || 0), 0),
+            productsSold: Array.from(products),
+            lastReportSubmitted: officerReports[0]?.submitted_at || officerReports[0]?.week_end_date || '',
+            status: profile.status,
+          };
+        });
+
+      const leaderboard = officers
+        .map((o: any) => ({
+          id: o.id,
+          fullName: o.fullName,
+          amountSecured: o.amountSecured,
+          dealsClosed: o.investmentsClosed,
+          conversionRate: o.prospects > 0 ? Math.round((o.investmentsClosed / o.prospects) * 100) : 0,
+        }))
+        .sort((a: any, b: any) => b.amountSecured - a.amountSecured || b.dealsClosed - a.dealsClosed)
+        .slice(0, 10);
+
+      const productMap = new Map<string, { productName: string; investmentsCount: number; totalAmount: number }>();
+      reports.forEach((r: any) => {
+        const names = String(r.products_sold || '').split(/[,;\n]/).map((v: string) => v.trim()).filter(Boolean);
+        names.forEach((name: string) => {
+          const key = name.toLowerCase();
+          const current = productMap.get(key) || { productName: name, investmentsCount: 0, totalAmount: 0 };
+          current.investmentsCount += 1;
+          current.totalAmount += Number(r.funds_secured || 0);
+          productMap.set(key, current);
+        });
+      });
+
+      const recentReports = [...submittedReports]
+        .sort((a: any, b: any) => String(b.submitted_at || b.week_end_date || '').localeCompare(String(a.submitted_at || a.week_end_date || '')))
+        .slice(0, 20)
+        .map((r: any) => ({
+          id: r.id,
+          officerName: r.user_name,
+          officerEmail: r.user_email,
+          weekStartDate: r.week_start_date,
+          weekEndDate: r.week_end_date,
+          submissionDate: r.submitted_at || r.week_end_date,
+          status: r.status,
+          fundsSecured: Number(r.funds_secured || 0),
+          prospectsAdded: Number(r.prospects_added || 0),
+          meetingsHeld: Number(r.meetings_held || 0),
+        }));
+
+      const activityRows: any[] = [];
+      prospects.slice(-15).forEach((p: any) => activityRows.push({
+        type: 'prospect', id: p.id, title: `Prospect: ${p.name}`, detail: `Status: ${p.status}`, timestamp: p.updated_at || p.created_at || '',
+      }));
+      meetings.slice(-15).forEach((m: any) => activityRows.push({
+        type: 'meeting', id: m.id, title: `Meeting: ${m.prospect_name || 'Client meeting'}`, detail: `Status: ${m.status || 'Scheduled'}`, timestamp: m.date || m.created_at || '',
+      }));
+      recentReports.slice(0, 10).forEach((r: any) => activityRows.push({
+        type: 'report', id: r.id, title: `Weekly report: ${r.officerName}`, detail: `${r.status} • ₦${Number(r.fundsSecured || 0).toLocaleString()} secured`, timestamp: r.submissionDate || '',
+      }));
+      activeProfiles.filter((p: any) => p.approved_at).slice(-10).forEach((p: any) => activityRows.push({
+        type: 'user_approved', id: p.id, title: `User approved: ${p.full_name}`, detail: p.email, timestamp: p.approved_at,
+      }));
+      activityRows.sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')));
+
+      const insights: string[] = [];
+      const conversionRate = prospects.length > 0 ? Math.round((closedProspects.length / prospects.length) * 100) : 0;
+      insights.push(`Current platform conversion rate is ${conversionRate}% across ${prospects.length} recorded prospects.`);
+      insights.push(`${submittedReports.length} weekly reports have been submitted or reviewed across the current reporting history.`);
+      if (leaderboard[0]) insights.push(`Top recorded performer is ${leaderboard[0].fullName} with ₦${Number(leaderboard[0].amountSecured || 0).toLocaleString()} secured.`);
+      insights.push(`There are ${workspaces.filter((w: any) => String(w.status).toLowerCase() === 'active').length} active research workspaces supporting prospect development.`);
+
+      return res.json({
+        overview: {
+          totalOfficers: officers.length,
+          totalActiveProspects: activeProspects.length,
+          totalMeetingsHeld: meetings.filter((m: any) => ['Held', 'Completed', 'Done'].includes(String(m.status))).length || meetings.length,
+          totalInvestmentsClosed: closedProspects.length,
+          totalFundsSecured,
+          totalReportsSubmitted: submittedReports.length,
+        },
+        workspaces: {
+          totalWorkspaces: workspaces.length,
+          activeWorkspaces: workspaces.filter((w: any) => String(w.status).toLowerCase() === 'active').length,
+          archivedWorkspaces: workspaces.filter((w: any) => String(w.status).toLowerCase() === 'archived').length,
+          researchSessionsCount: searchHistory.length,
+          proposalsCount: proposals.length,
+          presentationsCount: presentations.length,
+        },
+        officers,
+        leaderboard,
+        products: Array.from(productMap.values()).sort((a, b) => b.totalAmount - a.totalAmount),
+        reports: recentReports,
+        insights,
+        activities: activityRows.slice(0, 30),
+      });
+    } catch (error: any) {
+      console.error('[PHASE 2 EXECUTIVE] Failed to build executive dashboard:', error?.message || error);
+      return res.status(500).json({ error: 'Unable to build the executive summary right now.' });
+    }
+  });
+
   // Canonical user directory. `profiles` is the source of truth for identity and permissions.
   app.get('/api/admin/users', async (req, res) => {
     if (!requireAdmin(req, res)) return;
