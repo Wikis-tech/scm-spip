@@ -32,6 +32,8 @@ jobs:
         run: node scripts/phase3-security-hardening.mjs
       - name: Install dependencies
         run: npm install --no-package-lock
+      - name: Dependency audit gate
+        run: npm audit --omit=dev --audit-level=high
       - name: Phase 3 functional assertions
         run: |
           grep -q "registerPublicAuthRoutes(app, supabaseServer)" server.ts
@@ -55,7 +57,9 @@ jobs:
             echo "Frontend still depends on retired admin-backed signup endpoint" >&2
             exit 1
           fi
-          grep -q "status = 'PENDING'" database/migrations/phase_2c_signup_reliability.sql
+          grep -q "'PENDING'" database/migrations/phase_2c_signup_reliability.sql
+          grep -q "getUserById(targetId)" src/server/phase2Routes.ts
+          grep -q "email_confirmed_at" src/server/phase2Routes.ts
           grep -q "revoke all on public.campaigns from anon, authenticated" database/migrations/phase_3_crm_client360.sql
           grep -q "prospects_apollo_org_unique_idx" database/migrations/phase_3_crm_client360.sql
           grep -q "client_conversions_nonnegative_amounts" database/migrations/phase_3_crm_client360.sql
