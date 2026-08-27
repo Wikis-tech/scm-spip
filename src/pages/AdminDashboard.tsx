@@ -330,8 +330,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
 
   const handleSavePasswordReset = async () => {
     if (!resettingUserPassword) return;
-    if (!newPassword || newPassword.trim().length < 6) {
-      showToast("Password must be at least 6 characters in length.", 'error');
+    if (!newPassword || newPassword.trim().length < 12) {
+      showToast("Temporary passwords must be at least 12 characters in length.", 'error');
       return;
     }
 
@@ -457,7 +457,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
           </div>
           <h1 className="text-xl font-bold text-white font-display">SCM Platform Governance Center</h1>
           <p className="text-slate-400 text-xs mt-0.5">
-            System administration console for <strong>Wisdom Okoh</strong> and <strong>Omololu Ajediran</strong>.
+            Permission-controlled administration for Super Admin and HOD Admin roles.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -674,8 +674,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
                   ) : (
                     filteredUsers.map((user) => {
                       const isSelf = user.email.toLowerCase() === currentUser.email.toLowerCase();
-                      const isSuper = user.email.toLowerCase() === "wisdom.okoh@scmcapitalng.com" || 
-                                      user.email.toLowerCase() === "omololu.ajediran@scmcapitalng.com";
+                      const isSuper = user.permissionLevel === 'SUPER_ADMIN';
                       return (
                         <tr key={user.id} className="hover:bg-slate-900/20 transition-all">
                           <td className="py-3.5 px-4">
@@ -715,14 +714,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
                                 <Settings className="w-3.5 h-3.5" />
                               </button>
 
-                              {/* Reset secret password */}
-                              <button
-                                onClick={() => setResettingUserPassword(user)}
-                                className="p-1.5 bg-slate-850 hover:bg-slate-800 border border-slate-800 rounded-lg text-slate-300 hover:text-emerald-400 transition-all"
-                                title="Reset Secret Password"
-                              >
-                                <Key className="w-3.5 h-3.5" />
-                              </button>
+                              {/* Password resets are restricted to the canonical Super Admin. */}
+                              {currentUser.permissionLevel === 'SUPER_ADMIN' && (
+                                <button
+                                  onClick={() => setResettingUserPassword(user)}
+                                  className="p-1.5 bg-slate-850 hover:bg-slate-800 border border-slate-800 rounded-lg text-slate-300 hover:text-emerald-400 transition-all"
+                                  title="Reset Temporary Password"
+                                >
+                                  <Key className="w-3.5 h-3.5" />
+                                </button>
+                              )}
 
                               {/* Block/Suspend Toggle */}
                               {!isSuper && (user.status === 'Approved' || user.status === 'Active') && (

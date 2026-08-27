@@ -1,0 +1,56 @@
+name: Phase 2 Runtime Integration
+
+on:
+  push:
+    branches: [phase-2-users-admin-reporting]
+
+permissions:
+  contents: write
+
+jobs:
+  integrate-and-validate:
+    if: "!contains(github.event.head_commit.message, '[phase2-runtime-fixed]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: phase-2-users-admin-reporting
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Apply Phase 2 integration
+        run: |
+          node scripts/phase2-runtime-fix.mjs
+          node scripts/phase2-ui-permissions-fix.mjs
+      - name: Install dependencies
+        run: npm install --no-package-lock
+      - name: Phase 2 assertions
+        run: |
+          grep -q "registerPhase2Routes(app, supabaseServer)" server.ts
+          grep -q "registerPhase2WeeklyRoutes(app, supabaseServer)" server.ts
+          grep -q "Identity is sourced from the ACTIVE Supabase profile" server.ts
+          grep -q "ManagementReports" src/App.tsx
+          grep -q "res.status === 401 || res.status === 403" src/App.tsx
+          grep -q "currentUser.permissionLevel === 'SUPER_ADMIN'" src/components/Sidebar.tsx
+          grep -q "Management Reports" src/components/Sidebar.tsx
+          grep -q "Permission-controlled administration" src/pages/AdminDashboard.tsx
+          if grep -q "Failed to synchronize authenticated profile" server.ts; then
+            echo "Legacy profile synchronization still blocks or pollutes authentication path"
+            exit 1
+          fi
+      - name: Type check
+        run: npm run lint
+      - name: Production build
+        run: npm run build
+      - name: Commit integrated runtime
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server.ts src/App.tsx src/components/Sidebar.tsx src/pages/AdminDashboard.tsx src/pages/WeeklyReport.tsx
+          if git diff --cached --quiet; then
+            echo "No runtime integration changes to commit"
+          else
+            git commit -m "feat: complete Phase 2 runtime integration [phase2-runtime-fixed]"
+            git push origin HEAD:phase-2-users-admin-reporting
+          fi

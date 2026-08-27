@@ -21,6 +21,8 @@ dotenv.config();
 import { searchOrganizations, discoverDecisionMakers, enrichOrganization, apolloDiagnostics } from "./src/services/apolloService.ts";
 import { verifyData } from "./src/services/verificationService.ts";
 import { calculateProductRecommendations } from "./src/utils/recommendationEngine.ts";
+import { registerPhase2Routes } from "./src/server/phase2Routes.ts";
+import { registerPhase2WeeklyRoutes } from "./src/server/phase2WeeklyRoutes.ts";
 import { discoveryQueueEngine, DBClientContext } from "./src/services/discovery/discoveryQueueEngine.ts";
 
 // Helper to validate corporate email domain and format
@@ -399,30 +401,9 @@ app.use(async (req, res, next) => {
     const isAdmin = isSuperAdmin || permissionLevel === 'HOD_ADMIN';
     const legacyRole = isSuperAdmin ? 'SUPER_ADMIN' : permissionLevel === 'HOD_ADMIN' ? 'Admin' : 'Business Development Officer';
 
-    try {
-      await db.insert(users).values({
-        id: authUser.id,
-        fullName: profile.full_name,
-        email,
-        role: legacyRole,
-        department: profile.department || 'Asset Management',
-        avatarUrl: profile.avatar_url || '',
-        status: 'Approved'
-      }).onConflictDoUpdate({
-        target: users.id,
-        set: {
-          fullName: profile.full_name,
-          email,
-          role: legacyRole,
-          department: profile.department || 'Asset Management',
-          avatarUrl: profile.avatar_url || '',
-          status: 'Approved'
-        }
-      });
-    } catch (syncError: any) {
-      console.error('[SPIP SECURITY] Failed to synchronize authenticated profile:', syncError?.message || syncError);
-      return res.status(503).json({ error: 'SPIP database is temporarily unavailable.' });
-    }
+    // Identity is sourced from the ACTIVE Supabase profile above. The Phase 1B profile
+    // trigger owns legacy users-directory synchronization, so authentication never waits
+    // for the separate direct PostgreSQL connection.
 
     (req as any).user = {
       userId: authUser.id,
@@ -460,6 +441,11 @@ app.use(async (req, res, next) => {
     return res.status(503).json({ error: 'Authentication service is temporarily unavailable.' });
   }
 });
+
+// Phase 2 identity, administration and reporting routes use the trusted Supabase
+// server client and are registered before the legacy PostgreSQL health gate.
+registerPhase2Routes(app, supabaseServer);
+registerPhase2WeeklyRoutes(app, supabaseServer);
 
 const PORT = Number(process.env.PORT || 3000);
 
@@ -629,7 +615,7 @@ async function checkDatabaseHealth() {
     await seedDefaultAdmins();
   } catch (err: any) {
     isDatabaseHealthy = false;
-    console.log("[SCM DATABASE NOTICE] PostgreSQL database offline - operating in local memory fallback mode:", err.message);
+    console.log("[SCM DATABASE NOTICE] Direct PostgreSQL connection unavailable; CRM data routes remain fail-closed:", err.message);
   } finally {
     if (tempClient) tempClient.release();
     if (tempPool) await tempPool.end();

@@ -19,7 +19,7 @@ import { Pipeline } from './pages/Pipeline';
 import { CalendarPage } from './pages/CalendarPage';
 import { AdminDashboard } from './pages/AdminDashboard';
 import { WeeklyReport } from './pages/WeeklyReport';
-import { AdminReports } from './pages/AdminReports';
+import { ManagementReports } from './pages/ManagementReports';
 import { ExecutiveSummary } from './pages/ExecutiveSummary';
 import { Workspaces } from './pages/Workspaces';
 import { HelpCircle, Sparkles, ShieldCheck } from 'lucide-react';
@@ -244,8 +244,14 @@ export default function App() {
         try {
           const res = await scmFetch('/api/auth/me');
           if (!res.ok) {
-            console.warn('[SCM SECURITY] Session is no longer active or approved. Logging out.');
-                        setCurrentUser(null);
+            // Only authentication/authorization failures invalidate the browser session.
+            // A temporary API/database outage must not bounce an authenticated user to login.
+            if (res.status === 401 || res.status === 403) {
+              console.warn('[SCM SECURITY] Session is no longer active or approved. Logging out.');
+              setCurrentUser(null);
+            } else {
+              console.warn('[SCM PLATFORM] Session check temporarily unavailable; retaining valid Supabase session.');
+            }
             return;
           }
           const data = await res.json();
@@ -838,7 +844,7 @@ export default function App() {
         );
       case 'admin-reports':
         return (
-          <AdminReports
+          <ManagementReports
             currentUser={currentUser}
           />
         );
