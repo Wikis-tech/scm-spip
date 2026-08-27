@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   build-test-phase3:
-    if: "!contains(github.event.head_commit.message, '[phase3-validated]')"
+    if: "!contains(github.event.head_commit.message, '[phase3-secure]')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,14 +28,16 @@ jobs:
           fi
       - name: Apply compatibility contract fixes
         run: node scripts/phase3-compatibility-fix.mjs
+      - name: Apply authentication security hardening
+        run: node scripts/phase3-security-hardening.mjs
       - name: Install dependencies
         run: npm install --no-package-lock
-      - name: Phase 3 assertions
+      - name: Phase 3 functional assertions
         run: |
           grep -q "registerPublicAuthRoutes(app, supabaseServer)" server.ts
           grep -q "registerPhase3Routes(app, supabaseServer)" server.ts
           grep -q "registerPhase3CrudRoutes(app, supabaseServer)" server.ts
-          grep -q "/api/auth/register-v2" src/components/AuthScreen.tsx
+          grep -q "supabase.auth.signUp" src/components/AuthScreen.tsx
           grep -q "Client360" src/App.tsx
           grep -q "OfficerDashboardCharts" src/pages/Dashboard.tsx
           grep -q "ExecutiveRecharts" src/pages/ExecutiveSummary.tsx
@@ -43,11 +45,29 @@ jobs:
           grep -q "mapProspectRow" src/server/phase3Routes.ts
           grep -q "mapContactRow" src/server/phase3CrudRoutes.ts
           grep -q '"recharts"' package.json
+      - name: Phase 3 security assertions
+        run: |
+          if grep -q "auth.admin.createUser" src/server/publicAuthRoutes.ts; then
+            echo "Unsafe public service-role account creation detected" >&2
+            exit 1
+          fi
+          if grep -q "fetch('/api/auth/register-v2'" src/components/AuthScreen.tsx; then
+            echo "Frontend still depends on retired admin-backed signup endpoint" >&2
+            exit 1
+          fi
+          grep -q "status = 'PENDING'" database/migrations/phase_2c_signup_reliability.sql
+          grep -q "revoke all on public.campaigns from anon, authenticated" database/migrations/phase_3_crm_client360.sql
+          grep -q "prospects_apollo_org_unique_idx" database/migrations/phase_3_crm_client360.sql
+          grep -q "client_conversions_nonnegative_amounts" database/migrations/phase_3_crm_client360.sql
+          if grep -R -n --exclude-dir=node_modules --exclude='*.md' "scmcapital2026" src server.ts api; then
+            echo "Legacy default password pattern detected" >&2
+            exit 1
+          fi
       - name: Type check
         run: npm run lint
       - name: Production build
         run: npm run build
-      - name: Commit validated generated changes
+      - name: Commit validated secure changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -55,6 +75,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No generated changes to commit"
           else
-            git commit -m "fix: validate Phase 3 CRM compatibility [phase3-validated]"
+            git commit -m "security: validate hardened Phase 3 runtime [phase3-secure]"
             git push origin HEAD:phase-3-crm-ui-charts
           fi
