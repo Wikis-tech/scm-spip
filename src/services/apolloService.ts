@@ -134,51 +134,11 @@ export const apolloDiagnostics: ApolloDiagnostic = {
 };
 
 function getApolloApiKey(): string {
-  let key = process.env.APOLLO_API_KEY || "";
-  let source = "process.env.APOLLO_API_KEY";
-  if (!key) {
-    key = process.env.VITE_APOLLO_API_KEY || "";
-    source = "process.env.VITE_APOLLO_API_KEY";
-  }
-  if (!key) {
-    key = "KpuBuIUPuGIKOatjdoiVeA";
-    source = "default_fallback";
-  }
-  
-  try {
-    const metaEnv = (import.meta as any).env;
-    if (metaEnv && metaEnv.VITE_APOLLO_API_KEY) {
-      key = metaEnv.VITE_APOLLO_API_KEY;
-      source = "import.meta.env.VITE_APOLLO_API_KEY";
-    }
-  } catch (e) {
-    // catch reference error if import.meta is unavailable
-  }
-
-  if (key) {
-    key = key.trim();
-    // Robust parsing: strip leading/trailing single/double quotes, braces/curly braces, or square brackets
-    if (key.startsWith("[") && key.endsWith("]")) {
-      key = key.substring(1, key.length - 1);
-    } else if (key.startsWith("{") && key.endsWith("}")) {
-      key = key.substring(1, key.length - 1);
-    }
-    key = key.trim();
-    if (key.startsWith('"') && key.endsWith('"')) {
-      key = key.substring(1, key.length - 1);
-    } else if (key.startsWith("'") && key.endsWith("'")) {
-      key = key.substring(1, key.length - 1);
-    }
-    key = key.trim();
-  }
-
+  const key = (process.env.APOLLO_API_KEY || '').trim();
   apolloDiagnostics.apolloKeyLoaded = Boolean(key);
-  apolloDiagnostics.apolloKeyLength = key?.length || 0;
-  apolloDiagnostics.apolloKeySource = source;
+  apolloDiagnostics.apolloKeyLength = key.length;
+  apolloDiagnostics.apolloKeySource = key ? 'process.env.APOLLO_API_KEY' : 'None';
   apolloDiagnostics.apolloConnected = Boolean(key);
-
-  console.log(`[APOLLO AUDIT] Key Exists: ${Boolean(key).toString().toUpperCase()}`);
-  console.log(`[APOLLO AUDIT] Key Length: ${key?.length || 0}`);
   return key;
 }
 

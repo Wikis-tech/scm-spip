@@ -1,3 +1,5 @@
+import { supabase } from '../lib/supabase';
+
 // SCM Prospect Intelligence Platform - Enterprise Web Push Notification Client Service
 
 /**
@@ -135,13 +137,15 @@ export async function registerServiceWorkerAndSubscribe(
 
     // 6. Transmit the subscription metadata securely to the server database
     console.log('[PUSH CLIENT] Synchronizing subscription with SPIP server database...');
+    const { data: authData } = await supabase.auth.getSession();
+    const token = authData.session?.access_token;
+    if (!token) throw new Error('Authenticated SPIP session required for push registration.');
+
     const response = await fetch('/api/push/subscribe', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-user-id': userId,
-        'x-user-email': userEmail || '',
-        'x-user-role': userRole || ''
+        'Authorization': `Bearer ${token}`
       },
       body: JSON.stringify({
         subscription: subscription.toJSON(),
@@ -186,13 +190,15 @@ export async function unsubscribeUser(
 
     // 1. Delete subscription from push server database
     console.log('[PUSH CLIENT] Notifying backend of unsubscribe request...');
+    const { data: authData } = await supabase.auth.getSession();
+    const token = authData.session?.access_token;
+    if (!token) throw new Error('Authenticated SPIP session required for push unsubscribe.');
+
     await fetch('/api/push/unsubscribe', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-user-id': userId || '',
-        'x-user-email': userEmail || '',
-        'x-user-role': userRole || ''
+        'Authorization': `Bearer ${token}`
       },
       body: JSON.stringify({ endpoint: subscription.endpoint })
     });
