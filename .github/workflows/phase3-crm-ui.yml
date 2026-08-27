@@ -30,6 +30,8 @@ jobs:
         run: node scripts/phase3-compatibility-fix.mjs
       - name: Apply authentication security hardening
         run: node scripts/phase3-security-hardening.mjs
+      - name: Apply administration UI polish
+        run: node scripts/phase3-ui-polish.mjs
       - name: Prepare dependency graph
         run: npm install --package-lock-only --ignore-scripts
       - name: Dependency audit gate
@@ -49,6 +51,12 @@ jobs:
           grep -q "mapProspectRow" src/server/phase3Routes.ts
           grep -q "mapContactRow" src/server/phase3CrudRoutes.ts
           grep -q '"recharts"' package.json
+          grep -q "Research Analytics" src/pages/AdminDashboard.tsx
+          grep -q "Active Prospects" src/pages/AdminDashboard.tsx
+          if grep -q "SCM Leads Suspendd\|Enterprise Control Deck" src/pages/AdminDashboard.tsx; then
+            echo "Legacy/typo administration UI copy remains" >&2
+            exit 1
+          fi
       - name: Phase 3 security assertions
         run: |
           if grep -q "auth.admin.createUser" src/server/publicAuthRoutes.ts; then
