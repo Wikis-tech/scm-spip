@@ -23,6 +23,7 @@ jobs:
         run: |
           node scripts/stabilize-phase1-phase2.mjs
           node scripts/fix-phase12-types.mjs
+          node scripts/fix-phase12-header.mjs
       - name: Install dependencies
         run: npm install --no-package-lock
       - name: Runtime assertions
@@ -33,6 +34,9 @@ jobs:
           grep -q "headers.set('Authorization'" src/main.tsx
           grep -q "registerPhase2Routes(app, supabaseServer)" server.ts
           grep -q "registerPhase2WeeklyRoutes(app, supabaseServer)" server.ts
+          grep -q "Super Admin" src/components/Header.tsx
+          grep -q "HOD Admin" src/components/Header.tsx
+          grep -q "Staff Access" src/components/Header.tsx
       - name: Type check
         run: npm run lint
       - name: Production build
@@ -41,7 +45,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/server/phase2Routes.ts src/pages/ExecutiveSummary.tsx
+          git add src/server/phase2Routes.ts src/pages/ExecutiveSummary.tsx src/components/Header.tsx
           if git diff --cached --quiet; then
             echo "No runtime changes to commit"
           else
