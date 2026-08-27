@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   build-test-phase3:
-    if: "!contains(github.event.head_commit.message, '[phase3-applied]')"
+    if: "!contains(github.event.head_commit.message, '[phase3-validated]')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,8 +19,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Apply integration patch
-        run: node scripts/apply-phase3-ui-runtime.mjs
+      - name: Apply initial integration when needed
+        run: |
+          if grep -q "registerPhase3Routes(app, supabaseServer)" server.ts; then
+            echo "Initial Phase 3 integration already present."
+          else
+            node scripts/apply-phase3-ui-runtime.mjs
+          fi
+      - name: Apply compatibility contract fixes
+        run: node scripts/phase3-compatibility-fix.mjs
       - name: Install dependencies
         run: npm install --no-package-lock
       - name: Phase 3 assertions
@@ -33,12 +40,14 @@ jobs:
           grep -q "OfficerDashboardCharts" src/pages/Dashboard.tsx
           grep -q "ExecutiveRecharts" src/pages/ExecutiveSummary.tsx
           grep -q "ManagementRecharts" src/pages/ManagementReports.tsx
+          grep -q "mapProspectRow" src/server/phase3Routes.ts
+          grep -q "mapContactRow" src/server/phase3CrudRoutes.ts
           grep -q '"recharts"' package.json
       - name: Type check
         run: npm run lint
       - name: Production build
         run: npm run build
-      - name: Commit generated integration
+      - name: Commit validated generated changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -46,6 +55,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No generated changes to commit"
           else
-            git commit -m "feat: integrate Phase 3 CRM, signup and analytics [phase3-applied]"
+            git commit -m "fix: validate Phase 3 CRM compatibility [phase3-validated]"
             git push origin HEAD:phase-3-crm-ui-charts
           fi
