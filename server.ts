@@ -4,6 +4,7 @@ import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 import { db, createPool } from "./src/db/index.ts";
 import { users, prospects, contacts, activities, meetings, tasks, newsArticles, discoveredLeads, discoverySessions, discoveryQueues, apolloEnrichmentCache, auditLogs, reminders, savedSessions, serenaAuditLogs, systemAuditLogs, weeklyReports, workspaces, workspaceNotes, workspaceProposals, workspacePresentations, workspaceAiConversations, workspaceSearchHistory, aiSearchHistory, notifications, pushSubscriptions } from "./src/db/schema.ts";
 import { eq, and, desc, asc, sql, inArray, or } from "drizzle-orm";
@@ -32,58 +33,7 @@ function isValidScmEmail(email: string): boolean {
   return /^[a-z0-9._-]+$/.test(localPart);
 }
 
-const initialUsers: any[] = [
-  {
-    id: 'user-admin',
-    fullName: 'Wisdom Okoh',
-    email: 'wisdom.okoh@scmcapitalng.com',
-    role: 'Admin',
-    department: 'Executive Management',
-    avatarUrl: '',
-    password: 'scmcapital2026',
-    status: 'Approved'
-  },
-  {
-    id: 'user-admin-omololu',
-    fullName: 'Omololu Ajediran',
-    email: 'omololu.ajediran@scmcapitalng.com',
-    role: 'Admin',
-    department: 'Executive Management',
-    avatarUrl: '',
-    password: 'scmcapital2026',
-    status: 'Approved'
-  },
-  {
-    id: 'user-1',
-    fullName: 'Julian Draxler',
-    email: 'julian.draxler@scmcapitalng.com',
-    role: 'Director',
-    department: 'Executive Management',
-    avatarUrl: '',
-    password: 'scmcapital2026',
-    status: 'Approved'
-  },
-  {
-    id: 'user-2',
-    fullName: 'John Dept',
-    email: 'john.dept@scmcapitalng.com',
-    role: 'Relationship Manager',
-    department: 'Wealth Advisory Unit',
-    avatarUrl: '',
-    password: 'scmcapital2026',
-    status: 'Approved'
-  },
-  {
-    id: 'user-3',
-    fullName: 'Adewale Thompson',
-    email: 'adewale.thompson@scmcapitalng.com',
-    role: 'Business Development Officer',
-    department: 'Institutional Sales Unit',
-    avatarUrl: '',
-    password: 'scmcapital2026',
-    status: 'Approved'
-  }
-];
+const initialUsers: any[] = [];
 
 const initialProspects: Prospect[] = [];
 const initialContacts: Contact[] = [];
@@ -94,73 +44,38 @@ import { Prospect, Contact, Activity, Meeting, UserProfile, Task, NewsArticle, D
 // Active user OAuth access tokens mapping cached securely in memory on the server
 const activeUserTokens = new Map<string, string>();
 
-// Helper to extract user identity and roles for strict user isolation and CRM security policies
+// Authenticated identity is established exclusively by the Supabase JWT middleware below.
 function getRequestUser(req: any) {
-  if (req && req.user) {
-    return req.user;
-  }
-  const userId = req?.headers?.['x-user-id'] || req?.query?.userId || req?.body?.userId || req?.body?.officerId;
-  const role = req?.headers?.['x-user-role'] || req?.query?.role || req?.body?.userRole || req?.body?.role;
-  const rawEmail = req?.headers?.['x-user-email'] || req?.query?.userEmail || req?.body?.userEmail || req?.body?.email;
-  const email = rawEmail ? String(rawEmail).trim().toLowerCase() : "";
-
-  const isSuperAdminEmail = email === "wisdom.okoh@scmcapitalng.com" || email === "omololu.ajediran@scmcapitalng.com";
-  const userRole = isSuperAdminEmail ? (role || "Admin") : (role || "Business Development Officer");
-  const isAdmin = isSuperAdminEmail || userRole === "Admin" || userRole === "SUPER_ADMIN" || userRole === "Administrator" || userRole === "Director";
-
-  return { 
-    userId: userId || null, 
-    role: userRole || null, 
-    email: email || "", 
-    isAdmin: Boolean(isAdmin), 
-    status: "Approved", 
-    isSuperAdmin: isSuperAdminEmail
+  if (req?.user) return req.user;
+  return {
+    userId: null,
+    role: null,
+    email: '',
+    isAdmin: false,
+    status: 'UNAUTHENTICATED',
+    isSuperAdmin: false,
+    permissionLevel: null
   };
 }
 
-// Guarantees that any assigned user ID or owner ID exists in the Postgres users table to satisfy foreign key constraints
+// Resolve only users that already exist in the SCM user directory. Never auto-provision accounts.
 async function ensureValidUser(requestedUserId?: string | null, requestedEmail?: string | null, requestedName?: string | null) {
   const targetId = requestedUserId ? String(requestedUserId).trim() : null;
   const targetEmail = requestedEmail ? String(requestedEmail).trim().toLowerCase() : null;
-  const targetName = requestedName ? String(requestedName).trim() : (targetEmail ? targetEmail.split('@')[0] : "SCM Relationship Officer");
 
-  try {
-    if (targetId) {
-      const u = await db.select().from(users).where(eq(users.id, targetId));
-      if (u.length > 0) return { id: u[0].id, fullName: u[0].fullName, email: u[0].email };
-    }
-
-    if (targetEmail) {
-      const u = await db.select().from(users).where(eq(users.email, targetEmail));
-      if (u.length > 0) return { id: u[0].id, fullName: u[0].fullName, email: u[0].email };
-    }
-
-    // Auto-provision user record under requested ID and email so assigned_officer_id accurately reflects officer account
-    const newId = targetId || `user-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    const newEmail = targetEmail || `${newId}@scmcapitalng.com`;
-    
-    await db.insert(users).values({
-      id: newId,
-      fullName: targetName,
-      email: newEmail,
-      role: "Business Development Officer",
-      status: "Approved",
-      password: "scmcapital2026",
-      department: "Business Development"
-    });
-
-    return { id: newId, fullName: targetName, email: newEmail };
-  } catch (err: any) {
-    console.error("[SCM DATABASE] ensureValidUser auto-provisioning exception:", err.message);
-    if (targetId) {
-      return { id: targetId, fullName: targetName, email: targetEmail || `${targetId}@scmcapitalng.com` };
-    }
-    const anyUsers = await db.select().from(users).limit(1);
-    if (anyUsers.length > 0) {
-      return { id: anyUsers[0].id, fullName: anyUsers[0].fullName, email: anyUsers[0].email };
-    }
-    return { id: "user-default", fullName: "Wisdom Okoh", email: "wisdom.okoh@scmcapitalng.com" };
+  if (!targetId && !targetEmail) {
+    throw new Error('A valid assigned SCM user is required.');
   }
+
+  const found = targetId
+    ? await db.select().from(users).where(eq(users.id, targetId))
+    : await db.select().from(users).where(eq(users.email, targetEmail!));
+
+  if (found.length === 0) {
+    throw new Error('Assigned SCM user does not exist or has not been activated.');
+  }
+
+  return { id: found[0].id, fullName: found[0].fullName, email: found[0].email };
 }
 
 // System logging helper for auditing and security tracking
@@ -415,85 +330,154 @@ async function robustGenerateContent(params: { model?: string; contents: any; co
 const app = express();
 app.use(express.json());
 
+const supabaseUrl = process.env.SUPABASE_URL?.trim();
+const supabaseServerKey = (process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY)?.trim();
+
+if (!supabaseUrl || !supabaseServerKey) {
+  console.warn('[SPIP SECURITY] Server-side Supabase configuration is incomplete.');
+}
+
+const supabaseServer = createSupabaseClient(
+  supabaseUrl || 'https://invalid.supabase.co',
+  supabaseServerKey || 'missing-server-key',
+  { auth: { persistSession: false, autoRefreshToken: false } }
+);
+
+const PUBLIC_API_PATHS = new Set([
+  '/api/auth/config',
+  '/api/auth/login',
+  '/api/auth/register',
+  '/api/auth/verify',
+  '/api/auth/forgot-password',
+  '/api/auth/reset-password'
+]);
+
 app.use(async (req, res, next) => {
-  const userId = req.headers['x-user-id'] || req.query.userId || req.body?.userId || req.body?.officerId;
-  const role = req.headers['x-user-role'] || req.query.role || req.body?.userRole || req.body?.role;
-  const rawEmail = req.headers['x-user-email'] || req.query.userEmail || req.body?.userEmail || req.body?.email;
-  const email = rawEmail ? String(rawEmail).trim().toLowerCase() : "";
+  if (!req.path.startsWith('/api')) return next();
+  if (PUBLIC_API_PATHS.has(req.path)) return next();
 
-  let dbUser: any = null;
-  if (isDatabaseHealthy) {
+  const authorization = req.headers.authorization || '';
+  if (!authorization.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Authentication required.' });
+  }
+
+  const token = authorization.slice(7).trim();
+  if (!token) return res.status(401).json({ error: 'Authentication required.' });
+
+  try {
+    const { data: authData, error: authError } = await supabaseServer.auth.getUser(token);
+    const authUser = authData?.user;
+    if (authError || !authUser?.id || !authUser.email) {
+      return res.status(401).json({ error: 'Your session is invalid or has expired.' });
+    }
+
+    const email = authUser.email.trim().toLowerCase();
+    if (!isValidScmEmail(email)) {
+      return res.status(403).json({ error: 'SPIP access requires an SCM Capital corporate email.' });
+    }
+
+    const { data: profile, error: profileError } = await supabaseServer
+      .from('profiles')
+      .select('id, full_name, email, permission_level, job_title, department, status, avatar_url')
+      .eq('id', authUser.id)
+      .single();
+
+    if (profileError || !profile) {
+      return res.status(403).json({ error: 'Your SPIP profile is unavailable. Contact an administrator.' });
+    }
+
+    if (profile.status !== 'ACTIVE') {
+      return res.status(403).json({
+        error: profile.status === 'PENDING'
+          ? 'Your SPIP access request is pending administrator approval.'
+          : `Your SPIP account is ${String(profile.status).toLowerCase()}. Contact an administrator.`
+      });
+    }
+
+    const permissionLevel = profile.permission_level;
+    const isSuperAdmin = permissionLevel === 'SUPER_ADMIN';
+    const isAdmin = isSuperAdmin || permissionLevel === 'HOD_ADMIN';
+    const legacyRole = isSuperAdmin ? 'SUPER_ADMIN' : permissionLevel === 'HOD_ADMIN' ? 'Admin' : 'Business Development Officer';
+
     try {
-      if (userId) {
-        const matched = await db.select().from(users).where(eq(users.id, userId));
-        dbUser = matched[0] || null;
-      } else if (email) {
-        const matched = await db.select().from(users).where(eq(users.email, email));
-        dbUser = matched[0] || null;
-      }
-    } catch (err: any) {
-      isDatabaseHealthy = false;
+      await db.insert(users).values({
+        id: authUser.id,
+        fullName: profile.full_name,
+        email,
+        role: legacyRole,
+        department: profile.department || 'Asset Management',
+        avatarUrl: profile.avatar_url || '',
+        status: 'Approved'
+      }).onConflictDoUpdate({
+        target: users.id,
+        set: {
+          fullName: profile.full_name,
+          email,
+          role: legacyRole,
+          department: profile.department || 'Asset Management',
+          avatarUrl: profile.avatar_url || '',
+          status: 'Approved'
+        }
+      });
+    } catch (syncError: any) {
+      console.error('[SPIP SECURITY] Failed to synchronize authenticated profile:', syncError?.message || syncError);
+      return res.status(503).json({ error: 'SPIP database is temporarily unavailable.' });
     }
+
+    (req as any).user = {
+      userId: authUser.id,
+      email,
+      role: legacyRole,
+      permissionLevel,
+      isAdmin,
+      isSuperAdmin,
+      status: 'ACTIVE',
+      fullName: profile.full_name,
+      department: profile.department || 'Asset Management',
+      avatarUrl: profile.avatar_url || ''
+    };
+
+    if (req.path === '/api/auth/me') {
+      await supabaseServer.from('profiles').update({ last_login_at: new Date().toISOString() }).eq('id', authUser.id);
+      return res.json({
+        user: {
+          id: authUser.id,
+          fullName: profile.full_name,
+          email,
+          role: legacyRole,
+          permissionLevel,
+          department: profile.department || 'Asset Management',
+          avatarUrl: profile.avatar_url || '',
+          status: 'Active',
+          verified: true
+        }
+      });
+    }
+
+    return next();
+  } catch (error: any) {
+    console.error('[SPIP SECURITY] Authentication middleware failure:', error?.message || error);
+    return res.status(503).json({ error: 'Authentication service is temporarily unavailable.' });
   }
-
-  if (!dbUser) {
-    if (userId) {
-      dbUser = dbUsers.find((u: any) => u.id === userId) || null;
-    }
-    if (!dbUser && email) {
-      dbUser = dbUsers.find((u: any) => u.email.toLowerCase() === email.toLowerCase()) || null;
-    }
-  }
-
-  const isSuperAdminEmail = email === "wisdom.okoh@scmcapitalng.com" || 
-                            email === "omololu.ajediran@scmcapitalng.com" || 
-                            (dbUser && (dbUser.email.toLowerCase() === "wisdom.okoh@scmcapitalng.com" || 
-                                        dbUser.email.toLowerCase() === "omololu.ajediran@scmcapitalng.com"));
-
-  const status = isSuperAdminEmail ? "Approved" : (dbUser ? dbUser.status || "Approved" : "Approved");
-  const userRole = dbUser ? dbUser.role : (role || "Business Development Officer");
-  const isAdmin = isSuperAdminEmail || userRole === "Admin" || userRole === "SUPER_ADMIN" || userRole === "Administrator" || userRole === "Director";
-
-  (req as any).user = {
-    userId: dbUser ? dbUser.id : (userId || null),
-    role: userRole,
-    email: dbUser ? dbUser.email : email,
-    isAdmin: Boolean(isAdmin),
-    status,
-    isSuperAdmin: isSuperAdminEmail
-  };
-  next();
 });
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
 
 // API ROUTES
 
 let isDatabaseHealthy = false;
 
-async function seedDefaultAdmins() {
-  try {
-    const adminEmails = ["wisdom.okoh@scmcapitalng.com", "omololu.ajediran@scmcapitalng.com"];
-    for (const email of adminEmails) {
-      const existing = await db.select().from(users).where(eq(users.email, email));
-      if (existing.length === 0) {
-        const id = `user-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-        const fullName = email === "wisdom.okoh@scmcapitalng.com" ? "Wisdom Okoh" : "Omololu Ajediran";
-        await db.insert(users).values({
-          id,
-          fullName,
-          email,
-          role: "Admin",
-          status: "Approved",
-          password: "scmcapital2026",
-          department: "Compliance"
-        });
-        console.log(`[SCM DATABASE SEED] Created admin user: ${fullName} (${email})`);
-      }
-    }
-  } catch (err: any) {
-    console.error("[SCM DATABASE SEED ERROR] Failed to seed default admins:", err.message);
+app.use('/api', (req, res, next) => {
+  if (req.path.startsWith('/auth/')) return next();
+  if (process.env.NODE_ENV === 'production' && !isDatabaseHealthy) {
+    return res.status(503).json({ error: 'SPIP database is temporarily unavailable. No changes were saved.' });
   }
+  return next();
+});
+
+async function seedDefaultAdmins() {
+  // Authentication identities are created only in Supabase Auth. No default users or passwords are seeded.
+  return;
 }
 
 // In-Memory Workspace Storage Fallbacks
@@ -656,381 +640,28 @@ setInterval(checkDatabaseHealth, 30000);
 
 // AUTHENTICATION
 
-// Retrieve auth configuration and node status
-app.get("/api/auth/config", (req, res) => {
+app.get('/api/auth/config', (_req, res) => {
   return res.json({
-    demoMode: process.env.DEMO_MODE === "true"
+    provider: 'supabase',
+    corporateDomain: 'scmcapitalng.com',
+    demoMode: false
   });
 });
 
-// Validate current user session and status
-app.get("/api/auth/me", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  const { userId, role, email, status, isAdmin, isSuperAdmin } = getRequestUser(req);
-  if (!userId && !email) {
-    return res.status(401).json({ error: "Not authenticated" });
-  }
-
-  let user: any = null;
-  try {
-    const condition = userId ? eq(users.id, userId) : eq(users.email, email.toLowerCase());
-    const dbUsersFromPg = await db.select().from(users).where(condition);
-    user = dbUsersFromPg[0];
-  } catch (err: any) {
-    console.warn("[SCM DATABASE OFFLINE] Falling back to in-memory dbUsers for /api/auth/me");
-  }
-
-  if (!user) {
-    user = dbUsers.find(u => (userId && u.id === userId) || (email && u.email.toLowerCase() === email.toLowerCase()));
-  }
-
-  if (!user) {
-    return res.status(401).json({ error: "User profile not found in SCM registers." });
-  }
-
-  if (user.status && user.status !== "Approved" && user.status !== "Active") {
-    const isSuperAdminEmail = user.email.toLowerCase() === "wisdom.okoh@scmcapitalng.com" || user.email.toLowerCase() === "omololu.ajediran@scmcapitalng.com";
-    if (!isSuperAdminEmail) {
-      return res.status(403).json({ error: `Your corporate account status is ${user.status}. Access denied.` });
-    }
-  }
-
-  const mappedUser = {
-    id: user.id,
-    fullName: user.fullName,
-    email: user.email,
-    role: user.role,
-    department: user.department,
-    avatarUrl: user.avatarUrl || "",
-    status: user.status || "Approved",
-    verified: true
-  };
-  return res.json({ user: mappedUser });
-});
-
-// User account login endpoint
-app.post("/api/auth/login", async (req, res) => {
-  const { email, password } = req.body;
-  
-  if (!email || !password) {
-    return res.status(400).json({ error: "Email and password are required to login." });
-  }
-
-  // Validate corporate domain and format
-  if (!isValidScmEmail(email)) {
-    return res.status(400).json({ error: "Only SCM Capital email addresses are permitted." });
-  }
-
-  const normalizedEmail = email.toLowerCase().trim();
-
-  let user: any = null;
-  try {
-    const dbUsersFromPg = await db.select().from(users).where(eq(users.email, normalizedEmail));
-    user = dbUsersFromPg[0];
-  } catch (err: any) {
-    console.warn("[SCM DATABASE OFFLINE] Falling back to in-memory dbUsers for login:", err.message);
-  }
-
-  if (!user) {
-    user = dbUsers.find(u => u.email.toLowerCase() === normalizedEmail);
-  }
-
-  // Auto-provision super admin or known users if not found in dbUsers yet
-  if (!user) {
-    const isSuperAdminEmail = normalizedEmail === "wisdom.okoh@scmcapitalng.com" || normalizedEmail === "omololu.ajediran@scmcapitalng.com";
-    if (isSuperAdminEmail) {
-      user = {
-        id: normalizedEmail === "wisdom.okoh@scmcapitalng.com" ? "user-admin" : "user-admin-omololu",
-        fullName: normalizedEmail === "wisdom.okoh@scmcapitalng.com" ? "Wisdom Okoh" : "Omololu Ajediran",
-        email: normalizedEmail,
-        role: "Admin",
-        department: "Executive Management",
-        avatarUrl: "",
-        password: password || "scmcapital2026",
-        status: "Approved"
-      };
-      dbUsers.push(user);
-    }
-  }
-
-  if (!user) {
-    logSystemEvent("User Login Failed", null, "Failure", req, { email: normalizedEmail, reason: "Account not registered" });
-    return res.status(401).json({ error: "Corporate account not registered. Please sign up below." });
-  }
-
-  // Check secret password (if user profile has a password specified)
-  if (user.password && user.password !== password) {
-    logSystemEvent("User Login Failed", user.id, "Failure", req, { email: normalizedEmail, reason: "Invalid password" });
-    return res.status(401).json({ error: "Invalid secret password. Access denied." });
-  }
-
-  // Check user status
-  const isSuperAdminEmail = normalizedEmail === "wisdom.okoh@scmcapitalng.com" || normalizedEmail === "omololu.ajediran@scmcapitalng.com";
-  const userStatus = isSuperAdminEmail ? "Approved" : (user.status || "Approved");
-
-  if (userStatus === "Pending") {
-    logSystemEvent("User Login Blocked", user.id, "Pending", req, { email: normalizedEmail, reason: "Account pending approval" });
-    return res.status(403).json({ error: "Your corporate account is pending Administrator review and activation." });
-  }
-  if (userStatus === "Suspended") {
-    logSystemEvent("User Login Blocked", user.id, "Suspended", req, { email: normalizedEmail, reason: "Account suspended" });
-    return res.status(403).json({ error: "Your corporate account has been suspended. Please contact Executive Admin." });
-  }
-  if (userStatus === "Rejected") {
-    logSystemEvent("User Login Blocked", user.id, "Rejected", req, { email: normalizedEmail, reason: "Account request rejected" });
-    return res.status(403).json({ error: "Your access request has been rejected by SCM Administration." });
-  }
-  if (userStatus === "Inactive") {
-    logSystemEvent("User Login Blocked", user.id, "Inactive", req, { email: normalizedEmail, reason: "Account inactive" });
-    return res.status(403).json({ error: "Your corporate account is inactive." });
-  }
-
-  const mappedUser = {
-    id: user.id,
-    fullName: user.fullName,
-    email: user.email,
-    role: user.role,
-    department: user.department,
-    avatarUrl: user.avatarUrl || "",
-    status: userStatus,
-    verified: true
-  };
-
-  // Log successful login
-  logSystemEvent("User Login", user.id, "Success", req, { email: normalizedEmail, role: user.role });
-
-  return res.json({ user: mappedUser });
-});
-
-// User account registration with verification code
-app.post("/api/auth/register", async (req, res) => {
-  const { fullName, email, password, department } = req.body;
-  if (!fullName || !email || !password) {
-    return res.status(400).json({ error: "Full Name, Email, and Password are required." });
-  }
-
-  // Validate corporate domain and format
-  if (!isValidScmEmail(email)) {
-    return res.status(400).json({ error: "Only SCM Capital email addresses are permitted." });
-  }
-
-  const normalizedEmail = email.toLowerCase().trim();
-
-  let existingInPg: any[] = [];
-  try {
-    existingInPg = await db.select().from(users).where(eq(users.email, normalizedEmail));
-  } catch (err) {}
-
-  const existingInMem = dbUsers.filter(u => u.email.toLowerCase() === normalizedEmail);
-
-  if (existingInPg.length > 0 || existingInMem.length > 0) {
-    return res.status(400).json({ error: "An account with this email already exists under SCM registers." });
-  }
-
-  // Two super admins are pre-approved immediately, other accounts start as Pending
-  const isSuperAdminEmail = normalizedEmail === "wisdom.okoh@scmcapitalng.com" || normalizedEmail === "omololu.ajediran@scmcapitalng.com";
-  const startStatus = isSuperAdminEmail ? "Approved" : "Pending";
-  const assignedRole = isSuperAdminEmail ? "Admin" : "Business Development Officer";
-
-  const newUser = {
-    id: `user-${Date.now()}`,
-    fullName,
-    email: normalizedEmail,
-    role: assignedRole,
-    department: department || "Client Advisory",
-    password,
-    status: startStatus,
-  };
-
-  try {
-    await db.insert(users).values({
-      id: newUser.id,
-      fullName: newUser.fullName,
-      email: newUser.email,
-      role: newUser.role,
-      department: newUser.department,
-      avatarUrl: "",
-      status: newUser.status,
-      password: newUser.password
-    });
-  } catch (err: any) {
-    console.warn("[SCM DATABASE OFFLINE] Saving registered user to in-memory state:", err.message);
-  }
-
-  const mappedUser = {
-    id: newUser.id,
-    fullName: newUser.fullName,
-    email: newUser.email,
-    role: newUser.role as any,
-    department: newUser.department,
-    avatarUrl: "",
-    password: newUser.password,
-    status: newUser.status as any,
-    verified: true,
-    verificationCode: null
-  };
-
-  dbUsers.push(mappedUser);
-
-  console.log(`[SCM AUTH SYSTEM] Registered verified corporate account: ${normalizedEmail} with status: ${startStatus}`);
-  logSystemEvent("User Registration", newUser.id, startStatus, req, { email: newUser.email, fullName: newUser.fullName, role: newUser.role });
-
-  return res.json({ 
-    message: "registered_successfully", 
-    user: mappedUser,
-    demoMode: true
-  });
-});
-
-// User account logout endpoint
-app.post("/api/auth/logout", (req, res) => {
-  res.setHeader("Content-Type", "application/json");
+app.post('/api/auth/logout', async (req, res) => {
   const { userId } = getRequestUser(req);
-  if (userId) {
-    logSystemEvent("User Logout", userId, "Success", req);
-  }
+  if (userId) await logSystemEvent('User Logout', userId, 'Success', req);
   return res.json({ success: true });
 });
 
-const resetCodes = new Map<string, string>();
-
-// Code verification endpoint
-app.post("/api/auth/verify", async (req, res) => {
-  const { email, code } = req.body;
-  if (!email || !code) {
-    return res.status(400).json({ error: "Email and verification code are required." });
-  }
-
-  // Validate corporate domain and format
-  if (!isValidScmEmail(email)) {
-    return res.status(400).json({ error: "Only SCM Capital email addresses are permitted." });
-  }
-
-  const normalizedEmail = email.toLowerCase().trim();
-
-  let user: any = null;
-  try {
-    const list = await db.select().from(users).where(eq(users.email, normalizedEmail));
-    user = list[0];
-  } catch (err) {}
-
-  if (!user) {
-    user = dbUsers.find(u => u.email.toLowerCase() === normalizedEmail);
-  }
-
-  if (!user) {
-    return res.status(404).json({ error: "Account not found." });
-  }
-
-  const expectedCode = resetCodes.get(normalizedEmail);
-  if (expectedCode && expectedCode !== code.trim()) {
-    return res.status(400).json({ error: "Incorrect 6-digit confirmation key. Access denied." });
-  }
-
-  user.status = "Approved";
-  try {
-    await db.update(users).set({ status: "Approved" }).where(eq(users.id, user.id));
-  } catch (err) {}
-
-  console.log(`[SCM ACCESS GRANTED] ${user.email} is now fully verified.`);
-  
-  return res.json({ 
-    success: true, 
-    user: { ...user, verified: true }
-  });
+const deprecatedAuthHandler = (_req: any, res: any) => res.status(410).json({
+  error: 'This legacy credential endpoint has been disabled. SPIP now uses Supabase Auth.'
 });
-
-// Forgot password token trigger
-app.post("/api/auth/forgot-password", async (req, res) => {
-  const { email } = req.body;
-  if (!email) {
-    return res.status(400).json({ error: "Corporate email is required." });
-  }
-
-  // Validate corporate domain and format
-  if (!isValidScmEmail(email)) {
-    return res.status(400).json({ error: "Only SCM Capital email addresses are permitted." });
-  }
-
-  const normalizedEmail = email.toLowerCase().trim();
-
-  let user: any = null;
-  try {
-    const list = await db.select().from(users).where(eq(users.email, normalizedEmail));
-    user = list[0];
-  } catch (err) {}
-
-  if (!user) {
-    user = dbUsers.find(u => u.email.toLowerCase() === normalizedEmail);
-  }
-
-  if (!user) {
-    return res.status(404).json({ error: "This email address is not enrolled under SCM rosters." });
-  }
-
-  const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
-  resetCodes.set(normalizedEmail, resetCode);
-
-  console.log(`[SCM MAIL RUNTIME SENT] Password reset token for ${user.email}: ${resetCode}`);
-  
-  sendPasswordResetEmail(user.email, user.fullName, resetCode).catch(e => {
-    console.error("[SCM MAIL DISPATCH ERROR] Failed on reset token dispatch:", e);
-  });
-
-  return res.json({ 
-    message: "reset_code_sent", 
-    email: user.email, 
-    code: resetCode
-  });
-});
-
-// Password reset validation
-app.post("/api/auth/reset-password", async (req, res) => {
-  const { email, code, newPassword } = req.body;
-  if (!email || !code || !newPassword) {
-    return res.status(400).json({ error: "Email, security token, and new password are required." });
-  }
-
-  // Validate corporate domain and format
-  if (!isValidScmEmail(email)) {
-    return res.status(400).json({ error: "Only SCM Capital email addresses are permitted." });
-  }
-
-  const normalizedEmail = email.toLowerCase().trim();
-
-  let user: any = null;
-  try {
-    const list = await db.select().from(users).where(eq(users.email, normalizedEmail));
-    user = list[0];
-  } catch (err) {}
-
-  if (!user) {
-    user = dbUsers.find(u => u.email.toLowerCase() === normalizedEmail);
-  }
-
-  if (!user) {
-    return res.status(404).json({ error: "Account not found." });
-  }
-
-  const expectedCode = resetCodes.get(normalizedEmail);
-  if (!expectedCode || expectedCode !== code.trim()) {
-    return res.status(400).json({ error: "Invalid security reset token. Access denied." });
-  }
-
-  user.password = newPassword;
-  try {
-    await db.update(users).set({ password: newPassword }).where(eq(users.id, user.id));
-  } catch (err) {}
-  
-  resetCodes.delete(normalizedEmail);
-
-  console.log(`[SCM CREDENTIALS UPDATED] ${user.email} updated password successfully.`);
-
-  return res.json({ 
-    success: true, 
-    message: "Password updated successfully. Please enter your new login details." 
-  });
-});
+app.post('/api/auth/login', deprecatedAuthHandler);
+app.post('/api/auth/register', deprecatedAuthHandler);
+app.post('/api/auth/verify', deprecatedAuthHandler);
+app.post('/api/auth/forgot-password', deprecatedAuthHandler);
+app.post('/api/auth/reset-password', deprecatedAuthHandler);
 
 // GOOGLE WORKSPACE API INTEGRATIONS
 
@@ -2689,7 +2320,10 @@ app.post("/api/v1/mixed_people/api_search", async (req, res) => {
   console.log("[APOLLO PROXY AUDIT] Incoming Request Payload:", JSON.stringify(payload, null, 2));
 
   const start = Date.now();
-  const apolloApiKey = process.env.APOLLO_API_KEY || process.env.VITE_APOLLO_API_KEY || "KpuBuIUPuGIKOatjdoiVeA";
+  const apolloApiKey = process.env.APOLLO_API_KEY;
+    if (!apolloApiKey) {
+      return res.status(503).json({ error: 'Apollo integration is not configured.' });
+    }
   
   try {
     const apolloRes = await fetch("https://api.apollo.io/api/v1/mixed_people/api_search", {
@@ -3295,103 +2929,108 @@ app.get("/api/admin/users", async (req, res) => {
 
 app.put("/api/admin/users/:id", async (req, res) => {
   res.setHeader("Content-Type", "application/json");
-  const { userId, isAdmin } = getRequestUser(req);
+  const { userId, isAdmin, isSuperAdmin } = getRequestUser(req);
   if (!userId || !isAdmin) {
     return res.status(403).json({ error: "Access denied. Administrator privileges required." });
   }
 
   const { id } = req.params;
+  const { fullName, role, department, status, password } = req.body || {};
+
+  if (password !== undefined) {
+    return res.status(400).json({
+      error: "Administrators cannot set user passwords. Use the secure Supabase password recovery flow."
+    });
+  }
+
   try {
-    const existingUsers = await db.select().from(users).where(eq(users.id, id));
-    const existingUser = existingUsers[0];
-    if (!existingUser) {
+    const { data: targetProfile, error: profileError } = await supabaseServer
+      .from('profiles')
+      .select('id, full_name, email, permission_level, department, status')
+      .eq('id', id)
+      .single();
+
+    if (profileError || !targetProfile) {
       return res.status(404).json({ error: "User profile not found." });
     }
 
-    const { fullName, role, department, status, password } = req.body;
+    const profileUpdates: any = { updated_at: new Date().toISOString() };
+    if (fullName !== undefined) profileUpdates.full_name = String(fullName).trim();
+    if (department !== undefined) profileUpdates.department = String(department).trim() || 'Asset Management';
 
-    // Track administrative changes for logging
-    const changes: string[] = [];
-    if (fullName && fullName !== existingUser.fullName) changes.push(`Name: ${existingUser.fullName} -> ${fullName}`);
-    if (role && role !== existingUser.role) {
-      changes.push(`Role: ${existingUser.role} -> ${role}`);
-      logSystemEvent("Role Change", id, "Success", req, { from: existingUser.role, to: role, email: existingUser.email });
-    }
-    if (status && status !== existingUser.status) {
-      changes.push(`Status: ${existingUser.status || 'Pending'} -> ${status}`);
-      if (status === "Approved" || status === "Active") {
-        logSystemEvent("User Approval", id, "Approved", req, { email: existingUser.email });
-      } else if (status === "Rejected") {
-        logSystemEvent("User Rejection", id, "Rejected", req, { email: existingUser.email });
-      } else if (status === "Suspended") {
-        logSystemEvent("User Suspension", id, "Suspended", req, { email: existingUser.email });
-      } else {
-        logSystemEvent("Administrative Action", id, "Success", req, { detail: `Status changed to ${status}`, email: existingUser.email });
+    if (status !== undefined) {
+      const statusMap: Record<string, string> = {
+        Approved: 'ACTIVE', Active: 'ACTIVE', ACTIVE: 'ACTIVE',
+        Pending: 'PENDING', PENDING: 'PENDING',
+        Suspended: 'SUSPENDED', SUSPENDED: 'SUSPENDED',
+        Rejected: 'REJECTED', REJECTED: 'REJECTED'
+      };
+      const mappedStatus = statusMap[String(status)];
+      if (!mappedStatus) return res.status(400).json({ error: 'Invalid account status.' });
+      profileUpdates.status = mappedStatus;
+      if (mappedStatus === 'ACTIVE') {
+        profileUpdates.approved_at = new Date().toISOString();
+        profileUpdates.approved_by = userId;
       }
     }
-    if (password && password !== existingUser.password) {
-      changes.push("Password reset");
-      logSystemEvent("Reset Password", id, "Success", req, { email: existingUser.email });
+
+    if (role !== undefined) {
+      if (!isSuperAdmin) {
+        return res.status(403).json({ error: 'Only the Super Admin can change permission levels.' });
+      }
+      const roleMap: Record<string, string> = {
+        SUPER_ADMIN: 'SUPER_ADMIN', HOD_ADMIN: 'HOD_ADMIN', Admin: 'HOD_ADMIN', STAFF: 'STAFF',
+        'Business Development Officer': 'STAFF', 'Relationship Manager': 'STAFF',
+        'Asset Management Officer': 'STAFF', 'Team Lead': 'STAFF', Director: 'STAFF'
+      };
+      const mappedPermission = roleMap[String(role)];
+      if (!mappedPermission) return res.status(400).json({ error: 'Invalid permission level.' });
+      profileUpdates.permission_level = mappedPermission;
     }
 
-    const updatedUser = {
-      id,
-      fullName: fullName || existingUser.fullName,
-      role: role || existingUser.role,
-      department: department !== undefined ? department : existingUser.department,
-      status: status || existingUser.status || "Pending",
-      password: password || existingUser.password
-    };
+    const { data: updatedProfile, error: updateError } = await supabaseServer
+      .from('profiles')
+      .update(profileUpdates)
+      .eq('id', id)
+      .select('id, full_name, email, permission_level, department, status, avatar_url')
+      .single();
 
-    // Persist to Postgres
-    await db.update(users).set({
-      fullName: updatedUser.fullName,
-      role: updatedUser.role,
-      department: updatedUser.department,
-      status: updatedUser.status,
-      password: updatedUser.password
-    }).where(eq(users.id, id));
+    if (updateError || !updatedProfile) throw updateError || new Error('Profile update failed');
 
-    if (changes.length > 0) {
-      logSystemEvent("Administrative Action", id, "Success", req, { changes, targetEmail: existingUser.email });
-    }
+    await logSystemEvent('Administrative Action', id, 'Success', req, {
+      targetEmail: targetProfile.email,
+      status: profileUpdates.status || targetProfile.status,
+      permissionLevel: profileUpdates.permission_level || targetProfile.permission_level
+    });
 
-    return res.json(updatedUser);
+    const legacyRole = updatedProfile.permission_level === 'SUPER_ADMIN'
+      ? 'SUPER_ADMIN'
+      : updatedProfile.permission_level === 'HOD_ADMIN' ? 'Admin' : 'Business Development Officer';
+
+    return res.json({
+      id: updatedProfile.id,
+      fullName: updatedProfile.full_name,
+      email: updatedProfile.email,
+      role: legacyRole,
+      permissionLevel: updatedProfile.permission_level,
+      department: updatedProfile.department,
+      avatarUrl: updatedProfile.avatar_url || '',
+      status: updatedProfile.status === 'ACTIVE' ? 'Active' : updatedProfile.status
+    });
   } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to update user in Postgres:", err);
-    return res.status(500).json({ error: "Access failed updating corporate state registries: " + err.message });
+    console.error('[SPIP ADMIN] Failed to update user profile:', err?.message || err);
+    return res.status(500).json({ error: 'Unable to update this user profile.' });
   }
 });
 
 app.delete("/api/admin/users/:id", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId || !isAdmin) {
-    return res.status(403).json({ error: "Access denied. Administrator privileges required." });
+  const { userId, isSuperAdmin } = getRequestUser(req);
+  if (!userId || !isSuperAdmin) {
+    return res.status(403).json({ error: 'Only the Super Admin can remove an account.' });
   }
-
-  const { id } = req.params;
-  try {
-    const existingUsers = await db.select().from(users).where(eq(users.id, id));
-    const targetUser = existingUsers[0];
-    if (!targetUser) {
-      return res.status(404).json({ error: "User profile not found." });
-    }
-
-    if (targetUser.email === "wisdom.okoh@scmcapitalng.com" || targetUser.email === "omololu.ajediran@scmcapitalng.com") {
-      return res.status(400).json({ error: "Permanent Super Administrators cannot be deleted." });
-    }
-
-    logSystemEvent("User Deletion", id, "Success", req, { email: targetUser.email, fullName: targetUser.fullName });
-
-    // Persist to Postgres
-    await db.delete(users).where(eq(users.id, id));
-
-    return res.json({ success: true });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to delete user in Postgres:", err);
-    return res.status(500).json({ error: "Purge execution failed: " + err.message });
-  }
+  return res.status(405).json({
+    error: 'Permanent account deletion is disabled in Phase 1. Suspend the account instead to preserve the audit trail.'
+  });
 });
 
 // Admin system statistics/overview endpoint
@@ -7847,4 +7486,8 @@ async function startServer() {
   });
 }
 
-startServer();
+if (!process.env.VERCEL) {
+  startServer();
+}
+
+export default app;
