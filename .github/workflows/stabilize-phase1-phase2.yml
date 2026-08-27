@@ -1,0 +1,48 @@
+name: Stabilize Phase 1 and 2 Runtime
+
+on:
+  push:
+    branches: [phase-1-2-runtime-stabilization]
+
+permissions:
+  contents: write
+
+jobs:
+  stabilize-and-validate:
+    if: "!contains(github.event.head_commit.message, '[phase12-stabilized]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: phase-1-2-runtime-stabilization
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Apply Phase 1/2 runtime patch
+        run: node scripts/stabilize-phase1-phase2.mjs
+      - name: Install dependencies
+        run: npm install --no-package-lock
+      - name: Runtime assertions
+        run: |
+          grep -q "app.get('/api/admin/executive-dashboard-summary'" src/server/phase2Routes.ts
+          grep -q "Executive Summary Unavailable" src/pages/ExecutiveSummary.tsx
+          grep -q "registered before the legacy CRM database health gate" src/server/phase2Routes.ts
+          grep -q "Authorization.*Bearer" src/main.tsx
+          grep -q "registerPhase2Routes(app, supabaseServer)" server.ts
+          grep -q "registerPhase2WeeklyRoutes(app, supabaseServer)" server.ts
+      - name: Type check
+        run: npm run lint
+      - name: Production build
+        run: npm run build
+      - name: Commit stabilized runtime
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/server/phase2Routes.ts src/pages/ExecutiveSummary.tsx
+          if git diff --cached --quiet; then
+            echo "No runtime changes to commit"
+          else
+            git commit -m "fix: stabilize Phase 1/2 admin runtime [phase12-stabilized]"
+            git push origin HEAD:phase-1-2-runtime-stabilization
+          fi
