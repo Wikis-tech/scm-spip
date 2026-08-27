@@ -330,8 +330,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, ini
 
   const handleSavePasswordReset = async () => {
     if (!resettingUserPassword) return;
-    if (!newPassword || newPassword.trim().length < 6) {
-      showToast("Password must be at least 6 characters in length.", 'error');
+    if (!newPassword || newPassword.trim().length < 12) {
+      showToast("Temporary passwords must be at least 12 characters in length.", 'error');
       return;
     }
 

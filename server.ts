@@ -21,6 +21,8 @@ dotenv.config();
 import { searchOrganizations, discoverDecisionMakers, enrichOrganization, apolloDiagnostics } from "./src/services/apolloService.ts";
 import { verifyData } from "./src/services/verificationService.ts";
 import { calculateProductRecommendations } from "./src/utils/recommendationEngine.ts";
+import { registerPhase2Routes } from "./src/server/phase2Routes.ts";
+import { registerPhase2WeeklyRoutes } from "./src/server/phase2WeeklyRoutes.ts";
 import { discoveryQueueEngine, DBClientContext } from "./src/services/discovery/discoveryQueueEngine.ts";
 
 // Helper to validate corporate email domain and format
@@ -420,8 +422,10 @@ app.use(async (req, res, next) => {
         }
       });
     } catch (syncError: any) {
-      console.error('[SPIP SECURITY] Failed to synchronize authenticated profile:', syncError?.message || syncError);
-      return res.status(503).json({ error: 'SPIP database is temporarily unavailable.' });
+      // The Supabase profile is authoritative for authentication. A legacy CRM directory
+      // synchronization failure must not destroy an otherwise valid authenticated session.
+      // Direct CRM routes still fail closed behind the database health gate below.
+      console.warn('[SPIP SECURITY] Legacy CRM profile synchronization deferred:', syncError?.message || syncError);
     }
 
     (req as any).user = {
@@ -460,6 +464,11 @@ app.use(async (req, res, next) => {
     return res.status(503).json({ error: 'Authentication service is temporarily unavailable.' });
   }
 });
+
+// Phase 2 identity, administration and reporting routes use the trusted Supabase
+// server client and are registered before the legacy PostgreSQL health gate.
+registerPhase2Routes(app, supabaseServer);
+registerPhase2WeeklyRoutes(app, supabaseServer);
 
 const PORT = Number(process.env.PORT || 3000);
 
