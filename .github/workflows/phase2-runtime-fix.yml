@@ -27,11 +27,11 @@ jobs:
         run: |
           grep -q "registerPhase2Routes(app, supabaseServer)" server.ts
           grep -q "registerPhase2WeeklyRoutes(app, supabaseServer)" server.ts
-          grep -q "Legacy CRM profile synchronization deferred" server.ts
+          grep -q "Identity is sourced from the ACTIVE Supabase profile" server.ts
           grep -q "ManagementReports" src/App.tsx
           grep -q "res.status === 401 || res.status === 403" src/App.tsx
-          if grep -A6 "Legacy CRM profile synchronization deferred" server.ts | grep -q "return res.status(503)"; then
-            echo "Legacy profile synchronization still blocks valid authentication"
+          if grep -q "Failed to synchronize authenticated profile" server.ts; then
+            echo "Legacy profile synchronization still blocks or pollutes authentication path"
             exit 1
           fi
       - name: Type check
