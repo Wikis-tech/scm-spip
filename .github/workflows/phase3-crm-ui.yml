@@ -1,0 +1,51 @@
+name: Phase 3 CRM UI Validation
+
+on:
+  push:
+    branches: [phase-3-crm-ui-charts]
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-phase3:
+    if: "!contains(github.event.head_commit.message, '[phase3-applied]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: phase-3-crm-ui-charts
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Apply integration patch
+        run: node scripts/apply-phase3-ui-runtime.mjs
+      - name: Install dependencies
+        run: npm install --no-package-lock
+      - name: Phase 3 assertions
+        run: |
+          grep -q "registerPublicAuthRoutes(app, supabaseServer)" server.ts
+          grep -q "registerPhase3Routes(app, supabaseServer)" server.ts
+          grep -q "registerPhase3CrudRoutes(app, supabaseServer)" server.ts
+          grep -q "/api/auth/register-v2" src/components/AuthScreen.tsx
+          grep -q "Client360" src/App.tsx
+          grep -q "OfficerDashboardCharts" src/pages/Dashboard.tsx
+          grep -q "ExecutiveRecharts" src/pages/ExecutiveSummary.tsx
+          grep -q "ManagementRecharts" src/pages/ManagementReports.tsx
+          grep -q '"recharts"' package.json
+      - name: Type check
+        run: npm run lint
+      - name: Production build
+        run: npm run build
+      - name: Commit generated integration
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server.ts package.json src database/migrations scripts .github/workflows/phase3-crm-ui.yml
+          if git diff --cached --quiet; then
+            echo "No generated changes to commit"
+          else
+            git commit -m "feat: integrate Phase 3 CRM, signup and analytics [phase3-applied]"
+            git push origin HEAD:phase-3-crm-ui-charts
+          fi
