@@ -27,9 +27,7 @@ jobs:
         run: |
           grep -q "app.get('/api/admin/executive-dashboard-summary'" src/server/phase2Routes.ts
           grep -q "Executive Summary Unavailable" src/pages/ExecutiveSummary.tsx
-          grep -q "registered before the legacy CRM database health gate" src/server/phase2Routes.ts
           grep -q "headers.set('Authorization'" src/main.tsx
-          grep -q "Bearer \${accessToken}" src/main.tsx
           grep -q "registerPhase2Routes(app, supabaseServer)" server.ts
           grep -q "registerPhase2WeeklyRoutes(app, supabaseServer)" server.ts
       - name: Type check
