@@ -231,33 +231,59 @@ export async function searchOrganizations(query: string): Promise<ApolloCompany[
   apolloDiagnostics.lastSearch = cleanQuery;
   apolloDiagnostics.queryEntered = cleanQuery;
 
-  const response = await apolloClient.request<any>('https://api.apollo.io/api/v1/mixed_companies/search', 'POST', {
-    q_organization_name: cleanQuery,
-    page: 1,
-    per_page: 25,
-  });
+  // Apollo's web UI blends net-new Organizations with Accounts already saved in the
+  // workspace. Query both APIs so SPIP mirrors what staff see when searching Apollo.
+  const [organizationResponse, accountResponse] = await Promise.all([
+    apolloClient.request<any>('https://api.apollo.io/api/v1/mixed_companies/search', 'POST', {
+      q_organization_name: cleanQuery,
+      page: 1,
+      per_page: 100,
+    }),
+    apolloClient.request<any>('https://api.apollo.io/api/v1/accounts/search', 'POST', {
+      q_organization_name: cleanQuery,
+      page: 1,
+      per_page: 100,
+    }),
+  ]);
   syncDiagnostics();
 
-  if (!response.ok) {
+  const organizations = organizationResponse.ok && Array.isArray(organizationResponse.data?.organizations)
+    ? organizationResponse.data.organizations
+    : [];
+  const accounts = accountResponse.ok && Array.isArray(accountResponse.data?.accounts)
+    ? accountResponse.data.accounts
+    : [];
+
+  if (!organizationResponse.ok && !accountResponse.ok) {
     apolloDiagnostics.organizationsReturned = 0;
     return [];
   }
 
-  const raw = Array.isArray(response.data?.organizations)
-    ? response.data.organizations
-    : Array.isArray(response.data?.accounts)
-      ? response.data.accounts
-      : [];
+  const byIdentity = new Map<string, ApolloCompany>();
+  for (const raw of [...accounts, ...organizations]) {
+    const company = mapCompany(raw);
+    if (!company.name || company.name === 'Information Not Found') continue;
+    const normalizedName = normalizeOrganizationName(company.name);
+    const domain = normalizeDomain(company.domain);
+    const identity = company.id || domain || normalizedName;
+    if (!identity) continue;
+    const existing = byIdentity.get(identity);
+    if (!existing || (existing.domain === 'Not Found' && company.domain !== 'Not Found')) {
+      byIdentity.set(identity, company);
+    }
+  }
 
-  const ranked = raw
-    .map(mapCompany)
-    .filter((company: ApolloCompany) => company.id && company.name !== 'Information Not Found')
+  const ranked = [...byIdentity.values()]
     .map((company: ApolloCompany) => ({ company, score: organizationSimilarityScore(cleanQuery, company.name) }))
-    .sort((a: any, b: any) => b.score - a.score)
-    .map((row: any) => row.company);
+    .filter((row) => row.score > 0)
+    .sort((a, b) => b.score - a.score || a.company.name.localeCompare(b.company.name))
+    .map((row) => row.company);
 
   apolloDiagnostics.organizationsReturned = ranked.length;
   apolloDiagnostics.exactMatchFound = ranked.some((company: ApolloCompany) => normalizeOrganizationName(company.name) === normalizeOrganizationName(cleanQuery)) ? 'YES' : 'NO';
+  apolloDiagnostics.lastAcceptanceMethodUsed = accounts.length && organizations.length
+    ? 'Apollo Organizations + Saved Accounts'
+    : accounts.length ? 'Apollo Saved Accounts' : 'Apollo Organizations';
   return ranked;
 }
 

@@ -129,28 +129,26 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess }) => {
 
     setLoading(true);
     try {
-      const { data, error } = await supabase.auth.signUp({
-        email: normalizedEmail,
-        password,
-        options: {
-          emailRedirectTo: window.location.origin,
-          data: {
-            full_name: fullName.trim().slice(0, 150),
-            department: (department.trim() || 'Asset Management').slice(0, 120),
-            job_title: jobTitle.trim().slice(0, 120) || null,
-          },
-        },
+      const response = await fetch('/api/auth/register-v2', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: normalizedEmail,
+          password,
+          fullName: fullName.trim(),
+          department: department.trim() || 'Asset Management',
+          jobTitle: jobTitle.trim() || null,
+        }),
       });
-      if (error) throw error;
-      if (!data.user) throw new Error('Unable to create your SPIP access request.');
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload?.error || 'Unable to create your SPIP access request.');
 
-      await supabase.auth.signOut();
       setMode('login');
       setPassword('');
       setConfirmPassword('');
       setFullName('');
       setJobTitle('');
-      setMessage('Access request submitted. Confirm your SCM email if prompted, then wait for administrator approval.');
+      setMessage(payload?.message || 'Access request submitted. Wait for administrator approval before signing in.');
     } catch (error) {
       setErrorMessage(friendlyAuthError(error));
     } finally {
