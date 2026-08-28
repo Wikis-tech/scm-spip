@@ -15,8 +15,6 @@ self.addEventListener('push', (event) => {
     const body = data.message || 'You have an upcoming SPIP activity.';
     const options = {
       body,
-      icon: '/icons/icon-192.png',
-      badge: '/icons/badge-96.png',
       tag: `spip-${data.id || data.reminderKind || Date.now()}`,
       renotify: true,
       requireInteraction: critical,
@@ -54,6 +52,6 @@ self.addEventListener('notificationclick', (event) => {
 });
 
 self.addEventListener('pushsubscriptionchange', (event) => {
-  // Browsers can rotate subscriptions. The application re-syncs on next authenticated load.
+  // The authenticated application re-syncs the browser subscription on the next load.
   event.waitUntil(Promise.resolve());
 });
