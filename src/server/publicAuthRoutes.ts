@@ -29,13 +29,77 @@ function rateLimited(key: string) {
   return current.count > MAX_ATTEMPTS;
 }
 
+async function createPendingProfile(
+  supabase: SupabaseClient,
+  values: { userId: string; email: string; fullName: string; department: string; jobTitle: string | null },
+) {
+  return supabase.from('profiles').upsert({
+    id: values.userId,
+    full_name: values.fullName,
+    email: values.email,
+    permission_level: 'STAFF',
+    department: values.department,
+    job_title: values.jobTitle,
+    status: 'PENDING',
+    updated_at: new Date().toISOString(),
+  }, { onConflict: 'id' });
+}
+
+async function recoverExistingRequest(
+  supabase: SupabaseClient,
+  values: { email: string; fullName: string; department: string; jobTitle: string | null },
+) {
+  const { data: profile, error: profileLookupError } = await supabase
+    .from('profiles')
+    .select('id, status, permission_level')
+    .eq('email', values.email)
+    .maybeSingle();
+
+  if (profileLookupError) throw profileLookupError;
+  if (profile?.id) {
+    const status = String(profile.status || '').toUpperCase();
+    if (status === 'PENDING') {
+      return { code: 200, body: { ok: true, status: 'PENDING', message: 'Your access request is already pending administrator approval.' } };
+    }
+    if (status === 'ACTIVE') {
+      return { code: 409, body: { error: 'An active SPIP account already exists for this corporate email. Use Sign in or Forgot password.' } };
+    }
+    return { code: 403, body: { error: `This SPIP account is ${status.toLowerCase() || 'not active'}. Contact an administrator.` } };
+  }
+
+  // Previous versions could create the Supabase Auth identity before profile creation failed.
+  // Recover that orphan without changing its password or granting access. The account remains
+  // STAFF/PENDING and therefore cannot enter SPIP until an administrator approves it.
+  const { data: listed, error: listError } = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 });
+  if (listError) throw listError;
+  const existingAuthUser = listed?.users?.find((user: any) => normalizeEmail(user.email) === values.email);
+  if (!existingAuthUser?.id) return null;
+
+  const { error: repairError } = await createPendingProfile(supabase, {
+    userId: existingAuthUser.id,
+    email: values.email,
+    fullName: values.fullName,
+    department: values.department,
+    jobTitle: values.jobTitle,
+  });
+  if (repairError) throw repairError;
+
+  return {
+    code: 200,
+    body: {
+      ok: true,
+      status: 'PENDING',
+      message: 'Your previous access request has been repaired and is now pending administrator approval.',
+    },
+  };
+}
+
 /**
  * Public corporate access-request endpoint.
  *
- * This route intentionally uses the server-side Supabase administrator client so
- * signup does not depend on an Auth -> profile database trigger being present.
- * It never returns a session, only creates a STAFF/PENDING identity. Access to
- * SPIP remains blocked until an administrator explicitly activates the profile.
+ * It uses the server-side Supabase administrator client so profile creation is not
+ * dependent on an Auth database trigger. It never returns a session: every new or
+ * recovered employee identity is STAFF/PENDING until explicitly approved.
  */
 export function registerPublicAuthRoutes(app: Express, supabase: SupabaseClient) {
   app.post('/api/auth/register-v2', async (req, res) => {
@@ -70,6 +134,8 @@ export function registerPublicAuthRoutes(app: Express, supabase: SupabaseClient)
       if (createError || !created.user?.id) {
         const message = String(createError?.message || '').toLowerCase();
         if (message.includes('already') || message.includes('registered') || message.includes('exists')) {
+          const recovered = await recoverExistingRequest(supabase, { email, fullName, department, jobTitle });
+          if (recovered) return res.status(recovered.code).json(recovered.body);
           return res.status(409).json({ error: 'An SPIP account already exists for this corporate email.' });
         }
         console.error('[SPIP SIGNUP] Auth identity creation failed:', createError?.message || createError);
@@ -77,16 +143,13 @@ export function registerPublicAuthRoutes(app: Express, supabase: SupabaseClient)
       }
 
       const userId = created.user.id;
-      const { error: profileError } = await supabase.from('profiles').upsert({
-        id: userId,
-        full_name: fullName,
+      const { error: profileError } = await createPendingProfile(supabase, {
+        userId,
         email,
-        permission_level: 'STAFF',
+        fullName,
         department,
-        job_title: jobTitle,
-        status: 'PENDING',
-        updated_at: new Date().toISOString(),
-      }, { onConflict: 'id' });
+        jobTitle,
+      });
 
       if (profileError) {
         console.error('[SPIP SIGNUP] Profile creation failed:', profileError.message);
