@@ -1,0 +1,54 @@
+name: Phase 4 Reminders Validation
+
+on:
+  push:
+    branches: [phase-4-reminders-push]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Prepare dependency graph
+        run: npm install --package-lock-only --ignore-scripts
+      - name: Production dependency audit
+        run: npm audit --omit=dev --audit-level=high
+      - name: Install dependencies
+        run: npm install --no-package-lock
+      - name: Phase 4 security and behaviour assertions
+        run: |
+          set -e
+          test -f database/migrations/phase_4_reliable_reminders.sql
+          test -f database/migrations/phase_4_scheduler.sql
+          grep -q "unique(user_id, source_type, source_id, reminder_kind)" database/migrations/phase_4_reliable_reminders.sql
+          grep -q "spip_meeting_reminder_sync" database/migrations/phase_4_reliable_reminders.sql
+          grep -q "spip_task_reminder_sync" database/migrations/phase_4_reliable_reminders.sql
+          grep -q "meeting_24h" database/migrations/phase_4_reliable_reminders.sql
+          grep -q "meeting_10m" database/migrations/phase_4_reliable_reminders.sql
+          grep -q "meeting_start" database/migrations/phase_4_reliable_reminders.sql
+          grep -q "REMINDER_CRON_SECRET" api/index.ts
+          grep -q "timingSafeEqual" api/index.ts
+          grep -q "dispatch-self" api/index.ts
+          grep -q "attempt_count" api/index.ts
+          grep -q "QUIET_HOURS" api/index.ts
+          grep -q "status === 404 || status === 410" api/index.ts
+          grep -q "registerServiceWorkerAndSubscribe" src/services/pushService.ts
+          grep -q "startForegroundReminderHeartbeat" src/services/pushService.ts
+          grep -q "createCustomReminder" src/pages/Settings.tsx
+          grep -q "Send test" src/pages/Settings.tsx
+          grep -q "requireInteraction" public/sw.js
+          if grep -R -n --exclude-dir=node_modules "VITE_VAPID_PRIVATE\|VITE_REMINDER_CRON_SECRET" src api public; then
+            echo "A Phase 4 server secret is exposed to frontend code"; exit 1;
+          fi
+      - name: Type check
+        run: npm run lint
+      - name: Production build
+        run: npm run build
