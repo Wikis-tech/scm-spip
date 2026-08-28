@@ -30,6 +30,13 @@ function rateLimited(key: string) {
   return current.count > MAX_ATTEMPTS;
 }
 
+function getSupabaseAdminConfig() {
+  const url = process.env.SUPABASE_URL?.trim();
+  const key = (process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY)?.trim();
+  if (!url || !key) throw new Error('Supabase admin configuration is incomplete.');
+  return { url: url.replace(/\/$/, ''), key };
+}
+
 async function createPendingProfile(
   supabase: SupabaseClient,
   values: { userId: string; email: string; fullName: string; department: string; jobTitle: string | null },
@@ -99,10 +106,6 @@ async function submitAccessRequest(
   const recoveredBeforeCreate = await recoverExistingRequest(adminClient, values);
   if (recoveredBeforeCreate) return recoveredBeforeCreate;
 
-  // IMPORTANT: profile creation is intentionally NOT delegated to an auth.users trigger.
-  // The production Supabase Auth 500s were caused by that trigger failing inside GoTrue.
-  // Once phase_3d_auth_trigger_hotfix.sql is applied, createUser becomes atomic again and
-  // the server writes STAFF/PENDING explicitly using the service-role client.
   const { data: created, error: createError } = await adminClient.auth.admin.createUser({
     email: values.email,
     password: values.password,
@@ -161,6 +164,36 @@ async function submitAccessRequest(
   };
 }
 
+async function rawAdminCreateUser(values: { email: string; password: string }) {
+  const { url, key } = getSupabaseAdminConfig();
+  const response = await fetch(`${url}/auth/v1/admin/users`, {
+    method: 'POST',
+    headers: {
+      apikey: key,
+      Authorization: `Bearer ${key}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      email: values.email,
+      password: values.password,
+      email_confirm: true,
+      user_metadata: {
+        full_name: 'SPIP QA Raw Auth Test',
+        department: 'Asset Management',
+        job_title: 'QA',
+      },
+    }),
+  });
+  const text = await response.text();
+  return {
+    status: response.status,
+    ok: response.ok,
+    body: text.slice(0, 2000),
+    errorCode: response.headers.get('x-sb-error-code') || response.headers.get('sb-error-code') || null,
+    requestId: response.headers.get('x-request-id') || response.headers.get('sb-request-id') || null,
+  };
+}
+
 export function registerPublicAuthRoutes(app: Express, supabase: SupabaseClient) {
   app.post('/api/auth/register-v2', async (req, res) => {
     const email = normalizeEmail(req.body?.email);
@@ -191,37 +224,53 @@ export function registerPublicAuthRoutes(app: Express, supabase: SupabaseClient)
     }
   });
 
-  // Temporary production smoke test. It creates a unique QA user, verifies the explicit
-  // STAFF/PENDING profile, then deletes the QA identity again. Remove after validation.
   app.get(AUTH_SMOKE_PATH, async (_req, res) => {
     const stamp = Date.now();
     const email = `spip.qa.${stamp}@scmcapitalng.com`;
     const password = `SPIP-QA-${stamp}-Aa1!`;
     let userId = '';
     try {
-      const result = await submitAccessRequest(supabase, {
-        email,
-        password,
-        fullName: 'SPIP QA Smoke Test',
-        department: 'Asset Management',
-        jobTitle: 'QA',
-      });
+      const raw = await rawAdminCreateUser({ email, password });
+      console.error('[SPIP QA RAW AUTH]', raw);
 
       const { data: listed } = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 });
       userId = listed?.users?.find((user: any) => normalizeEmail(user.email) === email)?.id || '';
-      const { data: profile } = userId
-        ? await supabase.from('profiles').select('id, email, status, permission_level').eq('id', userId).maybeSingle()
-        : { data: null as any };
 
-      const pass = result.code === 201 && Boolean(userId) && profile?.status === 'PENDING' && profile?.permission_level === 'STAFF';
+      if (!raw.ok) {
+        return res.status(raw.status || 500).json({
+          pass: false,
+          rawStatus: raw.status,
+          rawErrorCode: raw.errorCode,
+          rawRequestId: raw.requestId,
+          rawBody: raw.body,
+          authUserCreated: Boolean(userId),
+        });
+      }
+
+      if (!userId) {
+        return res.status(500).json({ pass: false, rawStatus: raw.status, rawBody: raw.body, authUserCreated: false });
+      }
+
+      const { error: profileError } = await createPendingProfile(supabase, {
+        userId,
+        email,
+        fullName: 'SPIP QA Raw Auth Test',
+        department: 'Asset Management',
+        jobTitle: 'QA',
+      });
+      if (profileError) {
+        return res.status(500).json({ pass: false, rawStatus: raw.status, authUserCreated: true, profileError: profileError.message });
+      }
+
+      const { data: profile } = await supabase.from('profiles').select('id, status, permission_level').eq('id', userId).maybeSingle();
+      const pass = profile?.status === 'PENDING' && profile?.permission_level === 'STAFF';
       return res.status(pass ? 200 : 500).json({
         pass,
-        signupStatus: result.code,
-        authUserCreated: Boolean(userId),
+        rawStatus: raw.status,
+        authUserCreated: true,
         profileCreated: Boolean(profile?.id),
         profileStatus: profile?.status || null,
         permissionLevel: profile?.permission_level || null,
-        detail: (result.body as any)?.detail || (result.body as any)?.error || null,
       });
     } catch (error: any) {
       return res.status(500).json({ pass: false, detail: error?.message || String(error) });
