@@ -21,6 +21,10 @@ jobs:
           node-version: 22
       - name: Apply final server routing fix
         run: node scripts/phase3-final-server-fix.mjs
+      - name: Prepare dependency graph
+        run: npm install --package-lock-only --ignore-scripts
+      - name: Dependency audit
+        run: npm audit --omit=dev --audit-level=high
       - name: Install dependencies
         run: npm install --no-package-lock
       - name: Phase 3 security assertions
@@ -37,8 +41,6 @@ jobs:
           grep -q "mixed_people/api_search" src/services/apolloService.ts
           grep -q "databaseIndependentPrefixes" server.ts
           grep -q "truncate table public.users cascade" database/migrations/phase_3b_fresh_start.sql
-      - name: Dependency audit
-        run: npm audit --omit=dev --audit-level=high
       - name: Type check
         run: npm run lint
       - name: Production build
