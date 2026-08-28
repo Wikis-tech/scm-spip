@@ -1,0 +1,53 @@
+name: Phase 3 Signup and Apollo Contact Fix
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  repair-and-validate:
+    if: "!contains(github.event.head_commit.message, '[phase3-contact-fix]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Apply signup and Apollo contact fixes
+        run: node scripts/phase3-signup-apollo-contact-fix.mjs
+      - name: Prepare dependency graph
+        run: npm install --package-lock-only --ignore-scripts
+      - name: Dependency audit
+        run: npm audit --omit=dev --audit-level=high
+      - name: Install dependencies
+        run: npm install --no-package-lock
+      - name: Phase 3 assertions
+        run: |
+          set -e
+          grep -q "supabase.auth.signUp" src/components/AuthScreen.tsx
+          grep -q "organization_id || org?.id" src/services/apolloService.ts
+          grep -q "contacts/search" src/services/apolloService.ts
+          grep -q "q_organization_domains_list" src/services/apolloService.ts
+          grep -q "APOLLO PERSON MATCH" src/pages/Intelligence.tsx
+          grep -q "phase_3c_full_fresh_start_preserve_admins" <(find database/migrations -maxdepth 1 -type f -printf '%f\n')
+      - name: Type check
+        run: npm run lint
+      - name: Production build
+        run: npm run build
+      - name: Commit repaired application
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/components/AuthScreen.tsx src/services/apolloService.ts src/pages/Intelligence.tsx
+          if git diff --cached --quiet; then
+            echo "No application changes to commit"
+          else
+            git commit -m "fix: repair signup and Apollo contact discovery [phase3-contact-fix]"
+            git push origin HEAD:main
+          fi
