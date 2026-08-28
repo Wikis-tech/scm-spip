@@ -334,7 +334,7 @@ export function belongsToSelectedCompany(person: any, selectedOrg: { id: string;
 
 function mapPerson(person: any, company: { id: string; name: string; domain: string }): ApolloPerson {
   const firstName = person?.first_name || '';
-  const lastName = person?.last_name || '';
+  const lastName = person?.last_name || person?.last_name_obfuscated || '';
   const fullName = person?.name || [firstName, lastName].filter(Boolean).join(' ') || 'Unknown';
   return {
     id: String(person?.id || `${company.id}-${fullName}`),
@@ -373,55 +373,53 @@ export async function discoverDecisionMakers(companyId: string, domain: string, 
   const cleanDomain = normalizeDomain(domain);
   const validOrgId = companyId && !companyId.startsWith('co-') ? companyId : '';
   if (!cleanDomain && !validOrgId && !companyName.trim()) return [];
+  const selected = { id: validOrgId || companyId, name: companyName || cleanDomain, domain: cleanDomain };
 
-  const buildPeoplePayload = (useOrgId: boolean) => {
-    const payload: any = {
+  const runPeopleSearch = async (payload: any) => {
+    const response = await apolloClient.request<any>('https://api.apollo.io/api/v1/mixed_people/api_search', 'POST', {
       page: 1,
       per_page: 100,
       person_seniorities: ['owner', 'founder', 'c_suite', 'partner', 'vp', 'head', 'director', 'manager', 'senior'],
-    };
-    if (useOrgId && validOrgId) payload.organization_ids = [validOrgId];
-    else if (cleanDomain) payload.q_organization_domains_list = [cleanDomain];
-    else if (companyName.trim()) payload.q_keywords = companyName.trim();
-    return payload;
+      ...payload,
+    });
+    syncDiagnostics();
+    return response.ok && Array.isArray(response.data?.people) ? response.data.people : [];
   };
 
-  let peopleResponse = await apolloClient.request<any>(
-    'https://api.apollo.io/api/v1/mixed_people/api_search',
-    'POST',
-    buildPeoplePayload(Boolean(validOrgId)),
-  );
-  let globalPeople = peopleResponse.ok && Array.isArray(peopleResponse.data?.people) ? peopleResponse.data.people : [];
-
-  if (globalPeople.length === 0 && validOrgId && cleanDomain) {
-    peopleResponse = await apolloClient.request<any>(
-      'https://api.apollo.io/api/v1/mixed_people/api_search',
-      'POST',
-      buildPeoplePayload(false),
-    );
-    globalPeople = peopleResponse.ok && Array.isArray(peopleResponse.data?.people) ? peopleResponse.data.people : [];
+  let globalPeople: any[] = [];
+  let constrainedSearch = false;
+  if (validOrgId) {
+    globalPeople = await runPeopleSearch({ organization_ids: [validOrgId] });
+    constrainedSearch = globalPeople.length > 0;
+  }
+  if (globalPeople.length === 0 && cleanDomain) {
+    globalPeople = await runPeopleSearch({ q_organization_domains_list: [cleanDomain] });
+    constrainedSearch = globalPeople.length > 0;
+  }
+  if (globalPeople.length === 0 && companyName.trim()) {
+    globalPeople = await runPeopleSearch({ q_keywords: companyName.trim() });
+    constrainedSearch = false;
   }
 
-  const contactsResponse = companyName.trim()
-    ? await apolloClient.request<any>('https://api.apollo.io/api/v1/contacts/search', 'POST', {
-        q_keywords: companyName.trim(), page: 1, per_page: 100,
-      })
-    : ({ ok: false, data: null } as any);
+  let savedContacts: any[] = [];
+  if (companyName.trim()) {
+    const contactsResponse = await apolloClient.request<any>('https://api.apollo.io/api/v1/contacts/search', 'POST', {
+      q_keywords: companyName.trim(), page: 1, per_page: 100,
+    });
+    syncDiagnostics();
+    if (contactsResponse.ok && Array.isArray(contactsResponse.data?.contacts)) savedContacts = contactsResponse.data.contacts;
+  }
 
-  syncDiagnostics();
-  const savedContacts = contactsResponse.ok && Array.isArray(contactsResponse.data?.contacts) ? contactsResponse.data.contacts : [];
-  const selected = { id: validOrgId || companyId, name: companyName || cleanDomain, domain: cleanDomain };
-
-  const personOrgName = (p: any) => p?.organization?.name || p?.account?.name || p?.organization_name || '';
-  const personOrgId = (p: any) => p?.organization_id || p?.organization?.id || p?.account?.organization_id || '';
+  const personOrgName = (p: any) => p?.organization?.name || p?.account?.name || p?.organization_name || "";
+  const personOrgId = (p: any) => p?.organization_id || p?.organization?.id || p?.account?.organization_id || "";
   const belongs = (p: any) => {
-    const pid = String(personOrgId(p) || '').toLowerCase();
+    if (constrainedSearch && globalPeople.includes(p)) return true;
+    const pid = String(personOrgId(p) || "").toLowerCase();
     if (validOrgId && pid && pid === validOrgId.toLowerCase()) return true;
     const pd = normalizeDomain(p?.organization?.primary_domain || p?.organization?.domain || p?.account?.domain || p?.account?.website_url || "");
     if (cleanDomain && pd && pd === cleanDomain) return true;
     const pn = personOrgName(p);
-    if (companyName.trim() && pn && organizationSimilarityScore(companyName, pn) >= 65) return true;
-    return false;
+    return Boolean(companyName.trim() && pn && organizationSimilarityScore(companyName, pn) >= 65);
   };
 
   const mapFlexible = (p: any): ApolloPerson => {
@@ -429,29 +427,29 @@ export async function discoverDecisionMakers(companyId: string, domain: string, 
     return mapPerson({
       ...p,
       organization_id: personOrgId(p) || validOrgId || companyId,
-      organization: {
-        ...organization,
-        name: personOrgName(p) || companyName,
-        primary_domain: organization?.primary_domain || organization?.domain || cleanDomain,
-      },
+      organization: { ...organization, name: personOrgName(p) || companyName, primary_domain: organization?.primary_domain || organization?.domain || cleanDomain },
     }, selected);
   };
 
   const combined = [...savedContacts.filter(belongs), ...globalPeople.filter(belongs)].map(mapFlexible);
-  const byIdentity = new Map<string, ApolloPerson>();
+  const merged = new Map<string, ApolloPerson>();
   for (const person of combined) {
-    const key = person.id || (person.fullName.toLowerCase() + '|' + person.position.toLowerCase());
-    const existing = byIdentity.get(key);
-    if (!existing) { byIdentity.set(key, person); continue; }
-    const er = Number(Boolean(existing.email)) + Number(Boolean(existing.phone)) + Number(Boolean(existing.linkedin));
-    const nr = Number(Boolean(person.email)) + Number(Boolean(person.phone)) + Number(Boolean(person.linkedin));
-    if (nr > er) byIdentity.set(key, person);
+    if (!person.fullName || person.fullName === 'Unknown') continue;
+    const key = String(person.id || person.linkedin || person.email || (person.fullName + '|' + person.position)).toLowerCase();
+    const existing = merged.get(key);
+    if (!existing) { merged.set(key, person); continue; }
+    merged.set(key, { ...existing, ...person, email: person.email || existing.email, phone: person.phone || existing.phone, linkedin: person.linkedin || existing.linkedin, linkedin_url: person.linkedin_url || existing.linkedin_url });
   }
 
-  const rank: Record<string, number> = { owner: 10, founder: 9, c_suite: 8, partner: 7, vp: 6, head: 5, director: 4, manager: 3, senior: 2 };
-  const people = [...byIdentity.values()].sort((a, b) => (rank[String(b.seniority).toLowerCase()] || 0) - (rank[String(a.seniority).toLowerCase()] || 0));
-  apolloDiagnostics.peopleReturned = people.length;
+  const rank: Record<string, number> = { owner: 12, founder: 11, c_suite: 10, partner: 9, vp: 8, head: 7, director: 6, manager: 5, senior: 4 };
+  const result = [...merged.values()].sort((a, b) => {
+    const ar = (a.email ? 2 : 0) + (a.phone ? 2 : 0) + (a.linkedin ? 1 : 0);
+    const br = (b.email ? 2 : 0) + (b.phone ? 2 : 0) + (b.linkedin ? 1 : 0);
+    return br !== ar ? br - ar : (rank[String(b.seniority).toLowerCase()] || 0) - (rank[String(a.seniority).toLowerCase()] || 0);
+  });
+  apolloDiagnostics.peopleReturned = result.length;
   apolloDiagnostics.selectedOrganization = selected.name;
   apolloDiagnostics.selectedOrganizationId = selected.id;
-  return people;
+  apolloDiagnostics.lastAcceptanceMethodUsed = savedContacts.length ? 'Apollo People + Saved Contacts' : constrainedSearch ? 'Apollo Organization/Domain People Search' : 'Apollo Keyword People Search';
+  return result;
 }

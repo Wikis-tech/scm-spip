@@ -143,6 +143,9 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess }) => {
 
       if (error) throw error;
       if (!data.user?.id) throw new Error('Supabase did not create the staff identity. Please try again.');
+      if (Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+        throw new Error('An SPIP account already exists for this corporate email. Use Sign in or Forgot password.');
+      }
       if (data.session) await supabase.auth.signOut();
 
       setMode('login');
@@ -150,11 +153,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess }) => {
       setConfirmPassword('');
       setFullName('');
       setJobTitle('');
-      setMessage(
-        data.user.email_confirmed_at
-          ? 'Access request submitted. An administrator must approve the account before sign in.'
-          : 'Access request submitted. Confirm your corporate email if prompted, then wait for administrator approval.'
-      );
+      setMessage('Access request submitted. An administrator must approve the account before it can be used.');
     } catch (error) {
       setErrorMessage(friendlyAuthError(error));
     } finally {
