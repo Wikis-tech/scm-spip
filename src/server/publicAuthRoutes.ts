@@ -1,5 +1,5 @@
 import type { Express } from 'express';
-import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import type { SupabaseClient } from '@supabase/supabase-js';
 
 const requestAttempts = new Map<string, { count: number; resetAt: number }>();
 const WINDOW_MS = 15 * 60 * 1000;
@@ -28,30 +28,6 @@ function rateLimited(key: string) {
   current.count += 1;
   requestAttempts.set(key, current);
   return current.count > MAX_ATTEMPTS;
-}
-
-function makePublicSignupClient() {
-  const url = process.env.SUPABASE_URL?.trim();
-  const key = (
-    process.env.SUPABASE_PUBLISHABLE_KEY ||
-    process.env.SUPABASE_ANON_KEY ||
-    process.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
-    process.env.VITE_SUPABASE_ANON_KEY ||
-    process.env.SUPABASE_SECRET_KEY ||
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  )?.trim();
-
-  if (!url || !key) {
-    throw new Error('Supabase signup configuration is incomplete.');
-  }
-
-  return createClient(url, key, {
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false,
-      detectSessionInUrl: false,
-    },
-  });
 }
 
 async function createPendingProfile(
@@ -123,16 +99,18 @@ async function submitAccessRequest(
   const recoveredBeforeCreate = await recoverExistingRequest(adminClient, values);
   if (recoveredBeforeCreate) return recoveredBeforeCreate;
 
-  const signupClient = makePublicSignupClient();
-  const { data: created, error: createError } = await signupClient.auth.signUp({
+  // IMPORTANT: profile creation is intentionally NOT delegated to an auth.users trigger.
+  // The production Supabase Auth 500s were caused by that trigger failing inside GoTrue.
+  // Once phase_3d_auth_trigger_hotfix.sql is applied, createUser becomes atomic again and
+  // the server writes STAFF/PENDING explicitly using the service-role client.
+  const { data: created, error: createError } = await adminClient.auth.admin.createUser({
     email: values.email,
     password: values.password,
-    options: {
-      data: {
-        full_name: values.fullName,
-        department: values.department,
-        job_title: values.jobTitle,
-      },
+    email_confirm: true,
+    user_metadata: {
+      full_name: values.fullName,
+      department: values.department,
+      job_title: values.jobTitle,
     },
   });
 
@@ -144,7 +122,7 @@ async function submitAccessRequest(
       if (recovered) return recovered;
       return { code: 409, body: { error: 'An SPIP account already exists for this corporate email.' } };
     }
-    console.error('[SPIP SIGNUP] Supabase signUp failed:', {
+    console.error('[SPIP SIGNUP] Auth admin createUser failed:', {
       message: message || 'empty error',
       code: (createError as any)?.code || null,
       status: (createError as any)?.status || null,
@@ -153,35 +131,24 @@ async function submitAccessRequest(
       code: 500,
       body: {
         error: 'Unable to create the access request.',
-        detail: message || 'Supabase returned an empty signup error.',
+        detail: message || 'Supabase returned an empty user-creation error.',
       },
     };
   }
 
   const userId = created.user.id;
-  const { data: profile, error: profileLookupError } = await adminClient
-    .from('profiles')
-    .select('id, status, permission_level')
-    .eq('id', userId)
-    .maybeSingle();
+  const { error: profileError } = await createPendingProfile(adminClient, {
+    userId,
+    email: values.email,
+    fullName: values.fullName,
+    department: values.department,
+    jobTitle: values.jobTitle,
+  });
 
-  if (profileLookupError) {
-    console.error('[SPIP SIGNUP] Profile lookup after signup failed:', profileLookupError.message);
-  }
-
-  if (!profile?.id) {
-    const { error: profileError } = await createPendingProfile(adminClient, {
-      userId,
-      email: values.email,
-      fullName: values.fullName,
-      department: values.department,
-      jobTitle: values.jobTitle,
-    });
-    if (profileError) {
-      console.error('[SPIP SIGNUP] Profile creation failed:', profileError.message);
-      await adminClient.auth.admin.deleteUser(userId).catch(() => undefined);
-      return { code: 500, body: { error: 'Unable to create the staff profile. The request was rolled back.' } };
-    }
+  if (profileError) {
+    console.error('[SPIP SIGNUP] Profile creation failed:', profileError.message);
+    await adminClient.auth.admin.deleteUser(userId).catch(() => undefined);
+    return { code: 500, body: { error: 'Unable to create the staff profile. The request was rolled back.' } };
   }
 
   return {
@@ -224,8 +191,8 @@ export function registerPublicAuthRoutes(app: Express, supabase: SupabaseClient)
     }
   });
 
-  // Temporary production smoke test. It creates a unique QA user, verifies the trigger-created
-  // STAFF/PENDING profile, then deletes the QA identity again. This route is removed after validation.
+  // Temporary production smoke test. It creates a unique QA user, verifies the explicit
+  // STAFF/PENDING profile, then deletes the QA identity again. Remove after validation.
   app.get(AUTH_SMOKE_PATH, async (_req, res) => {
     const stamp = Date.now();
     const email = `spip.qa.${stamp}@scmcapitalng.com`;
