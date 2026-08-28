@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { AlertCircle, ArrowRight, CheckCircle, Lock, Mail, RefreshCw, User } from 'lucide-react';
+import { AlertCircle, ArrowRight, CheckCircle2, LockKeyhole, Mail, RefreshCw, UserRound } from 'lucide-react';
 import { UserProfile } from '../types';
 import { ScmLogo } from './ScmLogo';
 import { isScmCorporateEmail, isSupabaseConfigured, supabase } from '../lib/supabase';
@@ -8,7 +8,7 @@ interface AuthScreenProps {
   onLoginSuccess: (user: UserProfile) => void;
 }
 
-type Mode = 'login' | 'signup' | 'forgot_password' | 'reset_password';
+type Mode = 'login' | 'signup' | 'forgot' | 'reset';
 
 type ProfileRow = {
   id: string;
@@ -25,25 +25,28 @@ const mapProfile = (profile: ProfileRow): UserProfile => ({
   id: profile.id,
   fullName: profile.full_name,
   email: profile.email,
-  role:
-    profile.permission_level === 'SUPER_ADMIN'
-      ? 'SUPER_ADMIN'
-      : profile.permission_level === 'HOD_ADMIN'
-        ? 'Admin'
-        : 'Business Development Officer',
+  role: profile.permission_level === 'SUPER_ADMIN' ? 'SUPER_ADMIN' : profile.permission_level === 'HOD_ADMIN' ? 'Admin' : 'Business Development Officer',
   permissionLevel: profile.permission_level,
   department: profile.department || 'Asset Management',
   avatarUrl: profile.avatar_url || '',
   status: profile.status === 'ACTIVE' ? 'Active' : profile.status,
 });
 
-const friendlyAuthError = (message?: string) => {
-  const text = message || 'Unable to complete authentication.';
-  if (text.toLowerCase().includes('invalid login credentials')) return 'Incorrect email or password.';
-  if (text.toLowerCase().includes('email not confirmed')) return 'Please confirm your corporate email before signing in.';
-  if (text.toLowerCase().includes('user already registered')) return 'An account already exists for this corporate email.';
-  if (text.toLowerCase().includes('rate limit')) return 'Too many attempts. Please wait a moment and try again.';
-  return text;
+const friendlyAuthError = (error: unknown) => {
+  const raw = typeof error === 'string'
+    ? error
+    : error instanceof Error
+      ? error.message
+      : (error as any)?.message || (error as any)?.error_description || (error as any)?.error || '';
+  const text = String(raw || 'Unable to complete this request.').trim();
+  const lower = text.toLowerCase();
+  if (lower.includes('invalid login credentials')) return 'Incorrect email or password.';
+  if (lower.includes('email not confirmed')) return 'Confirm your SCM corporate email before signing in.';
+  if (lower.includes('already registered') || lower.includes('already exists')) return 'An SPIP account already exists for this corporate email.';
+  if (lower.includes('rate limit') || lower.includes('too many')) return 'Too many attempts. Please wait a moment and try again.';
+  if (lower.includes('database error') || lower.includes('saving new user')) return 'Your access request could not be created. Please contact the SPIP administrator.';
+  if (lower.includes('weak password')) return 'Use a stronger password with at least 12 characters.';
+  return text === '{}' ? 'Unable to complete this request. Please try again.' : text;
 };
 
 export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess }) => {
@@ -52,28 +55,31 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess }) => {
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [fullName, setFullName] = useState('');
-  const [department, setDepartment] = useState('Asset Management');
   const [jobTitle, setJobTitle] = useState('');
-  const [newPassword, setNewPassword] = useState('');
-  const [confirmNewPassword, setConfirmNewPassword] = useState('');
-  const [errorMsg, setErrorMsg] = useState('');
-  const [infoMsg, setInfoMsg] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
+  const [department, setDepartment] = useState('Asset Management');
+  const [message, setMessage] = useState('');
+  const [errorMessage, setErrorMessage] = useState('');
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     const { data } = supabase.auth.onAuthStateChange((event) => {
       if (event === 'PASSWORD_RECOVERY') {
-        setMode('reset_password');
-        setInfoMsg('Create a new password for your SPIP account.');
+        setMode('reset');
+        setMessage('Create a new password for your SPIP account.');
       }
     });
     return () => data.subscription.unsubscribe();
   }, []);
 
-  useEffect(() => {
-    setErrorMsg('');
-    setInfoMsg('');
-  }, [mode]);
+  const clearFeedback = () => {
+    setMessage('');
+    setErrorMessage('');
+  };
+
+  const setModeSafe = (next: Mode) => {
+    clearFeedback();
+    setMode(next);
+  };
 
   const loadProfile = async (userId: string) => {
     const { data, error } = await supabase
@@ -81,71 +87,48 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess }) => {
       .select('id, full_name, email, permission_level, job_title, department, status, avatar_url')
       .eq('id', userId)
       .single();
-
-    if (error || !data) throw new Error('Your SPIP profile could not be loaded. Contact an administrator.');
+    if (error || !data) throw new Error('Your SPIP profile is unavailable. Contact an administrator.');
     return data as ProfileRow;
   };
 
-  const handleLogin = async (event: React.FormEvent) => {
+  const login = async (event: React.FormEvent) => {
     event.preventDefault();
+    clearFeedback();
     const normalizedEmail = email.trim().toLowerCase();
-    if (!isScmCorporateEmail(normalizedEmail)) {
-      setErrorMsg('Please use your SCM Capital corporate email address.');
-      return;
-    }
-    if (!password) {
-      setErrorMsg('Enter your password.');
-      return;
-    }
+    if (!isScmCorporateEmail(normalizedEmail)) return setErrorMessage('Use your @scmcapitalng.com corporate email address.');
+    if (!password) return setErrorMessage('Enter your password.');
 
-    setIsLoading(true);
-    setErrorMsg('');
+    setLoading(true);
     try {
       const { data, error } = await supabase.auth.signInWithPassword({ email: normalizedEmail, password });
-      if (error || !data.user) throw new Error(friendlyAuthError(error?.message));
-
+      if (error || !data.user) throw error || new Error('Unable to sign in.');
       const profile = await loadProfile(data.user.id);
       if (profile.status !== 'ACTIVE') {
         await supabase.auth.signOut();
-        if (profile.status === 'PENDING') throw new Error('Your SPIP access request is waiting for administrator approval.');
+        if (profile.status === 'PENDING') throw new Error('Your access request is waiting for administrator approval.');
         if (profile.status === 'SUSPENDED') throw new Error('Your SPIP account is suspended. Contact an administrator.');
-        throw new Error('Your SPIP access request has been rejected. Contact an administrator if this is unexpected.');
+        throw new Error('Your SPIP access request is not active. Contact an administrator.');
       }
-
       onLoginSuccess(mapProfile(profile));
-    } catch (error: any) {
-      setErrorMsg(friendlyAuthError(error?.message));
+    } catch (error) {
+      setErrorMessage(friendlyAuthError(error));
     } finally {
-      setIsLoading(false);
+      setLoading(false);
     }
   };
 
-  const handleRegister = async (event: React.FormEvent) => {
+  const signup = async (event: React.FormEvent) => {
     event.preventDefault();
+    clearFeedback();
     const normalizedEmail = email.trim().toLowerCase();
-    if (!fullName.trim() || !normalizedEmail || !password || !confirmPassword) {
-      setErrorMsg('Full name, corporate email and password are required.');
-      return;
-    }
-    if (!isScmCorporateEmail(normalizedEmail)) {
-      setErrorMsg('Registration is restricted to @scmcapitalng.com email addresses.');
-      return;
-    }
-    if (password.length < 12) {
-      setErrorMsg('Use a password with at least 12 characters.');
-      return;
-    }
-    if (password !== confirmPassword) {
-      setErrorMsg('Passwords do not match.');
-      return;
-    }
 
-    setIsLoading(true);
-    setErrorMsg('');
-    setInfoMsg('');
+    if (fullName.trim().length < 2) return setErrorMessage('Enter your full name.');
+    if (!isScmCorporateEmail(normalizedEmail)) return setErrorMessage('Registration is restricted to @scmcapitalng.com email addresses.');
+    if (password.length < 12) return setErrorMessage('Use a password with at least 12 characters.');
+    if (password !== confirmPassword) return setErrorMessage('Passwords do not match.');
+
+    setLoading(true);
     try {
-      // Use Supabase's public signup flow so the corporate mailbox remains part of the
-      // trust boundary. A second PENDING approval gate still blocks platform access.
       const { data, error } = await supabase.auth.signUp({
         email: normalizedEmail,
         password,
@@ -158,164 +141,125 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess }) => {
           },
         },
       });
-
-      if (error) throw new Error(friendlyAuthError(error.message));
-      if (!data.user) throw new Error('Unable to submit your access request. Please try again.');
+      if (error) throw error;
+      if (!data.user) throw new Error('Unable to create your SPIP access request.');
 
       await supabase.auth.signOut();
+      setMode('login');
       setPassword('');
       setConfirmPassword('');
       setFullName('');
       setJobTitle('');
-      setMode('login');
-      setInfoMsg('Access request submitted. Confirm your SCM corporate email if prompted, then wait for administrator approval.');
-    } catch (error: any) {
-      const message = error?.message || 'Unable to submit your access request. Please try again.';
-      setErrorMsg(friendlyAuthError(String(message)));
+      setMessage('Access request submitted. Confirm your SCM email if prompted, then wait for administrator approval.');
+    } catch (error) {
+      setErrorMessage(friendlyAuthError(error));
     } finally {
-      setIsLoading(false);
+      setLoading(false);
     }
   };
 
-  const handleForgotPassword = async (event: React.FormEvent) => {
+  const sendReset = async (event: React.FormEvent) => {
     event.preventDefault();
+    clearFeedback();
     const normalizedEmail = email.trim().toLowerCase();
-    if (!isScmCorporateEmail(normalizedEmail)) {
-      setErrorMsg('Please enter your SCM Capital corporate email address.');
-      return;
-    }
-
-    setIsLoading(true);
-    setErrorMsg('');
+    if (!isScmCorporateEmail(normalizedEmail)) return setErrorMessage('Enter your SCM Capital corporate email address.');
+    setLoading(true);
     try {
-      const { error } = await supabase.auth.resetPasswordForEmail(normalizedEmail, {
-        redirectTo: window.location.origin,
-      });
-      if (error) throw new Error(friendlyAuthError(error.message));
-      setInfoMsg('If this account exists, a secure password recovery email has been sent.');
-    } catch (error: any) {
-      setErrorMsg(friendlyAuthError(error?.message));
+      const { error } = await supabase.auth.resetPasswordForEmail(normalizedEmail, { redirectTo: window.location.origin });
+      if (error) throw error;
+      setMessage('If the account exists, a password reset email has been sent.');
+    } catch (error) {
+      setErrorMessage(friendlyAuthError(error));
     } finally {
-      setIsLoading(false);
+      setLoading(false);
     }
   };
 
-  const handleResetPassword = async (event: React.FormEvent) => {
+  const updatePassword = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (newPassword.length < 8) {
-      setErrorMsg('Use a password with at least 12 characters.');
-      return;
-    }
-    if (newPassword !== confirmNewPassword) {
-      setErrorMsg('Passwords do not match.');
-      return;
-    }
-
-    setIsLoading(true);
-    setErrorMsg('');
+    clearFeedback();
+    if (password.length < 12) return setErrorMessage('Use a password with at least 12 characters.');
+    if (password !== confirmPassword) return setErrorMessage('Passwords do not match.');
+    setLoading(true);
     try {
-      const { error } = await supabase.auth.updateUser({ password: newPassword });
-      if (error) throw new Error(friendlyAuthError(error.message));
+      const { error } = await supabase.auth.updateUser({ password });
+      if (error) throw error;
       await supabase.auth.signOut();
       setMode('login');
-      setNewPassword('');
-      setConfirmNewPassword('');
-      setInfoMsg('Password updated successfully. Sign in with your new password.');
-    } catch (error: any) {
-      setErrorMsg(friendlyAuthError(error?.message));
+      setPassword('');
+      setConfirmPassword('');
+      setMessage('Password updated successfully. Sign in with your new password.');
+    } catch (error) {
+      setErrorMessage(friendlyAuthError(error));
     } finally {
-      setIsLoading(false);
+      setLoading(false);
     }
   };
 
   if (!isSupabaseConfigured) {
     return (
-      <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6">
-        <div className="max-w-md w-full border border-red-900/60 bg-slate-900 rounded-2xl p-8">
-          <AlertCircle className="w-8 h-8 text-red-400 mb-4" />
-          <h1 className="text-xl font-bold">SPIP configuration required</h1>
-          <p className="text-sm text-slate-400 mt-2">Supabase environment variables have not been configured for this deployment.</p>
+      <div className="flex min-h-screen items-center justify-center bg-slate-950 p-6 text-white">
+        <div className="w-full max-w-md rounded-2xl border border-red-900/50 bg-slate-900 p-8">
+          <AlertCircle className="h-8 w-8 text-red-400" />
+          <h1 className="mt-4 text-xl font-bold">SPIP configuration required</h1>
+          <p className="mt-2 text-sm text-slate-400">Supabase environment variables are missing from this deployment.</p>
         </div>
       </div>
     );
   }
 
-  const title = mode === 'login' ? 'Sign in to SPIP' : mode === 'signup' ? 'Request SPIP access' : mode === 'forgot_password' ? 'Reset your password' : 'Create a new password';
-  const subtitle = mode === 'login' ? 'Use your SCM Capital corporate email to continue.' : mode === 'signup' ? 'New accounts require administrator approval.' : mode === 'forgot_password' ? 'We will send a secure recovery link to your corporate email.' : 'Choose a new password for your account.';
+  const content = {
+    login: { title: 'Sign in to SPIP', subtitle: 'Use your SCM Capital corporate email to continue.', action: 'Sign in' },
+    signup: { title: 'Request SPIP access', subtitle: 'New staff accounts require administrator approval.', action: 'Submit access request' },
+    forgot: { title: 'Reset your password', subtitle: 'We will send a secure recovery link to your SCM email.', action: 'Send recovery email' },
+    reset: { title: 'Create a new password', subtitle: 'Use at least 12 characters.', action: 'Update password' },
+  }[mode];
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
-      <header className="w-full max-w-7xl mx-auto px-6 py-5 border-b border-slate-800 flex items-center justify-between">
+    <div className="min-h-screen bg-[#071524] text-slate-100">
+      <header className="mx-auto flex w-full max-w-7xl items-center justify-between border-b border-white/10 px-6 py-5">
         <ScmLogo variant="light" size="md" />
-        <span className="text-[11px] text-slate-400">SCM Capital Asset Management</span>
+        <span className="hidden text-xs text-slate-400 sm:block">SCM Capital Asset Management</span>
       </header>
 
-      <main className="grow flex items-center justify-center p-6">
-        <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl p-8 shadow-2xl">
-          <div className="text-center mb-7">
-            <div className="flex justify-center mb-4"><ScmLogo variant="light" size="lg" showText={false} /></div>
-            <h1 className="text-2xl font-bold text-white">{title}</h1>
-            <p className="text-sm text-slate-400 mt-2">{subtitle}</p>
+      <main className="flex min-h-[calc(100vh-81px)] items-center justify-center px-5 py-10">
+        <div className="w-full max-w-md rounded-3xl border border-white/10 bg-slate-900/90 p-7 shadow-2xl backdrop-blur sm:p-8">
+          <div className="mb-7">
+            <div className="mb-5 flex justify-center"><ScmLogo variant="light" size="lg" showText={false} /></div>
+            <h1 className="text-center text-2xl font-bold tracking-tight text-white">{content.title}</h1>
+            <p className="mt-2 text-center text-sm leading-6 text-slate-400">{content.subtitle}</p>
           </div>
 
-          {errorMsg && (
-            <div className="mb-5 p-3 rounded-lg border border-red-900/60 bg-red-950/40 text-red-300 text-sm flex gap-2">
-              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" /><span>{errorMsg}</span>
-            </div>
-          )}
-          {infoMsg && (
-            <div className="mb-5 p-3 rounded-lg border border-emerald-900/60 bg-emerald-950/30 text-emerald-300 text-sm flex gap-2">
-              <CheckCircle className="w-4 h-4 shrink-0 mt-0.5" /><span>{infoMsg}</span>
-            </div>
-          )}
+          {errorMessage && <Feedback tone="error" text={errorMessage} />}
+          {message && <Feedback tone="success" text={message} />}
 
-          <form
-            className="space-y-4"
-            onSubmit={mode === 'login' ? handleLogin : mode === 'signup' ? handleRegister : mode === 'forgot_password' ? handleForgotPassword : handleResetPassword}
-          >
+          <form className="mt-5 space-y-4" onSubmit={mode === 'login' ? login : mode === 'signup' ? signup : mode === 'forgot' ? sendReset : updatePassword}>
             {mode === 'signup' && (
               <>
-                <Field icon={<User className="w-4 h-4" />} label="Full name" value={fullName} onChange={setFullName} placeholder="Your full name" />
-                <Field icon={<User className="w-4 h-4" />} label="Job title" value={jobTitle} onChange={setJobTitle} placeholder="e.g. Relationship Officer" required={false} />
-                <Field icon={<User className="w-4 h-4" />} label="Department / Unit" value={department} onChange={setDepartment} placeholder="Asset Management" />
+                <Field label="Full name" icon={UserRound} value={fullName} onChange={setFullName} placeholder="Your full name" />
+                <Field label="Job title" icon={UserRound} value={jobTitle} onChange={setJobTitle} placeholder="e.g. Relationship Officer" required={false} />
+                <Field label="Department / Unit" icon={UserRound} value={department} onChange={setDepartment} placeholder="Asset Management" />
               </>
             )}
 
-            {mode !== 'reset_password' && (
-              <Field icon={<Mail className="w-4 h-4" />} label="Corporate email" type="email" value={email} onChange={setEmail} placeholder="firstname.lastname@scmcapitalng.com" />
-            )}
+            {mode !== 'reset' && <Field label="Corporate email" icon={Mail} type="email" value={email} onChange={setEmail} placeholder="firstname.lastname@scmcapitalng.com" />}
+            {mode !== 'forgot' && <Field label={mode === 'reset' ? 'New password' : 'Password'} icon={LockKeyhole} type="password" value={password} onChange={setPassword} placeholder={mode === 'login' ? 'Enter password' : 'Minimum 12 characters'} />}
+            {(mode === 'signup' || mode === 'reset') && <Field label="Confirm password" icon={LockKeyhole} type="password" value={confirmPassword} onChange={setConfirmPassword} placeholder="Confirm password" />}
 
-            {(mode === 'login' || mode === 'signup') && (
-              <Field icon={<Lock className="w-4 h-4" />} label="Password" type="password" value={password} onChange={setPassword} placeholder="Enter password" />
-            )}
-
-            {mode === 'signup' && (
-              <Field icon={<Lock className="w-4 h-4" />} label="Confirm password" type="password" value={confirmPassword} onChange={setConfirmPassword} placeholder="Confirm password" />
-            )}
-
-            {mode === 'reset_password' && (
-              <>
-                <Field icon={<Lock className="w-4 h-4" />} label="New password" type="password" value={newPassword} onChange={setNewPassword} placeholder="Minimum 12 characters" />
-                <Field icon={<Lock className="w-4 h-4" />} label="Confirm new password" type="password" value={confirmNewPassword} onChange={setConfirmNewPassword} placeholder="Confirm new password" />
-              </>
-            )}
-
-            <button disabled={isLoading} className="w-full mt-2 bg-red-700 hover:bg-red-600 disabled:opacity-60 text-white rounded-lg py-3 text-sm font-semibold flex items-center justify-center gap-2 transition-colors">
-              {isLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <ArrowRight className="w-4 h-4" />}
-              {mode === 'login' ? 'Sign in' : mode === 'signup' ? 'Submit access request' : mode === 'forgot_password' ? 'Send recovery email' : 'Update password'}
+            <button disabled={loading} className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#b1191f] px-4 py-3 text-sm font-semibold text-white transition hover:bg-[#94151a] disabled:opacity-50">
+              {loading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
+              {content.action}
             </button>
           </form>
 
-          <div className="mt-6 text-center text-sm text-slate-400 space-y-2">
+          <div className="mt-6 space-y-2 text-center text-sm text-slate-400">
             {mode === 'login' && (
               <>
-                <button onClick={() => setMode('forgot_password')} className="hover:text-white">Forgot password?</button>
-                <div><button onClick={() => setMode('signup')} className="text-red-400 hover:text-red-300">Request access</button></div>
+                <button onClick={() => setModeSafe('forgot')} className="hover:text-white">Forgot password?</button>
+                <div><button onClick={() => setModeSafe('signup')} className="font-medium text-red-400 hover:text-red-300">Request access</button></div>
               </>
             )}
-            {mode !== 'login' && mode !== 'reset_password' && (
-              <button onClick={() => setMode('login')} className="hover:text-white">Back to sign in</button>
-            )}
+            {mode !== 'login' && mode !== 'reset' && <button onClick={() => setModeSafe('login')} className="hover:text-white">Back to sign in</button>}
           </div>
         </div>
       </main>
@@ -323,29 +267,37 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess }) => {
   );
 };
 
+const Feedback = ({ tone, text }: { tone: 'error' | 'success'; text: string }) => (
+  <div className={`flex items-start gap-2 rounded-xl border px-3.5 py-3 text-sm ${tone === 'error' ? 'border-red-900/60 bg-red-950/40 text-red-300' : 'border-emerald-900/60 bg-emerald-950/30 text-emerald-300'}`}>
+    {tone === 'error' ? <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" /> : <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />}
+    <span>{text}</span>
+  </div>
+);
+
 interface FieldProps {
   label: string;
   value: string;
   onChange: (value: string) => void;
   placeholder: string;
-  icon: React.ReactNode;
+  icon: React.ComponentType<{ className?: string }>;
   type?: string;
   required?: boolean;
 }
 
-const Field: React.FC<FieldProps> = ({ label, value, onChange, placeholder, icon, type = 'text', required = true }) => (
+const Field: React.FC<FieldProps> = ({ label, value, onChange, placeholder, icon: Icon, type = 'text', required = true }) => (
   <label className="block">
-    <span className="block text-xs font-semibold text-slate-300 mb-1.5">{label}</span>
-    <div className="relative">
-      <span className="absolute left-3 top-3 text-slate-500">{icon}</span>
+    <span className="mb-1.5 block text-xs font-semibold text-slate-300">{label}</span>
+    <span className="relative block">
+      <Icon className="absolute left-3 top-3 h-4 w-4 text-slate-500" />
       <input
         required={required}
         type={type}
         value={value}
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
-        className="w-full bg-slate-950 border border-slate-700 rounded-lg pl-10 pr-4 py-2.5 text-sm text-white placeholder-slate-600 outline-none focus:border-red-700 focus:ring-1 focus:ring-red-700"
+        autoComplete={type === 'password' ? 'current-password' : type === 'email' ? 'email' : 'off'}
+        className="w-full rounded-xl border border-slate-700 bg-slate-950/60 py-2.5 pl-10 pr-3 text-sm text-white outline-none transition placeholder:text-slate-600 focus:border-red-700 focus:ring-2 focus:ring-red-900/30"
       />
-    </div>
+    </span>
   </label>
 );
