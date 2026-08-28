@@ -1,0 +1,94 @@
+name: Phase 3 CRM UI Validation
+
+on:
+  push:
+    branches: [phase-3-crm-ui-charts]
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-phase3:
+    if: "!contains(github.event.head_commit.message, '[phase3-secure]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: phase-3-crm-ui-charts
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Apply initial integration when needed
+        run: |
+          if grep -q "registerPhase3Routes(app, supabaseServer)" server.ts; then
+            echo "Initial Phase 3 integration already present."
+          else
+            node scripts/apply-phase3-ui-runtime.mjs
+          fi
+      - name: Apply compatibility contract fixes
+        run: node scripts/phase3-compatibility-fix.mjs
+      - name: Apply authentication security hardening
+        run: node scripts/phase3-security-hardening.mjs
+      - name: Apply administration UI polish
+        run: node scripts/phase3-ui-polish.mjs
+      - name: Prepare dependency graph
+        run: npm install --package-lock-only --ignore-scripts
+      - name: Dependency audit gate
+        run: npm audit --omit=dev --audit-level=high
+      - name: Install dependencies
+        run: npm install --no-package-lock
+      - name: Phase 3 functional assertions
+        run: |
+          grep -q "registerPublicAuthRoutes(app, supabaseServer)" server.ts
+          grep -q "registerPhase3Routes(app, supabaseServer)" server.ts
+          grep -q "registerPhase3CrudRoutes(app, supabaseServer)" server.ts
+          grep -q "supabase.auth.signUp" src/components/AuthScreen.tsx
+          grep -q "Client360" src/App.tsx
+          grep -q "OfficerDashboardCharts" src/pages/Dashboard.tsx
+          grep -q "ExecutiveRecharts" src/pages/ExecutiveSummary.tsx
+          grep -q "ManagementRecharts" src/pages/ManagementReports.tsx
+          grep -q "mapProspectRow" src/server/phase3Routes.ts
+          grep -q "mapContactRow" src/server/phase3CrudRoutes.ts
+          grep -q '"recharts"' package.json
+          grep -q "Research Analytics" src/pages/AdminDashboard.tsx
+          grep -q "Active Prospects" src/pages/AdminDashboard.tsx
+          if grep -q "SCM Leads Suspendd\|Enterprise Control Deck" src/pages/AdminDashboard.tsx; then
+            echo "Legacy/typo administration UI copy remains" >&2
+            exit 1
+          fi
+      - name: Phase 3 security assertions
+        run: |
+          if grep -q "auth.admin.createUser" src/server/publicAuthRoutes.ts; then
+            echo "Unsafe public service-role account creation detected" >&2
+            exit 1
+          fi
+          if grep -q "fetch('/api/auth/register-v2'" src/components/AuthScreen.tsx; then
+            echo "Frontend still depends on retired admin-backed signup endpoint" >&2
+            exit 1
+          fi
+          grep -q "'PENDING'" database/migrations/phase_2c_signup_reliability.sql
+          grep -q "getUserById(targetId)" src/server/phase2Routes.ts
+          grep -q "email_confirmed_at" src/server/phase2Routes.ts
+          grep -q "revoke all on public.campaigns from anon, authenticated" database/migrations/phase_3_crm_client360.sql
+          grep -q "prospects_apollo_org_unique_idx" database/migrations/phase_3_crm_client360.sql
+          grep -q "client_conversions_nonnegative_amounts" database/migrations/phase_3_crm_client360.sql
+          if grep -R -n --exclude-dir=node_modules --exclude='*.md' "scmcapital2026" src server.ts api; then
+            echo "Legacy default password pattern detected" >&2
+            exit 1
+          fi
+      - name: Type check
+        run: npm run lint
+      - name: Production build
+        run: npm run build
+      - name: Commit validated secure changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server.ts package.json src database/migrations scripts .github/workflows/phase3-crm-ui.yml
+          if git diff --cached --quiet; then
+            echo "No generated changes to commit"
+          else
+            git commit -m "security: validate hardened Phase 3 runtime [phase3-secure]"
+            git push origin HEAD:phase-3-crm-ui-charts
+          fi

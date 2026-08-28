@@ -310,6 +310,14 @@ export function registerPhase2Routes(app: Express, supabase: SupabaseClient) {
       if (!nextStatus) return res.status(400).json({ error: 'Invalid account status.' });
       patch.status = nextStatus;
       if (nextStatus === 'ACTIVE') {
+        const { data: authRecord, error: authLookupError } = await supabase.auth.admin.getUserById(targetId);
+        const confirmedAt = authRecord?.user?.email_confirmed_at || authRecord?.user?.confirmed_at;
+        if (authLookupError || !authRecord?.user) {
+          return res.status(503).json({ error: 'Unable to verify this corporate identity before approval.' });
+        }
+        if (!confirmedAt) {
+          return res.status(400).json({ error: 'This user must confirm their SCM corporate email before an administrator can activate the account.' });
+        }
         patch.approved_at = new Date().toISOString();
         patch.approved_by = actor.userId;
       }
