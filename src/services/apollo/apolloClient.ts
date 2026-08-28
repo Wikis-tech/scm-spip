@@ -85,7 +85,7 @@ export class ApolloClient {
     this.apiKey = key;
     this.baseUrl = (config?.baseUrl || process.env.APOLLO_BASE_URL || 'https://api.apollo.io/api/v1').replace(/\/+$/, '');
     this.timeoutMs = config?.timeoutMs || Number(process.env.APOLLO_TIMEOUT) || 12000;
-    this.maxRetries = config?.maxRetries ?? Number(process.env.APOLLO_MAX_RETRIES) || 2;
+    this.maxRetries = config?.maxRetries ?? (Number(process.env.APOLLO_MAX_RETRIES) || 2);
     this.retryDelayMs = config?.retryDelayMs || Number(process.env.APOLLO_RETRY_DELAY) || 750;
     this.dailyLimit = config?.dailyLimit || Number(process.env.APOLLO_DAILY_LIMIT) || 5000;
 
