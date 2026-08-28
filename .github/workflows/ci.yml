@@ -17,6 +17,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Prepare dependency graph
+        run: npm install --package-lock-only --ignore-scripts
+      - name: Dependency audit
+        run: npm audit --omit=dev --audit-level=high
       - name: Install dependencies
         run: npm install --no-package-lock
       - name: Security assertions
@@ -33,8 +37,7 @@ jobs:
           grep -q "permission_level" database/migrations/phase_2c_signup_reliability.sql
           grep -q "truncate table public.users cascade" database/migrations/phase_3b_fresh_start.sql
           grep -q "mixed_companies/search" src/services/apolloService.ts
-      - name: Dependency audit
-        run: npm audit --omit=dev --audit-level=high
+          grep -q "mixed_people/api_search" src/services/apolloService.ts
       - name: Type check
         run: npm run lint
       - name: Build
