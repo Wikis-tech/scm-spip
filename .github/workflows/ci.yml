@@ -21,10 +21,20 @@ jobs:
         run: npm install --no-package-lock
       - name: Security assertions
         run: |
-          if grep -q "scmcapital2026" server.ts; then echo "Legacy default password remains"; exit 1; fi
-          if grep -q "VITE_APOLLO_API_KEY" server.ts src/services/apolloService.ts; then echo "Apollo secret exposed through client-style env"; exit 1; fi
-          if grep -q "KpuBuIUPuGIKOatjdoiVeA" server.ts src/services/apolloService.ts; then echo "Committed Apollo fallback remains"; exit 1; fi
+          set -e
+          if grep -R -n --exclude-dir=node_modules --exclude='*.md' "scmcapital2026" src server.ts api 2>/dev/null; then echo "Legacy default password remains"; exit 1; fi
+          if grep -R -n --exclude-dir=node_modules --exclude='*.md' "KpuBuIUPuGIKOatjdoiVeA" src server.ts api 2>/dev/null; then echo "Committed Apollo fallback remains"; exit 1; fi
+          if grep -R -n --exclude-dir=node_modules --exclude='*.md' "VITE_APOLLO_API_KEY" src server.ts api 2>/dev/null; then echo "Apollo secret exposed through a client-style environment variable"; exit 1; fi
           if grep -q "password: text('password')" src/db/schema.ts; then echo "Plaintext password column remains"; exit 1; fi
+          if grep -R -n --exclude-dir=node_modules --exclude='*.md' "x-user-role\|x-user-id\|x-user-email" src 2>/dev/null; then echo "Legacy browser-controlled identity headers remain in frontend code"; exit 1; fi
+          if grep -q "auth.admin.createUser" src/server/publicAuthRoutes.ts; then echo "Unauthenticated service-role account creation remains"; exit 1; fi
+          grep -q "supabase.auth.signUp" src/components/AuthScreen.tsx
+          grep -q "password.length < 12" src/components/AuthScreen.tsx
+          grep -q "permission_level" database/migrations/phase_2c_signup_reliability.sql
+          grep -q "truncate table public.users cascade" database/migrations/phase_3b_fresh_start.sql
+          grep -q "mixed_companies/search" src/services/apolloService.ts
+      - name: Dependency audit
+        run: npm audit --omit=dev --audit-level=high
       - name: Type check
         run: npm run lint
       - name: Build
