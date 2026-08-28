@@ -87,37 +87,69 @@ export async function unsubscribeUser(): Promise<boolean> {
   }
 }
 
-export async function getPushStatus() {
-  return api('/api/push/status');
-}
-
-export async function sendTestPush() {
-  return api('/api/push/test', { method: 'POST' });
-}
-
-export async function getNotificationPreferences() {
-  return api('/api/notification-preferences');
-}
-
+export async function getPushStatus() { return api('/api/push/status'); }
+export async function sendTestPush() { return api('/api/push/test', { method: 'POST' }); }
+export async function getNotificationPreferences() { return api('/api/notification-preferences'); }
 export async function saveNotificationPreferences(values: Record<string, any>) {
   return api('/api/notification-preferences', { method: 'PATCH', body: JSON.stringify(values) });
 }
 
+export async function getReminders(limit = 50) {
+  return api(`/api/reminders?limit=${Math.min(100, Math.max(1, limit))}`);
+}
+
 export async function createCustomReminder(values: {
-  title: string; message?: string; scheduledFor: string; priority?: 'normal'|'high'|'critical';
-  sourceType?: 'follow_up'|'custom'; sourceId?: string; prospectId?: string; prospectName?: string; url?: string;
+  title: string;
+  message?: string;
+  scheduledFor: string;
+  priority?: 'normal' | 'high' | 'critical';
+  sourceType?: 'follow_up' | 'custom';
+  sourceId?: string;
+  prospectId?: string;
+  prospectName?: string;
+  url?: string;
 }) {
   return api('/api/reminders/custom', { method: 'POST', body: JSON.stringify(values) });
 }
 
-// Foreground safety net: if the external background scheduler is delayed, an active
-// SPIP tab asks the dispatcher to run only when a local integration explicitly exposes
-// REMINDER_CRON_SECRET. The production background scheduler remains the authority.
+export async function snoozeReminder(id: string, minutes = 10) {
+  return api(`/api/reminders/${encodeURIComponent(id)}/snooze`, {
+    method: 'POST',
+    body: JSON.stringify({ minutes }),
+  });
+}
+
+export async function cancelReminder(id: string) {
+  return api(`/api/reminders/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+export async function dispatchOwnDueReminders() {
+  return api('/api/reminders/dispatch-self', { method: 'POST' });
+}
+
 export async function syncServiceWorkerRegistration() {
   if (!isPushSupported() || Notification.permission !== 'granted') return;
-  try {
-    await navigator.serviceWorker.register('/sw.js', { scope: '/' });
-  } catch {
-    // Non-fatal: settings page exposes a retry path.
-  }
+  try { await navigator.serviceWorker.register('/sw.js', { scope: '/' }); }
+  catch { /* Settings exposes a retry path. */ }
+}
+
+let heartbeatStarted = false;
+export function startForegroundReminderHeartbeat() {
+  if (heartbeatStarted || typeof window === 'undefined') return;
+  heartbeatStarted = true;
+
+  const tick = async () => {
+    if (document.visibilityState !== 'visible') return;
+    if (!isPushSupported() || Notification.permission !== 'granted') return;
+    const { data } = await supabase.auth.getSession();
+    if (!data.session?.access_token) return;
+    try { await dispatchOwnDueReminders(); }
+    catch { /* Background scheduler remains authoritative; this is only a safety net. */ }
+  };
+
+  window.setTimeout(tick, 5_000);
+  window.setInterval(tick, 60_000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') tick();
+  });
 }
