@@ -465,9 +465,27 @@ const PORT = Number(process.env.PORT || 3000);
 let isDatabaseHealthy = false;
 
 app.use('/api', (req, res, next) => {
-  if (req.path.startsWith('/auth/')) return next();
+  // Authentication, Supabase-backed CRM/admin routes and stateless research endpoints
+  // do not depend on the legacy direct PostgreSQL pool. They remain protected by the
+  // Supabase bearer-token middleware registered above this gate.
+  const databaseIndependentPrefixes = [
+    '/auth/',
+    '/admin/',
+    '/crm/',
+    '/weekly-reports',
+    '/campaigns',
+    '/client-360',
+    '/apollo/',
+    '/gemini/',
+    '/serena/',
+  ];
+  if (databaseIndependentPrefixes.some((prefix) => req.path.startsWith(prefix))) return next();
+
   if (process.env.NODE_ENV === 'production' && !isDatabaseHealthy) {
-    return res.status(503).json({ error: 'SPIP database is temporarily unavailable. No changes were saved.' });
+    return res.status(503).json({
+      error: 'This legacy data service is temporarily unavailable. Your authenticated SPIP session remains active.',
+      code: 'LEGACY_DATABASE_UNAVAILABLE',
+    });
   }
   return next();
 });

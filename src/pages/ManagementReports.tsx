@@ -187,7 +187,7 @@ export const ManagementReports: React.FC<ManagementReportsProps> = ({ currentUse
       {tab === 'monthly' && monthly && (
         <div className="space-y-5">
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-            {cards.map(({ label, value, icon: Icon }) => <Kpi key={label} label={label} value={value} icon={Icon} />)}
+            {cards.map(({ label, value, icon: Icon }) => <React.Fragment key={label}><Kpi label={label} value={value} icon={Icon} /></React.Fragment>)}
           </div>
           <ManagementRecharts monthly={monthly} staff={staff} />
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
