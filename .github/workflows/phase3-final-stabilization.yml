@@ -23,23 +23,29 @@ jobs:
         run: |
           node scripts/phase3-final-server-fix.mjs
           node scripts/phase3-final-types-fix.mjs
+          node scripts/phase3-final-auth-apollo-fix.mjs
       - name: Prepare dependency graph
         run: npm install --package-lock-only --ignore-scripts
       - name: Dependency audit
         run: npm audit --omit=dev --audit-level=high
       - name: Install dependencies
         run: npm install --no-package-lock
-      - name: Phase 3 security assertions
+      - name: Phase 3 security and functional assertions
         run: |
           set -e
           if grep -R -n --exclude-dir=node_modules --exclude='*.md' "scmcapital2026" src server.ts api 2>/dev/null; then echo "Legacy default password remains"; exit 1; fi
           if grep -R -n --exclude-dir=node_modules --exclude='*.md' "KpuBuIUPuGIKOatjdoiVeA" src server.ts api 2>/dev/null; then echo "Committed Apollo fallback remains"; exit 1; fi
           if grep -R -n --exclude-dir=node_modules --exclude='*.md' "VITE_APOLLO_API_KEY" src server.ts api 2>/dev/null; then echo "Apollo client-side secret exposure remains"; exit 1; fi
           if grep -R -n --exclude-dir=node_modules --exclude='*.md' "x-user-role\|x-user-id\|x-user-email" src 2>/dev/null; then echo "Legacy browser-controlled identity headers remain"; exit 1; fi
-          if grep -q "auth.admin.createUser" src/server/publicAuthRoutes.ts; then echo "Unsafe public service-role signup remains"; exit 1; fi
-          grep -q "supabase.auth.signUp" src/components/AuthScreen.tsx
+          grep -q "fetch('/api/auth/register-v2'" src/components/AuthScreen.tsx
+          grep -q "auth.admin.createUser" src/server/publicAuthRoutes.ts
+          grep -q "permission_level: 'STAFF'" src/server/publicAuthRoutes.ts
+          grep -q "status: 'PENDING'" src/server/publicAuthRoutes.ts
+          grep -q "MAX_ATTEMPTS" src/server/publicAuthRoutes.ts
           grep -q "password.length < 12" src/components/AuthScreen.tsx
           grep -q "mixed_companies/search" src/services/apolloService.ts
+          grep -q "accounts/search" src/services/apolloService.ts
+          grep -q "per_page: 100" src/services/apolloService.ts
           grep -q "mixed_people/api_search" src/services/apolloService.ts
           grep -q "databaseIndependentPrefixes" server.ts
           grep -q "truncate table public.users cascade" database/migrations/phase_3b_fresh_start.sql
@@ -51,10 +57,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add server.ts src/pages/ManagementReports.tsx scripts .github/workflows/phase3-final-stabilization.yml
+          git add server.ts src scripts .github/workflows/phase3-final-stabilization.yml
           if git diff --cached --quiet; then
             echo "No generated changes to commit"
           else
-            git commit -m "fix: finalize Phase 3 runtime routing [phase3-final]"
+            git commit -m "fix: finalize Phase 3 signup and Apollo parity [phase3-final]"
             git push origin HEAD:phase-3-final-stabilization
           fi
