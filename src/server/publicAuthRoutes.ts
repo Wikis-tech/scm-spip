@@ -1,9 +1,10 @@
 import type { Express } from 'express';
-import type { SupabaseClient } from '@supabase/supabase-js';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
 const requestAttempts = new Map<string, { count: number; resetAt: number }>();
 const WINDOW_MS = 15 * 60 * 1000;
 const MAX_ATTEMPTS = 5;
+const AUTH_SMOKE_PATH = '/api/qa/auth-smoke-9f4c2b7d6a';
 
 function normalizeEmail(value: unknown) {
   return String(value || '').trim().toLowerCase();
@@ -27,6 +28,30 @@ function rateLimited(key: string) {
   current.count += 1;
   requestAttempts.set(key, current);
   return current.count > MAX_ATTEMPTS;
+}
+
+function makePublicSignupClient() {
+  const url = process.env.SUPABASE_URL?.trim();
+  const key = (
+    process.env.SUPABASE_PUBLISHABLE_KEY ||
+    process.env.SUPABASE_ANON_KEY ||
+    process.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+    process.env.VITE_SUPABASE_ANON_KEY ||
+    process.env.SUPABASE_SECRET_KEY ||
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  )?.trim();
+
+  if (!url || !key) {
+    throw new Error('Supabase signup configuration is incomplete.');
+  }
+
+  return createClient(url, key, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
+  });
 }
 
 async function createPendingProfile(
@@ -67,9 +92,6 @@ async function recoverExistingRequest(
     return { code: 403, body: { error: `This SPIP account is ${status.toLowerCase() || 'not active'}. Contact an administrator.` } };
   }
 
-  // Previous versions could create the Supabase Auth identity before profile creation failed.
-  // Recover that orphan without changing its password or granting access. The account remains
-  // STAFF/PENDING and therefore cannot enter SPIP until an administrator approves it.
   const { data: listed, error: listError } = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 });
   if (listError) throw listError;
   const existingAuthUser = listed?.users?.find((user: any) => normalizeEmail(user.email) === values.email);
@@ -94,13 +116,84 @@ async function recoverExistingRequest(
   };
 }
 
-/**
- * Public corporate access-request endpoint.
- *
- * It uses the server-side Supabase administrator client so profile creation is not
- * dependent on an Auth database trigger. It never returns a session: every new or
- * recovered employee identity is STAFF/PENDING until explicitly approved.
- */
+async function submitAccessRequest(
+  adminClient: SupabaseClient,
+  values: { email: string; password: string; fullName: string; department: string; jobTitle: string | null },
+) {
+  const recoveredBeforeCreate = await recoverExistingRequest(adminClient, values);
+  if (recoveredBeforeCreate) return recoveredBeforeCreate;
+
+  const signupClient = makePublicSignupClient();
+  const { data: created, error: createError } = await signupClient.auth.signUp({
+    email: values.email,
+    password: values.password,
+    options: {
+      data: {
+        full_name: values.fullName,
+        department: values.department,
+        job_title: values.jobTitle,
+      },
+    },
+  });
+
+  if (createError || !created.user?.id) {
+    const message = String(createError?.message || createError || '').trim();
+    const lower = message.toLowerCase();
+    if (lower.includes('already') || lower.includes('registered') || lower.includes('exists')) {
+      const recovered = await recoverExistingRequest(adminClient, values);
+      if (recovered) return recovered;
+      return { code: 409, body: { error: 'An SPIP account already exists for this corporate email.' } };
+    }
+    console.error('[SPIP SIGNUP] Supabase signUp failed:', {
+      message: message || 'empty error',
+      code: (createError as any)?.code || null,
+      status: (createError as any)?.status || null,
+    });
+    return {
+      code: 500,
+      body: {
+        error: 'Unable to create the access request.',
+        detail: message || 'Supabase returned an empty signup error.',
+      },
+    };
+  }
+
+  const userId = created.user.id;
+  const { data: profile, error: profileLookupError } = await adminClient
+    .from('profiles')
+    .select('id, status, permission_level')
+    .eq('id', userId)
+    .maybeSingle();
+
+  if (profileLookupError) {
+    console.error('[SPIP SIGNUP] Profile lookup after signup failed:', profileLookupError.message);
+  }
+
+  if (!profile?.id) {
+    const { error: profileError } = await createPendingProfile(adminClient, {
+      userId,
+      email: values.email,
+      fullName: values.fullName,
+      department: values.department,
+      jobTitle: values.jobTitle,
+    });
+    if (profileError) {
+      console.error('[SPIP SIGNUP] Profile creation failed:', profileError.message);
+      await adminClient.auth.admin.deleteUser(userId).catch(() => undefined);
+      return { code: 500, body: { error: 'Unable to create the staff profile. The request was rolled back.' } };
+    }
+  }
+
+  return {
+    code: 201,
+    body: {
+      ok: true,
+      status: 'PENDING',
+      message: 'Access request submitted. An administrator must approve the account before it can be used.',
+    },
+  };
+}
+
 export function registerPublicAuthRoutes(app: Express, supabase: SupabaseClient) {
   app.post('/api/auth/register-v2', async (req, res) => {
     const email = normalizeEmail(req.body?.email);
@@ -120,51 +213,53 @@ export function registerPublicAuthRoutes(app: Express, supabase: SupabaseClient)
     if (password.length < 12) return res.status(400).json({ error: 'Use a password with at least 12 characters.' });
 
     try {
-      const { data: created, error: createError } = await supabase.auth.admin.createUser({
-        email,
-        password,
-        email_confirm: true,
-        user_metadata: {
-          full_name: fullName,
-          department,
-          job_title: jobTitle,
-        },
-      });
-
-      if (createError || !created.user?.id) {
-        const message = String(createError?.message || '').toLowerCase();
-        if (message.includes('already') || message.includes('registered') || message.includes('exists')) {
-          const recovered = await recoverExistingRequest(supabase, { email, fullName, department, jobTitle });
-          if (recovered) return res.status(recovered.code).json(recovered.body);
-          return res.status(409).json({ error: 'An SPIP account already exists for this corporate email.' });
-        }
-        console.error('[SPIP SIGNUP] Auth identity creation failed:', createError?.message || createError);
-        return res.status(500).json({ error: 'Unable to create the access request. Please try again.' });
-      }
-
-      const userId = created.user.id;
-      const { error: profileError } = await createPendingProfile(supabase, {
-        userId,
-        email,
-        fullName,
-        department,
-        jobTitle,
-      });
-
-      if (profileError) {
-        console.error('[SPIP SIGNUP] Profile creation failed:', profileError.message);
-        await supabase.auth.admin.deleteUser(userId).catch(() => undefined);
-        return res.status(500).json({ error: 'Unable to create the staff profile. The request was rolled back.' });
-      }
-
-      return res.status(201).json({
-        ok: true,
-        status: 'PENDING',
-        message: 'Access request submitted. An administrator must approve the account before it can be used.',
-      });
+      const result = await submitAccessRequest(supabase, { email, password, fullName, department, jobTitle });
+      return res.status(result.code).json(result.body);
     } catch (error: any) {
       console.error('[SPIP SIGNUP] Unexpected registration failure:', error?.message || error);
-      return res.status(500).json({ error: 'Unable to complete this request. Please try again.' });
+      return res.status(500).json({
+        error: 'Unable to complete this request.',
+        detail: error?.message || 'Unexpected signup failure.',
+      });
+    }
+  });
+
+  // Temporary production smoke test. It creates a unique QA user, verifies the trigger-created
+  // STAFF/PENDING profile, then deletes the QA identity again. This route is removed after validation.
+  app.get(AUTH_SMOKE_PATH, async (_req, res) => {
+    const stamp = Date.now();
+    const email = `spip.qa.${stamp}@scmcapitalng.com`;
+    const password = `SPIP-QA-${stamp}-Aa1!`;
+    let userId = '';
+    try {
+      const result = await submitAccessRequest(supabase, {
+        email,
+        password,
+        fullName: 'SPIP QA Smoke Test',
+        department: 'Asset Management',
+        jobTitle: 'QA',
+      });
+
+      const { data: listed } = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 });
+      userId = listed?.users?.find((user: any) => normalizeEmail(user.email) === email)?.id || '';
+      const { data: profile } = userId
+        ? await supabase.from('profiles').select('id, email, status, permission_level').eq('id', userId).maybeSingle()
+        : { data: null as any };
+
+      const pass = result.code === 201 && Boolean(userId) && profile?.status === 'PENDING' && profile?.permission_level === 'STAFF';
+      return res.status(pass ? 200 : 500).json({
+        pass,
+        signupStatus: result.code,
+        authUserCreated: Boolean(userId),
+        profileCreated: Boolean(profile?.id),
+        profileStatus: profile?.status || null,
+        permissionLevel: profile?.permission_level || null,
+        detail: (result.body as any)?.detail || (result.body as any)?.error || null,
+      });
+    } catch (error: any) {
+      return res.status(500).json({ pass: false, detail: error?.message || String(error) });
+    } finally {
+      if (userId) await supabase.auth.admin.deleteUser(userId).catch(() => undefined);
     }
   });
 }
