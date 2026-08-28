@@ -1,0 +1,247 @@
+import { createClient } from '@supabase/supabase-js';
+import * as webpush from 'web-push';
+import crypto from 'node:crypto';
+
+const supabaseUrl = process.env.SUPABASE_URL?.trim() || '';
+const serverKey = (process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY)?.trim() || '';
+const supabase = createClient(supabaseUrl || 'https://invalid.supabase.co', serverKey || 'missing-key', {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
+
+const vapidPublic = process.env.VAPID_PUBLIC_KEY?.trim() || '';
+const vapidPrivate = process.env.VAPID_PRIVATE_KEY?.trim() || '';
+if (vapidPublic && vapidPrivate) {
+  webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:it@scmcapitalng.com', vapidPublic, vapidPrivate);
+}
+
+const clean = (v: any, max = 500) => String(v ?? '').trim().slice(0, max);
+
+async function currentUser(req: any) {
+  const authorization = String(req.headers?.authorization || '');
+  if (!authorization.startsWith('Bearer ')) return null;
+  const token = authorization.slice(7).trim();
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data.user?.id || !data.user.email) return null;
+  const { data: profile } = await supabase.from('profiles')
+    .select('id,email,full_name,status,permission_level')
+    .eq('id', data.user.id).maybeSingle();
+  if (!profile || profile.status !== 'ACTIVE') return null;
+  return profile;
+}
+
+function safeEqual(a: string, b: string) {
+  const aa = Buffer.from(a); const bb = Buffer.from(b);
+  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+}
+
+function mapReminder(r: any) {
+  return {
+    id: r.id, sourceType: r.source_type, sourceId: r.source_id,
+    prospectId: r.prospect_id, prospectName: r.prospect_name,
+    title: r.title, message: r.message, reminderKind: r.reminder_kind,
+    scheduledFor: r.scheduled_for, status: r.status, priority: r.priority,
+    sentAt: r.sent_at, metadata: r.metadata || {}, createdAt: r.created_at,
+  };
+}
+
+async function sendPushToUser(userId: string, reminder: any) {
+  if (!vapidPublic || !vapidPrivate) return { delivered: 0, failed: 0, reason: 'VAPID_NOT_CONFIGURED' };
+  const { data: subs, error } = await supabase.from('spip_push_subscriptions')
+    .select('*').eq('user_id', userId).eq('is_active', true);
+  if (error) throw error;
+  if (!subs?.length) return { delivered: 0, failed: 0, reason: 'NO_ACTIVE_DEVICE' };
+
+  const payload = JSON.stringify({
+    id: reminder.id,
+    title: reminder.title,
+    message: reminder.message,
+    priority: reminder.priority,
+    type: reminder.source_type,
+    reminderKind: reminder.reminder_kind,
+    url: reminder.metadata?.url || '/calendar',
+    requireInteraction: reminder.priority === 'critical' || Boolean(reminder.metadata?.requireInteraction),
+    timestamp: Date.now(),
+  });
+
+  let delivered = 0; let failed = 0;
+  for (const sub of subs) {
+    try {
+      await webpush.sendNotification({
+        endpoint: sub.endpoint,
+        keys: { p256dh: sub.p256dh, auth: sub.auth },
+      }, payload, { TTL: 60 * 60 * 12, urgency: reminder.priority === 'critical' ? 'high' : 'normal' });
+      delivered += 1;
+      await supabase.from('spip_push_subscriptions').update({ last_seen_at: new Date().toISOString() }).eq('id', sub.id);
+    } catch (e: any) {
+      failed += 1;
+      const status = Number(e?.statusCode || 0);
+      if (status === 404 || status === 410) {
+        await supabase.from('spip_push_subscriptions').update({ is_active: false }).eq('id', sub.id);
+      }
+    }
+  }
+  return { delivered, failed, reason: delivered ? null : 'DELIVERY_FAILED' };
+}
+
+async function dispatchDue() {
+  const now = new Date().toISOString();
+  const { data: rows, error } = await supabase.from('spip_reminders')
+    .select('*')
+    .eq('status', 'PENDING')
+    .lte('scheduled_for', now)
+    .or(`next_attempt_at.is.null,next_attempt_at.lte.${now}`)
+    .order('scheduled_for', { ascending: true })
+    .limit(100);
+  if (error) throw error;
+
+  const result = { scanned: rows?.length || 0, sent: 0, deferred: 0, failed: 0 };
+  for (const reminder of rows || []) {
+    if (reminder.expires_at && new Date(reminder.expires_at).getTime() < Date.now()) {
+      await supabase.from('spip_reminders').update({ status: 'FAILED', last_error: 'REMINDER_EXPIRED', updated_at: now }).eq('id', reminder.id);
+      result.failed += 1; continue;
+    }
+    try {
+      const delivery = await sendPushToUser(reminder.user_id, reminder);
+      if (delivery.delivered > 0) {
+        await supabase.from('spip_reminders').update({
+          status: 'SENT', sent_at: now, attempt_count: Number(reminder.attempt_count || 0) + 1,
+          last_error: null, updated_at: now,
+        }).eq('id', reminder.id);
+        await supabase.from('spip_notification_events').insert({
+          user_id: reminder.user_id, reminder_id: reminder.id,
+          title: reminder.title, message: reminder.message,
+          category: reminder.source_type, priority: reminder.priority,
+        });
+        result.sent += 1;
+      } else {
+        const attempts = Number(reminder.attempt_count || 0) + 1;
+        const minutes = Math.min(60, Math.max(5, Math.pow(2, Math.min(attempts, 5))));
+        await supabase.from('spip_reminders').update({
+          attempt_count: attempts, last_error: delivery.reason,
+          next_attempt_at: new Date(Date.now() + minutes * 60_000).toISOString(), updated_at: now,
+        }).eq('id', reminder.id);
+        result.deferred += 1;
+      }
+    } catch (e: any) {
+      const attempts = Number(reminder.attempt_count || 0) + 1;
+      await supabase.from('spip_reminders').update({
+        attempt_count: attempts, last_error: clean(e?.message || 'DISPATCH_ERROR', 300),
+        next_attempt_at: new Date(Date.now() + Math.min(60, attempts * 10) * 60_000).toISOString(), updated_at: now,
+      }).eq('id', reminder.id);
+      result.failed += 1;
+    }
+  }
+  return result;
+}
+
+export async function handlePhase4(req: any, res: any, path: string): Promise<boolean> {
+  if (path === 'push/public-key' && req.method === 'GET') {
+    res.status(vapidPublic ? 200 : 503).json(vapidPublic ? { publicKey: vapidPublic } : { error: 'Push notifications are not configured.' });
+    return true;
+  }
+
+  if (path === 'reminders/dispatch' && req.method === 'POST') {
+    const configured = process.env.REMINDER_CRON_SECRET || '';
+    const supplied = String(req.headers['x-spip-reminder-secret'] || req.headers.authorization?.replace(/^Bearer\s+/i, '') || '');
+    if (!configured || !supplied || !safeEqual(configured, supplied)) {
+      res.status(401).json({ error: 'Reminder dispatcher authorization failed.' }); return true;
+    }
+    try { res.json({ ok: true, ...(await dispatchDue()) }); }
+    catch (e: any) { res.status(500).json({ error: 'Reminder dispatch failed.', detail: clean(e?.message, 300) }); }
+    return true;
+  }
+
+  const user = await currentUser(req);
+  if (!user) { res.status(401).json({ error: 'Authentication required.' }); return true; }
+
+  if (path === 'push/subscribe' && req.method === 'POST') {
+    const sub = req.body?.subscription;
+    const endpoint = clean(sub?.endpoint, 2000);
+    const p256dh = clean(sub?.keys?.p256dh, 1000);
+    const auth = clean(sub?.keys?.auth, 1000);
+    if (!endpoint || !p256dh || !auth) { res.status(400).json({ error: 'Invalid push subscription.' }); return true; }
+    const { error } = await supabase.from('spip_push_subscriptions').upsert({
+      user_id: user.id, endpoint, p256dh, auth,
+      user_agent: clean(req.headers['user-agent'], 500), is_active: true,
+      last_seen_at: new Date().toISOString(),
+    }, { onConflict: 'endpoint' });
+    if (error) res.status(500).json({ error: 'Unable to register this device.' });
+    else {
+      await supabase.from('spip_notification_preferences').upsert({ user_id: user.id, push_enabled: true, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
+      res.status(201).json({ ok: true });
+    }
+    return true;
+  }
+
+  if (path === 'push/unsubscribe' && req.method === 'POST') {
+    const endpoint = clean(req.body?.endpoint, 2000);
+    await supabase.from('spip_push_subscriptions').update({ is_active: false, last_seen_at: new Date().toISOString() }).eq('user_id', user.id).eq('endpoint', endpoint);
+    res.json({ ok: true }); return true;
+  }
+
+  if (path === 'push/status' && req.method === 'GET') {
+    const [{ data: prefs }, { count }] = await Promise.all([
+      supabase.from('spip_notification_preferences').select('*').eq('user_id', user.id).maybeSingle(),
+      supabase.from('spip_push_subscriptions').select('*', { count: 'exact', head: true }).eq('user_id', user.id).eq('is_active', true),
+    ]);
+    res.json({ configured: Boolean(vapidPublic && vapidPrivate), activeDevices: count || 0, preferences: prefs || null }); return true;
+  }
+
+  if (path === 'push/test' && req.method === 'POST') {
+    const test = { id: `test-${Date.now()}`, title: 'SPIP notifications are working', message: 'This device can receive meeting and task reminders.', priority: 'high', source_type: 'custom', reminder_kind: 'test', metadata: { url: '/settings' } };
+    const delivery = await sendPushToUser(user.id, test);
+    res.status(delivery.delivered ? 200 : 409).json({ ok: delivery.delivered > 0, ...delivery }); return true;
+  }
+
+  if (path === 'reminders' && req.method === 'GET') {
+    const limit = Math.min(100, Math.max(1, Number(req.query?.limit || 50)));
+    const { data, error } = await supabase.from('spip_reminders').select('*').eq('user_id', user.id).order('scheduled_for', { ascending: true }).limit(limit);
+    if (error) res.status(500).json({ error: 'Unable to load reminders.' }); else res.json((data || []).map(mapReminder));
+    return true;
+  }
+
+  if (path === 'reminders/custom' && req.method === 'POST') {
+    const scheduled = new Date(req.body?.scheduledFor || '');
+    if (!Number.isFinite(scheduled.getTime()) || scheduled.getTime() <= Date.now()) { res.status(400).json({ error: 'Choose a future reminder time.' }); return true; }
+    const title = clean(req.body?.title, 160); const message = clean(req.body?.message, 800);
+    if (!title) { res.status(400).json({ error: 'Reminder title is required.' }); return true; }
+    const sourceId = clean(req.body?.sourceId, 160) || `custom-${crypto.randomUUID()}`;
+    const { data, error } = await supabase.from('spip_reminders').upsert({
+      user_id: user.id, source_type: req.body?.sourceType === 'follow_up' ? 'follow_up' : 'custom', source_id: sourceId,
+      prospect_id: clean(req.body?.prospectId, 200) || null, prospect_name: clean(req.body?.prospectName, 200) || null,
+      title, message: message || title, reminder_kind: 'custom', scheduled_for: scheduled.toISOString(),
+      priority: ['normal','high','critical'].includes(req.body?.priority) ? req.body.priority : 'normal', status: 'PENDING',
+      expires_at: new Date(scheduled.getTime() + 24 * 60 * 60_000).toISOString(), metadata: { url: req.body?.url || '/calendar' }, updated_at: new Date().toISOString(),
+    }, { onConflict: 'user_id,source_type,source_id,reminder_kind' }).select('*').single();
+    if (error) res.status(500).json({ error: 'Unable to create reminder.' }); else res.status(201).json(mapReminder(data));
+    return true;
+  }
+
+  const snooze = path.match(/^reminders\/([^/]+)\/snooze$/);
+  if (snooze && req.method === 'POST') {
+    const minutes = Math.min(1440, Math.max(5, Number(req.body?.minutes || 10)));
+    const { data, error } = await supabase.from('spip_reminders').update({ status: 'PENDING', scheduled_for: new Date(Date.now() + minutes * 60_000).toISOString(), next_attempt_at: null, sent_at: null, last_error: null, updated_at: new Date().toISOString() }).eq('id', snooze[1]).eq('user_id', user.id).select('*').maybeSingle();
+    if (error || !data) res.status(404).json({ error: 'Reminder not found.' }); else res.json(mapReminder(data)); return true;
+  }
+
+  const cancel = path.match(/^reminders\/([^/]+)$/);
+  if (cancel && req.method === 'DELETE') {
+    await supabase.from('spip_reminders').update({ status: 'CANCELLED', updated_at: new Date().toISOString() }).eq('id', cancel[1]).eq('user_id', user.id);
+    res.json({ ok: true }); return true;
+  }
+
+  if (path === 'notification-preferences' && req.method === 'GET') {
+    const { data } = await supabase.from('spip_notification_preferences').select('*').eq('user_id', user.id).maybeSingle();
+    res.json(data || { user_id: user.id }); return true;
+  }
+
+  if (path === 'notification-preferences' && req.method === 'PATCH') {
+    const allowed = ['push_enabled','meeting_24h','meeting_1h','meeting_10m','meeting_start','task_24h','task_1h','follow_up_enabled','quiet_hours_enabled','quiet_hours_start','quiet_hours_end'];
+    const patch: any = { user_id: user.id, updated_at: new Date().toISOString() };
+    for (const key of allowed) if (req.body?.[key] !== undefined) patch[key] = req.body[key];
+    const { data, error } = await supabase.from('spip_notification_preferences').upsert(patch, { onConflict: 'user_id' }).select('*').single();
+    if (error) res.status(500).json({ error: 'Unable to save notification preferences.' }); else res.json(data); return true;
+  }
+
+  return false;
+}
