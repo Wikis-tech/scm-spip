@@ -1,215 +1,123 @@
 import { supabase } from '../lib/supabase';
 
-// SCM Prospect Intelligence Platform - Enterprise Web Push Notification Client Service
-
-/**
- * Helper to convert standard base64 URL VAPID public key to a Uint8Array
- */
 function urlBase64ToUint8Array(base64String: string): Uint8Array {
   const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
-  const base64 = (base64String + padding)
-    .replace(/\-/g, '+')
-    .replace(/_/g, '/');
-
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
   const rawData = window.atob(base64);
-  const outputArray = new Uint8Array(rawData.length);
-
-  for (let i = 0; i < rawData.length; ++i) {
-    outputArray[i] = rawData.charCodeAt(i);
-  }
-  return outputArray;
+  return Uint8Array.from([...rawData].map((char) => char.charCodeAt(0)));
 }
 
-/**
- * Detects the active client runtime environment.
- * Evaluates whether we are running in an Android WebToNative app container,
- * a mobile browser, or a standard desktop browser.
- */
 export function getRuntimeEnvironment(): 'desktop-browser' | 'mobile-browser' | 'android-app' {
   if (typeof window === 'undefined') return 'desktop-browser';
-  
   const ua = navigator.userAgent || '';
   const isAndroid = /android/i.test(ua);
-  
-  // WebToNative often injects objects like window.WebToNative, window.webToNative, or custom webkit/OneSignal integrations
-  const isWebToNative = 
-    /webtonative/i.test(ua) || 
-    (window as any).WebToNative !== undefined || 
-    (window as any).webToNative !== undefined || 
-    (window as any).OneSignalNative !== undefined;
-
-  // General WebView indicators inside Android (e.g. "wv" or "Version/4.0")
+  const isNativeWrapper = /webtonative/i.test(ua) || (window as any).WebToNative || (window as any).webToNative || (window as any).OneSignalNative;
   const isWebView = isAndroid && (/wv/i.test(ua) || /Version\/4.0/i.test(ua));
-
-  if (isWebToNative || isWebView) {
-    return 'android-app';
-  }
-
-  const isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(ua);
-  if (isMobile) {
-    return 'mobile-browser';
-  }
-
-  return 'desktop-browser';
+  if (isNativeWrapper || isWebView) return 'android-app';
+  return /Mobi|Android|iPhone|iPad|iPod/i.test(ua) ? 'mobile-browser' : 'desktop-browser';
 }
 
-/**
- * Determines if the current environment supports Service Workers and standard Push Notifications
- */
 export function isPushSupported(): boolean {
-  // If we are running inside the Android WebToNative application, we rely on Native OneSignal SDK,
-  // so browser service worker push is not supported / bypasses this browser check.
-  if (getRuntimeEnvironment() === 'android-app') {
-    return false;
-  }
-
-  return (
-    typeof window !== 'undefined' &&
-    'serviceWorker' in navigator &&
-    'PushManager' in window
-  );
+  return typeof window !== 'undefined' && 'Notification' in window && 'serviceWorker' in navigator && 'PushManager' in window;
 }
 
-/**
- * Register the Service Worker and subscribe the user's browser for push notifications.
- * This runs seamlessly across Desktop and Android (Chrome, Edge, PWA installs, WebViews).
- */
-export async function registerServiceWorkerAndSubscribe(
-  userId: string,
-  userEmail?: string,
-  userRole?: string
-): Promise<boolean> {
-  if (!isPushSupported()) {
-    console.warn('[PUSH CLIENT] Service Worker or Push Notifications are not supported in this browser.');
-    return false;
-  }
+async function token() {
+  const { data } = await supabase.auth.getSession();
+  if (!data.session?.access_token) throw new Error('Authenticated SPIP session required.');
+  return data.session.access_token;
+}
 
+async function api(path: string, init: RequestInit = {}) {
+  const accessToken = await token();
+  const headers = new Headers(init.headers || {});
+  headers.set('Authorization', `Bearer ${accessToken}`);
+  if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  const response = await fetch(path, { ...init, headers });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body?.error || `Request failed (${response.status}).`);
+  return body;
+}
+
+export async function registerServiceWorkerAndSubscribe(_userId?: string, _userEmail?: string, _userRole?: string): Promise<boolean> {
+  if (!isPushSupported()) return false;
   try {
-    // 1. Register or get existing service worker registration
-    console.log('[PUSH CLIENT] Registering Service Worker...');
-    const registration = await navigator.serviceWorker.register('/sw.js', {
-      scope: '/'
-    });
-    console.log('[PUSH CLIENT] Service Worker registered successfully scope:', registration.scope);
+    const permission = Notification.permission === 'default' ? await Notification.requestPermission() : Notification.permission;
+    if (permission !== 'granted') throw new Error('Notification permission was not granted.');
 
-    // 2. Wait until the service worker is active
-    if (registration.installing) {
-      console.log('[PUSH CLIENT] Service Worker is installing...');
-    }
-    
-    // 3. Request native notifications permission if not already granted
-    if ('Notification' in window) {
-      const currentPermission = Notification.permission;
-      if (currentPermission === 'default') {
-        console.log('[PUSH CLIENT] Requesting browser notification permissions...');
-        const result = await Notification.requestPermission();
-        if (result !== 'granted') {
-          console.warn('[PUSH CLIENT] Notification permission was denied by the user.');
-          return false;
-        }
-      } else if (currentPermission === 'denied') {
-        console.warn('[PUSH CLIENT] Browser notification permission is already denied. Please reset permissions in settings.');
-        return false;
-      }
-    }
+    const registration = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+    await navigator.serviceWorker.ready;
 
-    // 4. Fetch the VAPID Public Key from our server
-    console.log('[PUSH CLIENT] Retrieving VAPID public key from backend...');
     const keyResponse = await fetch('/api/push/public-key');
-    if (!keyResponse.ok) {
-      throw new Error(`Failed to fetch VAPID public key: ${keyResponse.statusText}`);
+    const keyBody = await keyResponse.json().catch(() => ({}));
+    if (!keyResponse.ok || !keyBody.publicKey) throw new Error(keyBody.error || 'Push service is not configured.');
+
+    let subscription = await registration.pushManager.getSubscription();
+    if (!subscription) {
+      subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(keyBody.publicKey),
+      });
     }
-    const { publicKey } = await keyResponse.json();
-    if (!publicKey) {
-      throw new Error('No public key returned from push server endpoint.');
-    }
 
-    // 5. Subscribe or locate existing subscription on the PushManager
-    console.log('[PUSH CLIENT] Initiating/Retrieving subscription with PushManager...');
-    const applicationServerKey = urlBase64ToUint8Array(publicKey);
-    
-    const subscription = await registration.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey
-    });
-
-    console.log('[PUSH CLIENT] Browser subscription registered successfully:', subscription.endpoint);
-
-    // 6. Transmit the subscription metadata securely to the server database
-    console.log('[PUSH CLIENT] Synchronizing subscription with SPIP server database...');
-    const { data: authData } = await supabase.auth.getSession();
-    const token = authData.session?.access_token;
-    if (!token) throw new Error('Authenticated SPIP session required for push registration.');
-
-    const response = await fetch('/api/push/subscribe', {
+    await api('/api/push/subscribe', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`
-      },
-      body: JSON.stringify({
-        subscription: subscription.toJSON(),
-        userId
-      })
+      body: JSON.stringify({ subscription: subscription.toJSON() }),
     });
-
-    if (!response.ok) {
-      throw new Error(`Server failed to register subscription: ${response.statusText}`);
-    }
-
-    const resData = await response.json();
-    console.log('[PUSH CLIENT SUCCESS] Browser push registration synchronized successfully with DB:', resData);
-    
-    // Persist subscription flag locally to bypass redundant runs
     localStorage.setItem('SCM_PUSH_SUBSCRIBED_ENDPOINT', subscription.endpoint);
     return true;
-  } catch (err: any) {
-    console.error('[PUSH CLIENT ERROR] Core subscription flow failed:', err.message || err);
+  } catch (error) {
+    console.error('[SPIP PUSH] Registration failed:', error);
     return false;
   }
 }
 
-/**
- * Cleanly unregisters the user's active push subscription
- */
-export async function unsubscribeUser(
-  userId?: string,
-  userEmail?: string,
-  userRole?: string
-): Promise<boolean> {
+export async function unsubscribeUser(): Promise<boolean> {
   if (!isPushSupported()) return false;
-
   try {
     const registration = await navigator.serviceWorker.ready;
     const subscription = await registration.pushManager.getSubscription();
-    
-    if (!subscription) {
-      console.log('[PUSH CLIENT] No active subscription found to unsubscribe.');
-      return true;
-    }
-
-    // 1. Delete subscription from push server database
-    console.log('[PUSH CLIENT] Notifying backend of unsubscribe request...');
-    const { data: authData } = await supabase.auth.getSession();
-    const token = authData.session?.access_token;
-    if (!token) throw new Error('Authenticated SPIP session required for push unsubscribe.');
-
-    await fetch('/api/push/unsubscribe', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`
-      },
-      body: JSON.stringify({ endpoint: subscription.endpoint })
-    });
-
-    // 2. Unsubscribe on the browser PushManager
-    const unsubscribed = await subscription.unsubscribe();
-    console.log('[PUSH CLIENT SUCCESS] Unsubscribed from browser PushManager:', unsubscribed);
+    if (!subscription) return true;
+    await api('/api/push/unsubscribe', { method: 'POST', body: JSON.stringify({ endpoint: subscription.endpoint }) });
+    const ok = await subscription.unsubscribe();
     localStorage.removeItem('SCM_PUSH_SUBSCRIBED_ENDPOINT');
-    return unsubscribed;
-  } catch (err: any) {
-    console.error('[PUSH CLIENT ERROR] Unsubscription flow failed:', err.message || err);
+    return ok;
+  } catch (error) {
+    console.error('[SPIP PUSH] Unsubscribe failed:', error);
     return false;
+  }
+}
+
+export async function getPushStatus() {
+  return api('/api/push/status');
+}
+
+export async function sendTestPush() {
+  return api('/api/push/test', { method: 'POST' });
+}
+
+export async function getNotificationPreferences() {
+  return api('/api/notification-preferences');
+}
+
+export async function saveNotificationPreferences(values: Record<string, any>) {
+  return api('/api/notification-preferences', { method: 'PATCH', body: JSON.stringify(values) });
+}
+
+export async function createCustomReminder(values: {
+  title: string; message?: string; scheduledFor: string; priority?: 'normal'|'high'|'critical';
+  sourceType?: 'follow_up'|'custom'; sourceId?: string; prospectId?: string; prospectName?: string; url?: string;
+}) {
+  return api('/api/reminders/custom', { method: 'POST', body: JSON.stringify(values) });
+}
+
+// Foreground safety net: if the external background scheduler is delayed, an active
+// SPIP tab asks the dispatcher to run only when a local integration explicitly exposes
+// REMINDER_CRON_SECRET. The production background scheduler remains the authority.
+export async function syncServiceWorkerRegistration() {
+  if (!isPushSupported() || Notification.permission !== 'granted') return;
+  try {
+    await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+  } catch {
+    // Non-fatal: settings page exposes a retry path.
   }
 }
