@@ -129,37 +129,37 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess }) => {
 
     setLoading(true);
     try {
-      const { data, error } = await supabase.auth.signUp({
-        email: normalizedEmail,
-        password,
-        options: {
-          data: {
-            full_name: fullName.trim(),
-            department: department.trim() || 'Asset Management',
-            job_title: jobTitle.trim() || null,
-          },
-        },
+      const response = await fetch('/api/auth/register-v2', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: normalizedEmail,
+          password,
+          fullName: fullName.trim(),
+          department: department.trim() || 'Asset Management',
+          jobTitle: jobTitle.trim() || null,
+        }),
       });
-
-      if (error) throw error;
-      if (!data.user?.id) throw new Error('Supabase did not create the staff identity. Please try again.');
-      if (Array.isArray(data.user.identities) && data.user.identities.length === 0) {
-        throw new Error('An SPIP account already exists for this corporate email. Use Sign in or Forgot password.');
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const detail = body?.detail ? ` ${String(body.detail)}` : '';
+        throw new Error(`${body?.error || 'Unable to create the access request.'}${detail}`.trim());
       }
-      if (data.session) await supabase.auth.signOut();
 
+      await supabase.auth.signOut().catch(() => undefined);
       setMode('login');
       setPassword('');
       setConfirmPassword('');
       setFullName('');
       setJobTitle('');
-      setMessage('Access request submitted. An administrator must approve the account before it can be used.');
+      setMessage(body?.message || 'Access request submitted. An administrator must approve the account before it can be used.');
     } catch (error) {
       setErrorMessage(friendlyAuthError(error));
     } finally {
       setLoading(false);
     }
   };
+
   const sendReset = async (event: React.FormEvent) => {
     event.preventDefault();
     clearFeedback();
