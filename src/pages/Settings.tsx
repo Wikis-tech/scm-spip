@@ -1,360 +1,218 @@
-import React, { useState } from 'react';
-import { Settings2, Cpu, ShieldCheck, HelpCircle, Bell, Sparkles, AlertCircle, CheckCircle, Flame } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import {
+  Bell,
+  CheckCircle2,
+  ChevronRight,
+  LockKeyhole,
+  MonitorCog,
+  Settings2,
+  ShieldCheck,
+  UserRound,
+} from 'lucide-react';
 import { UserProfile } from '../types';
-import { registerServiceWorkerAndSubscribe, isPushSupported, getRuntimeEnvironment } from '../services/pushService';
+import { registerServiceWorkerAndSubscribe, isPushSupported } from '../services/pushService';
+import { supabase } from '../lib/supabase';
 
 interface SettingsProps {
   currentUser: UserProfile;
 }
 
-export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
-  const [simulating, setSimulating] = useState<string | null>(null);
-  const [simError, setSimError] = useState<string | null>(null);
-  const [simSuccess, setSimSuccess] = useState<string | null>(null);
+type SectionKey = 'profile' | 'security' | 'notifications' | 'preferences' | 'administration';
 
-  const handleSimulate = async (type: string) => {
-    setSimulating(type);
-    setSimError(null);
-    setSimSuccess(null);
+export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
+  const isAdmin = currentUser.permissionLevel === 'SUPER_ADMIN' || currentUser.permissionLevel === 'HOD_ADMIN';
+  const [activeSection, setActiveSection] = useState<SectionKey>('profile');
+  const [message, setMessage] = useState<string>('');
+  const [busy, setBusy] = useState(false);
+
+  const sections = useMemo(() => {
+    const rows: { key: SectionKey; label: string; description: string; icon: any; admin?: boolean }[] = [
+      { key: 'profile', label: 'Profile', description: 'Your SCM identity and access level', icon: UserRound },
+      { key: 'security', label: 'Password & Security', description: 'Password recovery and session security', icon: LockKeyhole },
+      { key: 'notifications', label: 'Notifications', description: 'Browser and meeting reminder preferences', icon: Bell },
+      { key: 'preferences', label: 'Preferences', description: 'Workspace display and behaviour', icon: Settings2 },
+    ];
+    if (isAdmin) {
+      rows.push({ key: 'administration', label: 'Administration', description: 'Platform access and integration overview', icon: ShieldCheck, admin: true });
+    }
+    return rows;
+  }, [isAdmin]);
+
+  const sendPasswordReset = async () => {
+    setBusy(true);
+    setMessage('');
     try {
-      const res = await fetch('/api/notifications/simulate', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ type, userId: currentUser.id })
+      const { error } = await supabase.auth.resetPasswordForEmail(currentUser.email, {
+        redirectTo: window.location.origin,
       });
-      const data = await res.json();
-      if (res.ok) {
-        setSimSuccess(`Simulated alert of type "${type}". Check the bell dropdown!`);
-        // Automatically fade success message
-        setTimeout(() => setSimSuccess(null), 5000);
-      } else {
-        setSimError(data.error || 'Failed to trigger.');
-      }
-    } catch (err: any) {
-      setSimError(err.message || 'Simulation network error.');
+      if (error) throw error;
+      setMessage('A secure password reset link has been sent to your SCM corporate email.');
+    } catch (error: any) {
+      setMessage(error?.message || 'Unable to send the password reset email right now.');
     } finally {
-      setSimulating(null);
+      setBusy(false);
     }
   };
 
-  const highPriorityEvents = [
-    { type: 'Meeting reminder', category: 'Meeting', label: 'Meeting Reminder' },
-    { type: 'Meeting rescheduled', category: 'Meeting', label: 'Meeting Rescheduled' },
-    { type: 'New task assigned', category: 'Task', label: 'New Task Assigned' },
-    { type: 'Task overdue', category: 'Task', label: 'Task Overdue' },
-    { type: 'New prospect assigned to user', category: 'Assignment', label: 'New Prospect Assigned' },
-    { type: 'User approval request', category: 'Approval', label: 'User Approval Request' },
-    { type: 'User approved', category: 'Approval', label: 'User Approved' },
-    { type: 'User rejected', category: 'Approval', label: 'User Rejected' },
-  ];
-
-  const mediumPriorityEvents = [
-    { type: 'Deal moved stage', category: 'Opportunity', label: 'Deal Moved Stage' },
-    { type: 'Proposal approved', category: 'Opportunity', label: 'Proposal Approved' },
-    { type: 'Proposal rejected', category: 'Opportunity', label: 'Proposal Rejected' },
-  ];
-
-  const isSuperAdmin = currentUser.email === 'wisdom.okoh@scmcapitalng.com' || 
-                       currentUser.email === 'omololu.ajediran@scmcapitalng.com';
-  const isAdminUser = isSuperAdmin || 
-                      currentUser.role === 'Admin' || 
-                      currentUser.role === 'SUPER_ADMIN' ||
-                      currentUser.role === 'Administrator';
+  const enableNotifications = async () => {
+    setBusy(true);
+    setMessage('');
+    try {
+      if (!isPushSupported()) {
+        setMessage('Push notifications are not supported in this browser.');
+        return;
+      }
+      const success = await registerServiceWorkerAndSubscribe(currentUser.id, currentUser.email, currentUser.role);
+      setMessage(success ? 'Notifications are enabled for this device.' : 'Notification setup was not completed. Check your browser permission and try again.');
+    } catch (error: any) {
+      setMessage(error?.message || 'Unable to enable notifications right now.');
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
-    <div className="space-y-6 font-sans text-xs text-slate-650">
-      
-      {/* SCM parameters block */}
-      <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm space-y-4">
-        <div className="pb-2 border-b border-slate-100 flex items-center gap-1.5">
-          <Settings2 className="w-4 h-4 text-slate-500" />
-          <h3 className="font-display font-semibold text-sm text-brand-neutral">
-            SCM Prospect Intelligence Configurations
-          </h3>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 leading-relaxed">
-          {/* Section 1: Session profile info */}
-          <div className="space-y-3.5 border border-slate-100 p-4 rounded-xl bg-slate-50">
-            <h4 className="font-display font-bold text-slate-800 text-xs flex items-center gap-1.5">
-              <ShieldCheck className="w-4 h-4 text-emerald-500 font-bold" />
-              <span>Active Staff Node Metadata</span>
-            </h4>
-            
-            <div className="space-y-2">
-              <div>
-                <span className="text-slate-400 block font-bold text-[10px] uppercase">Officer Name</span>
-                <span className="text-brand-neutral font-semibold text-xs">{currentUser.fullName}</span>
-              </div>
-              <div>
-                <span className="text-slate-400 block font-bold text-[10px] uppercase">Corporate E-Mail</span>
-                <span className="text-brand-neutral font-mono">{currentUser.email}</span>
-              </div>
-              <div className="grid grid-cols-2 gap-2 pt-2 border-t border-slate-200/60">
-                <div>
-                  <span className="text-slate-400 block font-bold text-[10px] uppercase">Assigned Role</span>
-                  <span className="text-emerald-700 font-bold">{currentUser.role}</span>
-                 </div>
-                <div>
-                  <span className="text-slate-400 block font-bold text-[10px] uppercase">Assigned Department</span>
-                  <span className="text-brand-neutral font-semibold">{currentUser.department || 'Wealth Management'}</span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Section 2: Technical engine specifications */}
-          <div className="space-y-3.5 border border-slate-100 p-4 rounded-xl bg-slate-50">
-            <h4 className="font-display font-bold text-slate-800 text-xs flex items-center gap-1.5">
-              <Cpu className="w-4 h-4 text-[#b1191f]" />
-              <span>Deep AI Engine Integration</span>
-            </h4>
-
-            <div className="space-y-2 text-slate-500 leading-normal">
-              <p>
-                The platform utilizes the server-side **Gemini 3.5 Flash Model** representation to research corporate target profiles, Treasury potential values, and decision structures of blue-chip Nigerian enterprises.
-              </p>
-              <p>
-                API Key placement is securely curated through server environment variables proxy. Under current configurations, queries fall back on high-yield, seeded Nigerian conglomerates if the API Key is unassigned.
-              </p>
-              <div className="bg-emerald-50 border border-emerald-200/80 rounded p-2 text-emerald-800 flex items-center gap-1.5 text-[11px] font-semibold">
-                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                <span>Active Server State: Port 3000 Ingress Operational</span>
-              </div>
-            </div>
-          </div>
-        </div>
+    <div className="space-y-6">
+      <div>
+        <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[#b1191f]">Workspace settings</p>
+        <h1 className="mt-1 text-2xl font-bold tracking-tight text-slate-950">Settings</h1>
+        <p className="mt-1 max-w-2xl text-sm text-slate-500">Manage your account, security and device preferences without exposing technical system secrets.</p>
       </div>
 
-      {/* SCM Web Notification Permissions Panel */}
-      <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm space-y-4">
-        <div className="pb-2 border-b border-slate-100 flex items-center justify-between">
-          <div className="flex items-center gap-1.5">
-            <Bell className="w-4 h-4 text-[#b1191f]" />
-            <h3 className="font-display font-semibold text-sm text-brand-neutral">
-              SCM Real-Time Browser Reminders Desk
-            </h3>
-          </div>
-          <span className="bg-[#b1191f]/10 text-[#b1191f] text-[9px] font-extrabold uppercase px-2 py-0.5 rounded border border-[#b1191f]/20">
-            CLIENT SIDE
-          </span>
+      {message && (
+        <div className="flex items-start gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+          <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>{message}</span>
         </div>
-
-        <p className="text-[11px] text-slate-500 leading-relaxed max-w-2xl">
-          Configure prompt timings (24 Hours, 1 Hour, 10 Minutes, and start time) and verify compliance. All configurations are stored securely within your active browser session container.
-        </p>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div className="p-4 border border-slate-100 rounded-xl bg-slate-50 flex flex-col justify-between">
-            {typeof window !== 'undefined' && getRuntimeEnvironment() === 'android-app' ? (
-              <div className="space-y-1">
-                <span className="text-[9px] font-bold uppercase text-slate-400 block">System Connection Status</span>
-                <div className="space-y-1 bg-white p-2 rounded-lg border border-slate-100 mt-1">
-                  <span className="font-semibold text-slate-750 text-xs flex justify-between">
-                    <span className="text-slate-500 text-[10px]">OneSignal SDK:</span> <strong className="text-emerald-700">Connected</strong>
-                  </span>
-                  <span className="font-semibold text-slate-750 text-xs flex justify-between">
-                    <span className="text-slate-500 text-[10px]">Firebase:</span> <strong className="text-emerald-700">Connected</strong>
-                  </span>
-                  <span className="font-semibold text-slate-750 text-xs flex justify-between">
-                    <span className="text-slate-500 text-[10px]">Native Push Registration:</span> <strong className="text-emerald-700">Registered</strong>
-                  </span>
-                  <span className="font-semibold text-slate-750 text-xs flex justify-between">
-                    <span className="text-slate-500 text-[10px]">Android Notification Permission:</span> <strong className="text-emerald-700">Granted</strong>
-                  </span>
-                  <span className="font-semibold text-slate-750 text-xs flex justify-between">
-                    <span className="text-slate-500 text-[10px]">Device Registration:</span> <strong className="text-emerald-700">Active</strong>
-                  </span>
-                  <span className="font-semibold text-slate-750 text-xs flex justify-between">
-                    <span className="text-slate-500 text-[10px]">OneSignal Subscription:</span> <strong className="text-emerald-700">Active</strong>
-                  </span>
-                </div>
-              </div>
-            ) : (
-              <div className="space-y-1">
-                <span className="text-[9px] font-bold uppercase text-slate-400 block">System Connection Status</span>
-                <span className="font-semibold text-slate-750 text-xs block">
-                  Notification API: <strong className="text-brand-neutral">{'Notification' in window ? 'Supported' : 'Unavailable'}</strong>
-                </span>
-                <span className="font-semibold text-slate-705 text-xs block">
-                  Active Permission: <strong className="text-rose-700 font-extrabold uppercase">{typeof window !== 'undefined' && 'Notification' in window ? Notification.permission : 'Denied'}</strong>
-                </span>
-                <span className="font-semibold text-slate-705 text-xs block">
-                  Push Subscription: <strong className="text-emerald-700 font-extrabold uppercase">
-                    {typeof window !== 'undefined' && isPushSupported() && localStorage.getItem('SCM_PUSH_SUBSCRIBED_ENDPOINT') ? 'Active & Registered' : 'Not Registered'}
-                  </strong>
-                </span>
-              </div>
-            )}
-            {typeof window !== 'undefined' && getRuntimeEnvironment() === 'android-app' ? (
-              <div className="mt-3">
-                <span className="text-[10px] text-emerald-700 font-extrabold bg-emerald-50 border border-emerald-200 px-2.5 py-1.5 rounded-lg block text-center uppercase tracking-wider">
-                  Android Web-to-Native Active
-                </span>
-              </div>
-            ) : typeof window !== 'undefined' && isPushSupported() ? (
-              <div className="mt-3 flex flex-wrap gap-2">
-                <button
-                  onClick={async () => {
-                    const success = await registerServiceWorkerAndSubscribe(currentUser.id, currentUser.email, currentUser.role);
-                    if (success) {
-                      alert('Success: Web Push subscription established and synchronized with the SCM database.');
-                    } else {
-                      alert('Push Subscription failed. Please ensure you allow notifications when prompted.');
-                    }
-                    window.location.reload();
-                  }}
-                  className="px-3 py-1.5 bg-[#b1191f] hover:bg-red-700 text-white text-[10px] font-extrabold uppercase tracking-wider rounded-lg transition-colors cursor-pointer"
-                >
-                  {typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted' ? 'Force Re-subscribe Push' : 'Enable Push Notifications'}
-                </button>
-              </div>
-            ) : (
-              typeof window !== 'undefined' && 'Notification' in window && Notification.permission !== 'granted' && (
-                <button
-                  onClick={async () => {
-                    await Notification.requestPermission();
-                    window.location.reload();
-                  }}
-                  className="mt-3 w-fit px-3 py-1.5 bg-[#b1191f] hover:bg-red-700 text-white text-[10px] font-extrabold uppercase tracking-wider rounded-lg transition-colors cursor-pointer"
-                >
-                  Request Permission Now
-                </button>
-              )
-            )}
-          </div>
-
-          <div className="p-4 border border-slate-100 rounded-xl bg-slate-50 flex flex-col justify-between space-y-2">
-            <div>
-              <span className="text-[9px] font-bold uppercase text-slate-400 block font-sans">Verification & Test Suite</span>
-              <p className="text-[10px] text-slate-500 leading-relaxed mt-1">
-                To test the exact reminder triggers again (24h, 1h, 10m, and start), wipe local trigger traces below. This permits duplicates for re-testing.
-              </p>
-            </div>
-            <button
-              onClick={() => {
-                localStorage.removeItem('SCM_FIRED_REMINDERS');
-                alert('Success: Local reminder timeline triggers cleared. You may test existing meeting reminders again!');
-              }}
-              className="w-fit px-3 py-1.5 border border-[#b1191f] hover:bg-red-50 text-[#b1191f] text-[10px] font-extrabold uppercase tracking-wider rounded-lg transition-colors cursor-pointer"
-            >
-              Clear Reminder Fire History
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* SCM Enterprise Alert Simulation Deck */}
-      {isAdminUser && (
-        <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm space-y-4">
-        <div className="pb-2 border-b border-slate-100 flex items-center justify-between">
-          <div className="flex items-center gap-1.5">
-            <Bell className="w-4 h-4 text-[#b1191f]" />
-            <h3 className="font-display font-semibold text-sm text-brand-neutral">
-              SCM Enterprise-Grade Alert Simulation Deck
-            </h3>
-          </div>
-          <span className="bg-red-50 text-[#b1191f] text-[9px] font-extrabold uppercase px-2 py-0.5 rounded border border-red-100">
-            Audit Ready
-          </span>
-        </div>
-
-        <p className="text-[11px] text-slate-500 leading-relaxed max-w-2xl">
-          Trigger and dispatch real-time events to test the newly refactored logical filters of the alert system. By layout requirements, unread high/medium alerts will appear at the top of the notification bell, and can be marked read to transition them into archival history. Unapproved system notifications are fully locked out.
-        </p>
-
-        {/* Feedback states */}
-        {simSuccess && (
-          <div className="p-2.5 bg-emerald-50 text-emerald-800 border border-emerald-200 rounded-lg flex items-center gap-2 font-medium">
-            <CheckCircle className="w-4 h-4 text-emerald-600 shrink-0" />
-            <span>{simSuccess}</span>
-          </div>
-        )}
-        {simError && (
-          <div className="p-2.5 bg-red-50 text-[#b1191f] border border-red-200 rounded-lg flex items-center gap-2 font-medium">
-            <AlertCircle className="w-4 h-4 text-[#b1191f] shrink-0" />
-            <span>{simError}</span>
-          </div>
-        )}
-
-        {/* Grid of actions */}
-        <div className="space-y-4">
-          <div>
-            <h4 className="font-bold text-slate-800 uppercase tracking-wide text-[9px] mb-2 flex items-center gap-1">
-              <Flame className="w-3.5 h-3.5 text-rose-500" />
-              <span>High Priority Bulletins (Strict Business critical Gates)</span>
-            </h4>
-            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2.5">
-              {highPriorityEvents.map(evt => (
-                <button
-                  key={evt.type}
-                  disabled={simulating !== null}
-                  onClick={() => handleSimulate(evt.type)}
-                  className="p-3 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl text-left hover:border-[#b1191f] hover:shadow-sm transition-all focus:outline-none focus:ring-1 focus:ring-[#b1191f] cursor-pointer disabled:opacity-50"
-                  title={`Simulate event trigger: "${evt.type}"`}
-                >
-                  <div className="flex justify-between items-start mb-1 text-[8.5px] uppercase font-bold text-slate-400">
-                    <span>{evt.category}</span>
-                    <span className="text-red-650">HIGH</span>
-                  </div>
-                  <span className="font-semibold text-slate-800 leading-tight block text-[10.5px]">
-                    {evt.label}
-                  </span>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div>
-            <h4 className="font-bold text-slate-800 uppercase tracking-wide text-[9px] mb-2 flex items-center gap-1">
-              <Sparkles className="w-3.5 h-3.5 text-amber-500" />
-              <span>Medium Priority Bulletins (Pipeline Opportunities)</span>
-            </h4>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-              {mediumPriorityEvents.map(evt => (
-                <button
-                  key={evt.type}
-                  disabled={simulating !== null}
-                  onClick={() => handleSimulate(evt.type)}
-                  className="p-3 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl text-left hover:border-[#b1191f] hover:shadow-sm transition-all focus:outline-none focus:ring-1 focus:ring-[#b1191f] cursor-pointer disabled:opacity-50"
-                  title={`Simulate event trigger: "${evt.type}"`}
-                >
-                  <div className="flex justify-between items-start mb-1 text-[8.5px] uppercase font-bold text-slate-400">
-                    <span>{evt.category}</span>
-                    <span className="text-amber-650 font-bold">MEDIUM</span>
-                  </div>
-                  <span className="font-semibold text-slate-800 leading-tight block text-[10.5px]">
-                    {evt.label}
-                  </span>
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
       )}
 
-      {/* Guide notes */}
-      <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm space-y-3">
-        <h4 className="font-display font-medium text-xs text-brand-neutral flex items-center gap-1">
-          <HelpCircle className="w-4 h-4 text-slate-400" />
-          <span>SCM B2B Sales Playbook Guideline</span>
-        </h4>
-        <div className="space-y-2 leading-relaxed text-slate-500">
-          <p>
-            1. **Outreach & Onboarding**: Log custom organizations in the *Prospect Directory*, compile their intelligence reports, and schedule the initial pitch meetings.
-          </p>
-          <p>
-            2. **Bespoke Financial Literacy Seminar**: Schedule a "Financial Literacy Session" on-site or virtual to engage employees and outline the high risk-adjusted yields of SCM Money Market Mutual Funds.
-          </p>
-          <p>
-            3. **Conversion Progression**: Transition the prospect through *Proposal Sent* and *Negotiation* to *Converted* to anchor their institutional AUM under SCM Wealth Management.
-          </p>
-        </div>
-      </div>
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[280px,minmax(0,1fr)]">
+        <aside className="h-fit rounded-2xl border border-slate-200 bg-white p-2 shadow-sm">
+          {sections.map((section) => {
+            const Icon = section.icon;
+            const active = activeSection === section.key;
+            return (
+              <button
+                key={section.key}
+                onClick={() => {
+                  setActiveSection(section.key);
+                  setMessage('');
+                }}
+                className={`flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left transition ${active ? 'bg-slate-950 text-white' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-950'}`}
+              >
+                <span className={`rounded-lg p-2 ${active ? 'bg-white/10' : 'bg-slate-100'}`}><Icon className="h-4 w-4" /></span>
+                <span className="min-w-0 flex-1">
+                  <span className="block text-sm font-semibold">{section.label}</span>
+                  <span className={`mt-0.5 block text-[11px] ${active ? 'text-slate-300' : 'text-slate-400'}`}>{section.description}</span>
+                </span>
+                <ChevronRight className="h-4 w-4 opacity-60" />
+              </button>
+            );
+          })}
+        </aside>
 
+        <section className="min-h-[420px] rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+          {activeSection === 'profile' && (
+            <div className="space-y-6">
+              <div>
+                <h2 className="text-lg font-bold text-slate-950">Profile</h2>
+                <p className="mt-1 text-sm text-slate-500">Your identity is managed through SCM Capital's approved SPIP directory.</p>
+              </div>
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <InfoCard label="Full name" value={currentUser.fullName} />
+                <InfoCard label="Corporate email" value={currentUser.email} />
+                <InfoCard label="Department" value={currentUser.department || 'Asset Management'} />
+                <InfoCard label="Access level" value={currentUser.permissionLevel === 'SUPER_ADMIN' ? 'Super Admin' : currentUser.permissionLevel === 'HOD_ADMIN' ? 'HOD Admin' : 'Staff'} />
+              </div>
+            </div>
+          )}
+
+          {activeSection === 'security' && (
+            <div className="space-y-6">
+              <div>
+                <h2 className="text-lg font-bold text-slate-950">Password & Security</h2>
+                <p className="mt-1 text-sm text-slate-500">Authentication is handled by Supabase Auth. SPIP never stores your password in the CRM database.</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                <div className="flex items-start gap-3">
+                  <LockKeyhole className="mt-0.5 h-5 w-5 text-[#b1191f]" />
+                  <div className="flex-1">
+                    <div className="font-semibold text-slate-900">Reset password</div>
+                    <p className="mt-1 text-sm text-slate-500">Send a secure recovery link to {currentUser.email}.</p>
+                    <button disabled={busy} onClick={sendPasswordReset} className="mt-4 rounded-lg bg-slate-950 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:opacity-50">Send reset link</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeSection === 'notifications' && (
+            <div className="space-y-6">
+              <div>
+                <h2 className="text-lg font-bold text-slate-950">Notifications</h2>
+                <p className="mt-1 text-sm text-slate-500">Enable browser notifications for meeting, task and follow-up reminders on this device.</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 p-4">
+                <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <div className="font-semibold text-slate-900">Browser notifications</div>
+                    <p className="mt-1 text-sm text-slate-500">Current permission: <span className="font-medium text-slate-700">{typeof window !== 'undefined' && 'Notification' in window ? Notification.permission : 'unsupported'}</span></p>
+                  </div>
+                  <button disabled={busy} onClick={enableNotifications} className="rounded-lg bg-[#b1191f] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[#94151a] disabled:opacity-50">Enable notifications</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeSection === 'preferences' && (
+            <div className="space-y-6">
+              <div>
+                <h2 className="text-lg font-bold text-slate-950">Workspace Preferences</h2>
+                <p className="mt-1 text-sm text-slate-500">SPIP uses a compact, responsive workspace designed for desktop and mobile use.</p>
+              </div>
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <InfoCard label="Interface" value="SCM Corporate" />
+                <InfoCard label="Default workspace" value="Asset Management" />
+                <InfoCard label="Currency" value="Nigerian Naira (₦)" />
+                <InfoCard label="Time zone" value="West Africa Time" />
+              </div>
+            </div>
+          )}
+
+          {activeSection === 'administration' && isAdmin && (
+            <div className="space-y-6">
+              <div>
+                <h2 className="text-lg font-bold text-slate-950">Administration</h2>
+                <p className="mt-1 text-sm text-slate-500">High-level platform configuration. Secret values remain server-side in Vercel and are never displayed here.</p>
+              </div>
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <StatusCard title="Authentication" detail="Supabase Auth" />
+                <StatusCard title="Database" detail="Supabase PostgreSQL" />
+                <StatusCard title="Prospect intelligence" detail="Apollo API" />
+                <StatusCard title="Hosting" detail="Vercel" />
+              </div>
+              <div className="flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+                <MonitorCog className="mt-0.5 h-5 w-5 shrink-0" />
+                <span>Integration secrets and system-level changes should be managed only from the secured deployment environment and Super Admin workflow.</span>
+              </div>
+            </div>
+          )}
+        </section>
+      </div>
     </div>
   );
 };
+
+const InfoCard = ({ label, value }: { label: string; value: string }) => (
+  <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+    <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">{label}</div>
+    <div className="mt-2 break-words text-sm font-semibold text-slate-900">{value}</div>
+  </div>
+);
+
+const StatusCard = ({ title, detail }: { title: string; detail: string }) => (
+  <div className="rounded-xl border border-slate-200 p-4">
+    <div className="flex items-center gap-2 text-sm font-semibold text-slate-900"><ShieldCheck className="h-4 w-4 text-emerald-600" />{title}</div>
+    <div className="mt-2 text-sm text-slate-500">{detail}</div>
+  </div>
+);
