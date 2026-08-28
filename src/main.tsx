@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import App from './App.tsx';
 import './index.css';
 import { supabase } from './lib/supabase';
-import { syncServiceWorkerRegistration } from './services/pushService';
+import { syncServiceWorkerRegistration, startForegroundReminderHeartbeat } from './services/pushService';
 
 const nativeFetch = window.fetch.bind(window);
 
@@ -24,8 +24,8 @@ window.fetch = async (input: RequestInfo | URL, init: RequestInit = {}) => {
   return response;
 };
 
-// Keep an already-approved notification device attached to the latest service worker.
 syncServiceWorkerRegistration();
+startForegroundReminderHeartbeat();
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode><App /></StrictMode>,
