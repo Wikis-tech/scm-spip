@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module';
-import { handlePhase4 } from './phase4';
+import { handlePhase4 } from '../src/server/phase4Api';
 
 const require = createRequire(import.meta.url);
 const serverModule = require('../dist/server.cjs');
@@ -9,8 +9,6 @@ export default async function handler(req: any, res: any) {
   const rawPath = req.query?.path;
   const path = Array.isArray(rawPath) ? rawPath.join('/') : String(rawPath || '').replace(/^\/+/, '');
 
-  // Phase 4 runs directly on the Supabase data plane. This intentionally bypasses
-  // the legacy PostgreSQL health gate in server.ts, while still enforcing Supabase Auth.
   if (
     path.startsWith('push/') ||
     path === 'reminders' ||
@@ -21,18 +19,13 @@ export default async function handler(req: any, res: any) {
     if (handled) return;
   }
 
-  if (req.query && Object.prototype.hasOwnProperty.call(req.query, 'path')) {
-    delete req.query.path;
-  }
+  if (req.query && Object.prototype.hasOwnProperty.call(req.query, 'path')) delete req.query.path;
 
   const query = new URLSearchParams();
   if (req.query) {
     for (const [key, value] of Object.entries(req.query)) {
-      if (Array.isArray(value)) {
-        for (const item of value) query.append(key, String(item));
-      } else if (value !== undefined && value !== null) {
-        query.set(key, String(value));
-      }
+      if (Array.isArray(value)) for (const item of value) query.append(key, String(item));
+      else if (value !== undefined && value !== null) query.set(key, String(value));
     }
   }
 
