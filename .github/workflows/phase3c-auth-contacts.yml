@@ -44,5 +44,6 @@ jobs:
             echo "No Phase 3C application changes to commit"
           else
             git commit -m "fix: stabilize signup and Apollo contacts [phase3c-applied]"
+            git pull --rebase origin main
             git push origin HEAD:main
           fi
