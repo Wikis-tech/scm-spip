@@ -19,8 +19,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Apply final server routing fix
-        run: node scripts/phase3-final-server-fix.mjs
+      - name: Apply final runtime compatibility fixes
+        run: |
+          node scripts/phase3-final-server-fix.mjs
+          node scripts/phase3-final-types-fix.mjs
       - name: Prepare dependency graph
         run: npm install --package-lock-only --ignore-scripts
       - name: Dependency audit
@@ -49,7 +51,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add server.ts scripts .github/workflows/phase3-final-stabilization.yml
+          git add server.ts src/pages/ManagementReports.tsx scripts .github/workflows/phase3-final-stabilization.yml
           if git diff --cached --quiet; then
             echo "No generated changes to commit"
           else
