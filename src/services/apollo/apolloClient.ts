@@ -35,20 +35,18 @@ export interface ApolloClientTelemetry {
 
 export class ApolloClient {
   private static instance: ApolloClient | null = null;
-
-  private apiKey: string = "";
-  private baseUrl: string = "https://api.apollo.io/api/v1";
-  private timeoutMs: number = 15000;
-  private maxRetries: number = 3;
-  private retryDelayMs: number = 1000;
-  private dailyLimit: number = 5000;
-
-  private requestsTodayCount: number = 0;
-  private lastResetDay: string = "";
+  private apiKey = '';
+  private baseUrl = 'https://api.apollo.io/api/v1';
+  private timeoutMs = 12000;
+  private maxRetries = 2;
+  private retryDelayMs = 750;
+  private dailyLimit = 5000;
+  private requestsTodayCount = 0;
+  private lastResetDay = '';
 
   private telemetry: ApolloClientTelemetry = {
     apiKeyLoaded: false,
-    apiKeySource: "None",
+    apiKeySource: 'None',
     apiKeyLength: 0,
     requestsCountToday: 0,
     dailyLimit: 5000,
@@ -65,50 +63,30 @@ export class ApolloClient {
   }
 
   public static getInstance(config?: ApolloClientConfig): ApolloClient {
-    if (!ApolloClient.instance) {
-      ApolloClient.instance = new ApolloClient(config);
-    } else if (config) {
-      ApolloClient.instance.configure(config);
-    }
+    if (!ApolloClient.instance) ApolloClient.instance = new ApolloClient(config);
+    else if (config) ApolloClient.instance.configure(config);
     return ApolloClient.instance;
   }
 
   public configure(config?: ApolloClientConfig): void {
-    // 1. Resolve API Key from config or environment
-    let keySource = "None";
-    let key = config?.apiKey || process.env.APOLLO_API_KEY || "";
-    if (config?.apiKey) {
-      keySource = "explicit_config";
-    } else if (process.env.APOLLO_API_KEY) {
-      keySource = "process.env.APOLLO_API_KEY";
-    } else if (process.env.VITE_APOLLO_API_KEY) {
-      key = process.env.VITE_APOLLO_API_KEY;
-      keySource = "process.env.VITE_APOLLO_API_KEY";
-    } else {
-      key = "KpuBuIUPuGIKOatjdoiVeA"; // Default fallback key
-      keySource = "default_fallback";
-    }
+    let keySource = 'None';
+    let key = config?.apiKey || process.env.APOLLO_API_KEY || '';
+    if (config?.apiKey) keySource = 'explicit_config';
+    else if (process.env.APOLLO_API_KEY) keySource = 'process.env.APOLLO_API_KEY';
 
-    if (key) {
-      key = key.trim();
-      if ((key.startsWith("[") && key.endsWith("]")) || (key.startsWith("{") && key.endsWith("}"))) {
-        key = key.substring(1, key.length - 1).trim();
-      }
-      if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
-        key = key.substring(1, key.length - 1).trim();
-      }
+    key = key.trim();
+    if ((key.startsWith('[') && key.endsWith(']')) || (key.startsWith('{') && key.endsWith('}'))) {
+      key = key.slice(1, -1).trim();
+    }
+    if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
+      key = key.slice(1, -1).trim();
     }
 
     this.apiKey = key;
-
-    // 2. Resolve Base URL
-    const rawBaseUrl = config?.baseUrl || process.env.APOLLO_BASE_URL || "https://api.apollo.io/api/v1";
-    this.baseUrl = rawBaseUrl.replace(/\/+$/, "");
-
-    // 3. Resolve Timeouts and Limits
-    this.timeoutMs = config?.timeoutMs || Number(process.env.APOLLO_TIMEOUT) || 15000;
-    this.maxRetries = config?.maxRetries || Number(process.env.APOLLO_MAX_RETRIES) || 3;
-    this.retryDelayMs = config?.retryDelayMs || Number(process.env.APOLLO_RETRY_DELAY) || 1000;
+    this.baseUrl = (config?.baseUrl || process.env.APOLLO_BASE_URL || 'https://api.apollo.io/api/v1').replace(/\/+$/, '');
+    this.timeoutMs = config?.timeoutMs || Number(process.env.APOLLO_TIMEOUT) || 12000;
+    this.maxRetries = config?.maxRetries ?? Number(process.env.APOLLO_MAX_RETRIES) || 2;
+    this.retryDelayMs = config?.retryDelayMs || Number(process.env.APOLLO_RETRY_DELAY) || 750;
     this.dailyLimit = config?.dailyLimit || Number(process.env.APOLLO_DAILY_LIMIT) || 5000;
 
     this.telemetry.apiKeyLoaded = Boolean(this.apiKey);
@@ -126,190 +104,107 @@ export class ApolloClient {
   }
 
   private checkDailyRateLimit(): void {
-    const today = new Date().toISOString().split("T")[0];
+    const today = new Date().toISOString().slice(0, 10);
     if (this.lastResetDay !== today) {
       this.lastResetDay = today;
       this.requestsTodayCount = 0;
     }
-
     if (this.requestsTodayCount >= this.dailyLimit) {
-      throw new Error(`Apollo Client daily request limit (${this.dailyLimit}) reached for today (${today}). Request throttled.`);
+      throw new Error(`Apollo daily request limit (${this.dailyLimit}) reached.`);
     }
-
-    this.requestsTodayCount++;
+    this.requestsTodayCount += 1;
     this.telemetry.requestsCountToday = this.requestsTodayCount;
   }
 
-  /**
-   * Executes a safe, enterprise HTTP request against Apollo REST API endpoints
-   * @param endpoint Endpoint path (e.g. "/organizations/search" or "https://api.apollo.io/api/v1/...")
-   * @param method HTTP Method ("GET" | "POST")
-   * @param body Request payload or query parameters
-   */
-  public async request<T = any>(
-    endpoint: string,
-    method: "GET" | "POST" = "POST",
-    body?: any
-  ): Promise<ApolloResponse<T>> {
+  public async request<T = any>(endpoint: string, method: 'GET' | 'POST' = 'POST', body?: any): Promise<ApolloResponse<T>> {
     const start = Date.now();
 
-    // Enforce daily rate limits
+    if (!this.apiKey) {
+      const error = 'Apollo API key is not configured.';
+      this.telemetry.lastError = error;
+      return { ok: false, status: 503, data: null, statusText: 'Apollo Not Configured', error, latencyMs: 0 };
+    }
+
     try {
       this.checkDailyRateLimit();
     } catch (limitErr: any) {
-      return {
-        ok: false,
-        status: 429,
-        data: null,
-        statusText: "Rate Limit Exceeded",
-        error: limitErr.message,
-        latencyMs: Date.now() - start,
-      };
+      return { ok: false, status: 429, data: null, statusText: 'Rate Limit Exceeded', error: limitErr.message, latencyMs: Date.now() - start };
     }
 
-    // Format full target URL
-    let fullUrl = endpoint.startsWith("http://") || endpoint.startsWith("https://")
+    let fullUrl = endpoint.startsWith('http://') || endpoint.startsWith('https://')
       ? endpoint
-      : `${this.baseUrl}${endpoint.startsWith("/") ? "" : "/"}${endpoint}`;
+      : `${this.baseUrl}${endpoint.startsWith('/') ? '' : '/'}${endpoint}`;
 
     const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      "Cache-Control": "no-cache",
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-cache',
+      'X-Api-Key': this.apiKey,
     };
 
-    if (this.apiKey) {
-      headers["X-Api-Key"] = this.apiKey;
-    }
+    const fetchOptions: RequestInit = { method, headers };
+    let payloadPreview = '';
 
-    let fetchOptions: RequestInit = {
-      method,
-      headers,
-    };
-
-    let queryOrBodyPreview = "";
-
-    if (method === "GET") {
+    if (method === 'GET') {
       const params = new URLSearchParams();
-      if (body) {
-        Object.keys(body).forEach((k) => {
-          if (body[k] !== undefined && body[k] !== null) {
-            params.append(k, String(body[k]));
-          }
-        });
-      }
-      const queryStr = params.toString();
-      if (queryStr) {
-        fullUrl = `${fullUrl}?${queryStr}`;
-      }
-      queryOrBodyPreview = queryStr;
+      Object.entries(body || {}).forEach(([key, value]) => {
+        if (value === undefined || value === null) return;
+        if (Array.isArray(value)) value.forEach((entry) => params.append(key, String(entry)));
+        else params.append(key, String(value));
+      });
+      const query = params.toString();
+      if (query) fullUrl = `${fullUrl}?${query}`;
+      payloadPreview = query;
     } else {
-      queryOrBodyPreview = JSON.stringify(body || {});
-      fetchOptions.body = queryOrBodyPreview;
+      payloadPreview = JSON.stringify(body || {});
+      fetchOptions.body = payloadPreview;
     }
 
     this.telemetry.lastEndpointCalled = `${method} ${fullUrl}`;
-    this.telemetry.lastPayloadPreview = queryOrBodyPreview.substring(0, 500);
+    this.telemetry.lastPayloadPreview = payloadPreview.slice(0, 500);
 
-    let attempt = 0;
-    let lastErrorMsg = "";
-
-    while (attempt <= this.maxRetries) {
-      attempt++;
+    let lastError = '';
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
-
       try {
-        const response = await fetch(fullUrl, {
-          ...fetchOptions,
-          signal: controller.signal,
-        });
-
+        const response = await fetch(fullUrl, { ...fetchOptions, signal: controller.signal });
         clearTimeout(timeoutId);
-
         const latencyMs = Date.now() - start;
-        this.telemetry.lastResponseTimeMs = latencyMs;
-        this.telemetry.lastResponseStatus = response.status;
-
         const text = await response.text();
-        this.telemetry.lastResponseBodyPreview = text.substring(0, 500);
-
         let parsedData: T | null = null;
-        try {
-          parsedData = JSON.parse(text);
-        } catch {
-          // Response body is not JSON
-        }
+        try { parsedData = text ? JSON.parse(text) : null; } catch { parsedData = null; }
+
+        this.telemetry.lastResponseStatus = response.status;
+        this.telemetry.lastResponseTimeMs = latencyMs;
+        this.telemetry.lastResponseBodyPreview = text.slice(0, 500);
 
         if (response.ok) {
           this.telemetry.lastError = null;
-          return {
-            ok: true,
-            status: response.status,
-            data: parsedData,
-            statusText: response.statusText,
-            latencyMs,
-          };
+          return { ok: true, status: response.status, data: parsedData, statusText: response.statusText, latencyMs };
         }
 
-        // Retryable HTTP status codes
-        const isRetryableStatus = [429, 500, 502, 503, 504].includes(response.status);
-        lastErrorMsg = `HTTP ${response.status} (${response.statusText}): ${text.substring(0, 200)}`;
-        this.telemetry.lastError = lastErrorMsg;
-
-        if (isRetryableStatus && attempt <= this.maxRetries) {
-          const delay = this.retryDelayMs * Math.pow(2, attempt - 1) + Math.random() * 200;
-          console.warn(`[APOLLO CLIENT] Request failed with status ${response.status}. Retrying attempt ${attempt}/${this.maxRetries} after ${Math.round(delay)}ms...`);
-          await new Promise((res) => setTimeout(res, delay));
-          continue;
+        lastError = `Apollo returned HTTP ${response.status}.`;
+        this.telemetry.lastError = lastError;
+        const retryable = [429, 500, 502, 503, 504].includes(response.status);
+        if (!retryable || attempt === this.maxRetries) {
+          return { ok: false, status: response.status, data: parsedData, statusText: response.statusText, error: lastError, latencyMs };
         }
-
-        return {
-          ok: false,
-          status: response.status,
-          data: parsedData,
-          statusText: response.statusText,
-          error: lastErrorMsg,
-          latencyMs,
-        };
       } catch (err: any) {
         clearTimeout(timeoutId);
-        const latencyMs = Date.now() - start;
-        this.telemetry.lastResponseTimeMs = latencyMs;
-        this.telemetry.lastResponseStatus = 500;
-
-        const isAbort = err.name === "AbortError";
-        lastErrorMsg = isAbort
-          ? `Timeout after ${this.timeoutMs}ms calling ${fullUrl}`
-          : `Network Exception: ${err.message || String(err)}`;
-
-        this.telemetry.lastError = lastErrorMsg;
-
-        if (attempt <= this.maxRetries) {
-          const delay = this.retryDelayMs * Math.pow(2, attempt - 1) + Math.random() * 200;
-          console.warn(`[APOLLO CLIENT] Network/Timeout error (${lastErrorMsg}). Retrying attempt ${attempt}/${this.maxRetries} after ${Math.round(delay)}ms...`);
-          await new Promise((res) => setTimeout(res, delay));
-          continue;
+        const isAbort = err?.name === 'AbortError';
+        lastError = isAbort ? `Apollo request timed out after ${this.timeoutMs}ms.` : `Apollo network request failed: ${err?.message || String(err)}`;
+        this.telemetry.lastError = lastError;
+        if (attempt === this.maxRetries) {
+          return { ok: false, status: isAbort ? 504 : 502, data: null, statusText: isAbort ? 'Gateway Timeout' : 'Bad Gateway', error: lastError, latencyMs: Date.now() - start };
         }
-
-        return {
-          ok: false,
-          status: 500,
-          data: null,
-          statusText: "Internal Client Exception",
-          error: lastErrorMsg,
-          latencyMs,
-        };
       }
+
+      const delay = this.retryDelayMs * Math.pow(2, attempt) + Math.floor(Math.random() * 150);
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
 
-    return {
-      ok: false,
-      status: 500,
-      data: null,
-      statusText: "Max Retries Exceeded",
-      error: lastErrorMsg || "Max retries exceeded",
-      latencyMs: Date.now() - start,
-    };
+    return { ok: false, status: 502, data: null, statusText: 'Apollo Request Failed', error: lastError || 'Apollo request failed.', latencyMs: Date.now() - start };
   }
 }
 
