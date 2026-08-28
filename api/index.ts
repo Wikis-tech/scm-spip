@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module';
-import { handlePhase4 } from '../src/server/phase4Api';
+import { handlePhase4 } from '../src/server/phase4Api.ts';
 
 const require = createRequire(import.meta.url);
 const serverModule = require('../dist/server.cjs');
