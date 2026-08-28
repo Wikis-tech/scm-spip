@@ -129,26 +129,33 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess }) => {
 
     setLoading(true);
     try {
-      const response = await fetch('/api/auth/register-v2', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: normalizedEmail,
-          password,
-          fullName: fullName.trim(),
-          department: department.trim() || 'Asset Management',
-          jobTitle: jobTitle.trim() || null,
-        }),
+      const { data, error } = await supabase.auth.signUp({
+        email: normalizedEmail,
+        password,
+        options: {
+          data: {
+            full_name: fullName.trim(),
+            department: department.trim() || 'Asset Management',
+            job_title: jobTitle.trim() || null,
+          },
+        },
       });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(payload?.error || 'Unable to create your SPIP access request.');
+      if (error) throw error;
+      if (!data.user) throw new Error('Unable to create your SPIP access request.');
+      if (Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+        throw new Error('An SPIP account already exists for this corporate email. Use Sign in or Forgot password.');
+      }
+
+      // Even when Supabase email confirmation is disabled, a newly-created employee must
+      // never remain signed in before administrator approval. Phase 2C creates STAFF/PENDING.
+      await supabase.auth.signOut();
 
       setMode('login');
       setPassword('');
       setConfirmPassword('');
       setFullName('');
       setJobTitle('');
-      setMessage(payload?.message || 'Access request submitted. Wait for administrator approval before signing in.');
+      setMessage('Access request submitted. An administrator must approve the account before it can be used.');
     } catch (error) {
       setErrorMessage(friendlyAuthError(error));
     } finally {

@@ -182,7 +182,7 @@ function formatMoney(value: any) {
 }
 
 function mapCompany(org: any): ApolloCompany {
-  const id = String(org?.id || org?.organization_id || '');
+  const id = String(org?.organization_id || org?.id || '');
   const domain = normalizeDomain(org?.primary_domain || org?.domain || org?.website_url || '');
   return {
     id,
@@ -346,9 +346,16 @@ function mapPerson(person: any, company: { id: string; name: string; domain: str
     position: person?.title || 'Information Not Found',
     department: person?.departments?.[0] || person?.functions?.[0] || 'Information Not Found',
     seniority: person?.seniority || 'Information Not Found',
-    email: person?.email || '',
+    email: (() => {
+      const value = String(person?.email || '').trim();
+      return value && !value.includes('[email') ? value : '';
+    })(),
     emailValidationType: person?.email_status || undefined,
-    phone: person?.phone_numbers?.[0]?.sanitized_number || person?.phone_numbers?.[0]?.raw_number || '',
+    phone: person?.phone_numbers?.find((entry: any) => entry?.sanitized_number || entry?.raw_number)?.sanitized_number
+      || person?.phone_numbers?.find((entry: any) => entry?.sanitized_number || entry?.raw_number)?.raw_number
+      || person?.sanitized_phone
+      || person?.phone
+      || '',
     linkedin: person?.linkedin_url || '',
     bio: person?.headline || '',
     confidenceScore: 90,
@@ -365,34 +372,93 @@ function mapPerson(person: any, company: { id: string; name: string; domain: str
 export async function discoverDecisionMakers(companyId: string, domain: string, companyName = ''): Promise<ApolloPerson[]> {
   const cleanDomain = normalizeDomain(domain);
   const validOrgId = companyId && !companyId.startsWith('co-') ? companyId : '';
-  if (!cleanDomain && !validOrgId) return [];
-
-  const payload: any = {
-    page: 1,
-    per_page: 50,
-    person_seniorities: ['owner', 'founder', 'c_suite', 'partner', 'vp', 'head', 'director'],
-  };
-  if (validOrgId) payload.organization_ids = [validOrgId];
-  else payload.q_organization_domains_list = [cleanDomain];
-
-  const response = await apolloClient.request<any>('https://api.apollo.io/api/v1/mixed_people/api_search', 'POST', payload);
-  syncDiagnostics();
-  if (!response.ok || !Array.isArray(response.data?.people)) {
-    apolloDiagnostics.peopleReturned = 0;
-    return [];
-  }
+  if (!cleanDomain && !validOrgId && !companyName.trim()) return [];
 
   const selected = { id: validOrgId || companyId, name: companyName || cleanDomain, domain: cleanDomain };
-  const people = response.data.people
-    .filter((person: any) => belongsToSelectedCompany(person, selected, 72).belongs)
-    .map((person: any) => mapPerson(person, selected))
-    .sort((a: ApolloPerson, b: ApolloPerson) => {
-      const rank: Record<string, number> = { owner: 10, founder: 9, c_suite: 8, partner: 7, vp: 6, head: 5, director: 4 };
-      return (rank[String(b.seniority).toLowerCase()] || 0) - (rank[String(a.seniority).toLowerCase()] || 0);
-    });
 
-  apolloDiagnostics.peopleReturned = people.length;
+  const runPeopleSearch = async (payload: any) => {
+    const response = await apolloClient.request<any>('https://api.apollo.io/api/v1/mixed_people/api_search', 'POST', {
+      page: 1,
+      per_page: 100,
+      ...payload,
+    });
+    syncDiagnostics();
+    return response.ok && Array.isArray(response.data?.people) ? response.data.people : [];
+  };
+
+  // Apollo Accounts have their own account id. We now prioritize organization_id in mapCompany,
+  // but still retry by domain/name because historical saved-account records may not contain it.
+  let people: any[] = [];
+  let constrainedSearch = false;
+  if (validOrgId) {
+    people = await runPeopleSearch({ organization_ids: [validOrgId] });
+    constrainedSearch = people.length > 0;
+  }
+  if (people.length === 0 && cleanDomain) {
+    people = await runPeopleSearch({ q_organization_domains_list: [cleanDomain] });
+    constrainedSearch = people.length > 0;
+  }
+  if (people.length === 0 && companyName.trim()) {
+    people = await runPeopleSearch({ q_keywords: companyName.trim() });
+    constrainedSearch = false;
+  }
+
+  // Saved Apollo Contacts are already enriched records and can contain email/phone data.
+  // Merge them with net-new People Search so staff see names immediately and any contact details
+  // that are already available in the team's Apollo workspace without fabricating data.
+  let savedContacts: any[] = [];
+  if (companyName.trim()) {
+    const savedResponse = await apolloClient.request<any>('https://api.apollo.io/api/v1/contacts/search', 'POST', {
+      q_keywords: companyName.trim(),
+      page: 1,
+      per_page: 100,
+    });
+    syncDiagnostics();
+    if (savedResponse.ok && Array.isArray(savedResponse.data?.contacts)) {
+      savedContacts = savedResponse.data.contacts;
+    }
+  }
+
+  const acceptedPeople = people.filter((person: any) => {
+    if (constrainedSearch) return true;
+    return belongsToSelectedCompany(person, selected, 65).belongs;
+  });
+  const acceptedContacts = savedContacts.filter((person: any) => belongsToSelectedCompany(person, selected, 65).belongs);
+
+  const merged = new Map<string, ApolloPerson>();
+  for (const raw of [...acceptedPeople, ...acceptedContacts]) {
+    const mapped = mapPerson(raw, selected);
+    if (!mapped.fullName || mapped.fullName === 'Unknown') continue;
+    const key = String(raw?.id || mapped.linkedin || mapped.email || (mapped.fullName + '|' + mapped.position)).toLowerCase();
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, mapped);
+      continue;
+    }
+    // Prefer the richer saved-contact version when Apollo has already revealed contact data.
+    merged.set(key, {
+      ...existing,
+      ...mapped,
+      email: mapped.email || existing.email,
+      phone: mapped.phone || existing.phone,
+      linkedin: mapped.linkedin || existing.linkedin,
+      linkedin_url: mapped.linkedin_url || existing.linkedin_url,
+    });
+  }
+
+  const rank: Record<string, number> = { owner: 12, founder: 11, c_suite: 10, partner: 9, vp: 8, head: 7, director: 6, manager: 5, senior: 4 };
+  const result = [...merged.values()].sort((a, b) => {
+    const contactDataA = (a.email ? 2 : 0) + (a.phone ? 2 : 0) + (a.linkedin ? 1 : 0);
+    const contactDataB = (b.email ? 2 : 0) + (b.phone ? 2 : 0) + (b.linkedin ? 1 : 0);
+    if (contactDataA !== contactDataB) return contactDataB - contactDataA;
+    return (rank[String(b.seniority).toLowerCase()] || 0) - (rank[String(a.seniority).toLowerCase()] || 0);
+  });
+
+  apolloDiagnostics.peopleReturned = result.length;
   apolloDiagnostics.selectedOrganization = selected.name;
   apolloDiagnostics.selectedOrganizationId = selected.id;
-  return people;
+  apolloDiagnostics.lastAcceptanceMethodUsed = savedContacts.length
+    ? 'Apollo People + Saved Contacts'
+    : constrainedSearch ? 'Apollo Organization/Domain People Search' : 'Apollo Keyword People Search';
+  return result;
 }

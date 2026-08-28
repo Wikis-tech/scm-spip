@@ -1485,7 +1485,7 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
                           className="bg-white border border-slate-200 hover:border-[#b1191f] rounded-xl p-4 shadow-xs relative flex flex-col justify-between transition-all hover:shadow-md cursor-pointer group animate-fade-in"
                         >
                           <div className="space-y-3">
-                            {/* Phase 6 Badge: VERIFIED APOLLO CONTACT */}
+                            {/* Phase 6 Badge: APOLLO PERSON MATCH */}
                             <div className="flex items-center gap-1.5 bg-emerald-50 text-emerald-800 border border-emerald-100 rounded-lg px-2.5 py-1 text-[9px] font-extrabold uppercase w-fit">
                               <ShieldCheck className="w-3.5 h-3.5 text-emerald-700" />
                               VERIFIED APOLLO CONTACT
@@ -1519,19 +1519,19 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
                               <div className="flex items-center gap-1.5">
                                 <span className="font-bold text-slate-400 uppercase text-[8px] w-20">Company:</span>
                                 <span className="font-bold text-slate-900 truncate">
-                                  {selectedCo?.name || c.organizationName || c.companyName || "Verraki (A Member of Andersen Consulting)"}
+                                  {selectedCo?.name || c.organizationName || c.companyName || "Information Not Found"}
                                 </span>
                               </div>
                               <div className="flex items-center gap-1.5">
                                 <span className="font-bold text-slate-400 uppercase text-[8px] w-20">Department:</span>
                                 <span className="font-medium text-slate-705 truncate">
-                                  {c.department || "Executive Management"}
+                                  {c.department || "Information Not Found"}
                                 </span>
                               </div>
                               <div className="flex items-center gap-1.5">
                                 <span className="font-bold text-slate-400 uppercase text-[8px] w-20">Location:</span>
                                 <span className="font-medium text-slate-705 truncate flex items-center gap-0.5">
-                                  <MapPin className="w-3 h-3 text-slate-400 shrink-0" /> {(c as any).location || "Lagos, Nigeria"}
+                                  <MapPin className="w-3 h-3 text-slate-400 shrink-0" /> {(c as any).location || "Information Not Found"}
                                 </span>
                               </div>
                               
@@ -1616,10 +1616,10 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
                 ) : (
                   <div className="text-center py-12 px-4 bg-slate-50 border border-slate-200 border-dashed rounded-xl space-y-2">
                     <p className="text-xs font-semibold text-slate-500">
-                      Apollo returned zero matching contacts for this organization.
+                      Apollo returned no people or saved contacts for this organization.
                     </p>
                     <p className="text-[10px] text-slate-400">
-                      Try adjusting the Division filter above or typing a different keyword to locate exact department decision makers.
+                      SPIP checks Apollo People Search and your team's saved Apollo Contacts. Try another organization match if this company has no indexed people.
                     </p>
                   </div>
                 )}
