@@ -140,29 +140,27 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess }) => {
           },
         },
       });
-      if (error) throw error;
-      if (!data.user) throw new Error('Unable to create your SPIP access request.');
-      if (Array.isArray(data.user.identities) && data.user.identities.length === 0) {
-        throw new Error('An SPIP account already exists for this corporate email. Use Sign in or Forgot password.');
-      }
 
-      // Even when Supabase email confirmation is disabled, a newly-created employee must
-      // never remain signed in before administrator approval. Phase 2C creates STAFF/PENDING.
-      await supabase.auth.signOut();
+      if (error) throw error;
+      if (!data.user?.id) throw new Error('Supabase did not create the staff identity. Please try again.');
+      if (data.session) await supabase.auth.signOut();
 
       setMode('login');
       setPassword('');
       setConfirmPassword('');
       setFullName('');
       setJobTitle('');
-      setMessage('Access request submitted. An administrator must approve the account before it can be used.');
+      setMessage(
+        data.user.email_confirmed_at
+          ? 'Access request submitted. An administrator must approve the account before sign in.'
+          : 'Access request submitted. Confirm your corporate email if prompted, then wait for administrator approval.'
+      );
     } catch (error) {
       setErrorMessage(friendlyAuthError(error));
     } finally {
       setLoading(false);
     }
   };
-
   const sendReset = async (event: React.FormEvent) => {
     event.preventDefault();
     clearFeedback();
