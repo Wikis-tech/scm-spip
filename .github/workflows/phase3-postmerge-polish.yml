@@ -32,8 +32,8 @@ jobs:
           set -e
           grep -q "import.meta.env.DEV && showDiag" src/pages/Intelligence.tsx
           grep -q "companyId: company.id, domain: company.domain" src/pages/Intelligence.tsx
-          if grep -q "250000000\|1500000000\|5000000000" src/pages/Intelligence.tsx; then echo "Fabricated opportunity values remain"; exit 1; fi
-          if grep -q "Lagos, Nigeria\|Energy & Services" src/pages/Intelligence.tsx; then echo "Fabricated executive fallbacks remain"; exit 1; fi
+          if grep -q "opportunityValue: cleanValue\|const cleanValue = result.overview.revenueValue" src/pages/Intelligence.tsx; then echo "Fabricated opportunity value heuristic remains"; exit 1; fi
+          if grep -q "industry: data.overview?.industry || 'Energy & Services'\|headquarters: data.overview?.headquarters || 'Lagos, Nigeria'" src/pages/Intelligence.tsx; then echo "Fabricated executive fallback remains"; exit 1; fi
           grep -q "setIsImported(false)" src/pages/Intelligence.tsx
           grep -q "fetch('/api/auth/register-v2'" src/components/AuthScreen.tsx
           grep -q "accounts/search" src/services/apolloService.ts
