@@ -153,14 +153,14 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
         
         // Mock selectedCo company profile details based on matched executive's company organization details
         setSelectedCo({
-          id: data.overview?.id || `co-${Date.now()}`,
+          id: data.overview?.id || '',
           name: data.overview?.name || searchTerm,
           domain: data.overview?.website || 'Not Found',
-          industry: data.overview?.industry || 'Energy & Services',
-          headquarters: data.overview?.headquarters || 'Lagos, Nigeria',
+          industry: data.overview?.industry || 'Information Not Found',
+          headquarters: data.overview?.headquarters || 'Information Not Found',
           employeeCount: data.overview?.employeeCount || 'Information Not Found',
           revenueValue: data.overview?.revenueValue || 'Information Not Found',
-          description: data.overview?.description || 'Dossier compiled dynamically via executive search index query.',
+          description: data.overview?.description || 'Information Not Found',
           linkedinUrl: 'Not Found',
           techStack: []
         });
@@ -182,7 +182,7 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
           setOutreachExec(primary.fullName);
           setOutreachPos(primary.position);
           setOutreachCompany(data.overview?.name || searchTerm);
-          setOutreachIndustry(data.overview?.industry || 'Energy & Services');
+          setOutreachIndustry(data.overview?.industry || '');
         }
       } catch (err: any) {
         console.error(err);
@@ -253,7 +253,7 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
       const response = await apiFetch('/api/gemini/intelligence', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ companyName: company.name })
+        body: JSON.stringify({ companyName: company.name, companyId: company.id, domain: company.domain })
       });
 
       if (!response.ok) {
@@ -364,12 +364,6 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
   const handleImport = async () => {
     if (!result) return;
     
-    const cleanValue = result.overview.revenueValue.toLowerCase().includes('billion') 
-      ? 1500000000 
-      : result.overview.revenueValue.toLowerCase().includes('trillion') 
-        ? 5000000000 
-        : 250000000;
-
     const partialProspect: Partial<Prospect> = {
       name: result.overview.name,
       industry: result.overview.industry,
@@ -380,7 +374,6 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
       priority: result.metrics.overallOpportunityScore >= 85 ? 'High' : 'Medium',
       notes: `${result.overview.description} \nAI Assessment Overall Opportunity Score: ${result.metrics.overallOpportunityScore}/100.`,
       conversionProbability: 25,
-      opportunityValue: cleanValue,
       treasuryPotential: result.metrics.treasuryPotential,
       mmfPotential: result.metrics.mmfOpportunity,
       wealthPotential: result.metrics.wealthManagementFit,
@@ -392,7 +385,9 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
       await onImportProspect(partialProspect);
       setIsImported(true);
     } catch (err: any) {
-      setIsImported(true);
+      console.error('[SPIP IMPORT] Prospect import failed:', err?.message || err);
+      setIsImported(false);
+      setErrorWord(err?.message || 'Unable to import this prospect. Please try again.');
     }
   };
 
@@ -566,7 +561,7 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
                 setShowDiag(prev => !prev);
                 fetchDiagnostics();
               }}
-              className={`text-xs font-semibold px-3 py-1.5 rounded-lg border transition-all flex items-center gap-1.5 cursor-pointer ${
+              className={`hidden text-xs font-semibold px-3 py-1.5 rounded-lg border transition-all flex items-center gap-1.5 cursor-pointer ${
                 showDiag 
                   ? "bg-slate-900 border-slate-950 text-emerald-400 font-mono shadow-inner" 
                   : "bg-slate-50 border-slate-200 text-slate-600 hover:border-slate-300 hover:bg-slate-100"
@@ -594,7 +589,7 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
         </div>
 
         {/* Real-time Developer Diagnostics Panel (Phase 8) */}
-        {showDiag && (
+        {import.meta.env.DEV && showDiag && (
           <div className="bg-slate-950 text-slate-200 rounded-xl p-5 border border-slate-900 font-mono text-xs space-y-4 animate-fadeIn shadow-lg">
             <div className="flex items-center justify-between border-b border-slate-900 pb-2">
               <div className="flex items-center gap-2">
