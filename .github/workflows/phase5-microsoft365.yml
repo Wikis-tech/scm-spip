@@ -1,0 +1,55 @@
+name: Phase 5 Microsoft 365
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'api/microsoft/**'
+      - 'src/server/phase5MicrosoftRoutes.ts'
+      - 'src/services/microsoft365Service.ts'
+      - 'src/pages/Settings.tsx'
+      - 'database/migrations/phase_5_microsoft_365.sql'
+      - '.env.example'
+      - '.github/workflows/phase5-microsoft365.yml'
+  push:
+    branches: [phase-5-microsoft-365]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile || bun install
+      - name: Security assertions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f database/migrations/phase_5_microsoft_365.sql
+          test -f src/server/phase5MicrosoftRoutes.ts
+          test -f api/microsoft/'[...path].ts'
+          grep -q "aes-256-gcm" src/server/phase5MicrosoftRoutes.ts
+          grep -q "code_challenge_method.*S256" src/server/phase5MicrosoftRoutes.ts
+          grep -q "offline_access" src/server/phase5MicrosoftRoutes.ts
+          grep -q "Mail.Send" src/server/phase5MicrosoftRoutes.ts
+          grep -q "Calendars.ReadWrite" src/server/phase5MicrosoftRoutes.ts
+          grep -q "@scmcapitalng.com" src/server/phase5MicrosoftRoutes.ts
+          grep -q "revoke all on table public.microsoft_connections from anon, authenticated" database/migrations/phase_5_microsoft_365.sql
+          ! grep -R "MICROSOFT_CLIENT_SECRET" src/pages src/services --exclude='microsoft365Service.ts'
+          ! grep -R "refresh_token_ciphertext" src/pages
+      - name: TypeScript
+        run: bunx tsc --noEmit
+      - name: Production build
+        run: bun run build
+      - name: Dependency advisory report
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun audit > /tmp/bun-audit.txt 2>&1 || true
+          cat /tmp/bun-audit.txt
+          if grep -Eiq '(^|[^a-z])(critical|high)([^a-z]|$)' /tmp/bun-audit.txt; then
+            echo 'High/critical dependency advisory detected.' >&2
+            exit 1
+          fi
