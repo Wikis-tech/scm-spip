@@ -1,0 +1,54 @@
+name: Phase 6 AI Orchestration
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'api/ai/**'
+      - 'api/gemini/assistant.ts'
+      - 'src/server/phase6AiRuntime.ts'
+      - 'database/migrations/phase_6_ai_orchestration.sql'
+      - '.env.example'
+      - '.github/workflows/phase6-ai.yml'
+  push:
+    branches: [phase-6-ai-orchestration]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile || bun install
+      - name: Phase 6 security and functional assertions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f database/migrations/phase_6_ai_orchestration.sql
+          test -f src/server/phase6AiRuntime.ts
+          test -f api/gemini/assistant.ts
+          test -f api/ai/'[...path].ts'
+          grep -q "eq('user_id', identity.id)" src/server/phase6AiRuntime.ts
+          grep -q "owner_user_id', identity.id" src/server/phase6AiRuntime.ts
+          grep -q "spip_ai_provider_health" src/server/phase6AiRuntime.ts
+          grep -q "HTTP_.*429\|status === 429" src/server/phase6AiRuntime.ts
+          grep -q "CONFIDENTIAL" src/server/phase6AiRuntime.ts
+          grep -q "revoke all on table public.spip_ai_conversations from anon, authenticated" database/migrations/phase_6_ai_orchestration.sql
+          grep -q "spip-ai-private" database/migrations/phase_6_ai_orchestration.sql
+          ! grep -R "GROQ_API_KEY.*VITE_\|CEREBRAS_API_KEY.*VITE_\|ZAI_API_KEY.*VITE_" src api || false
+      - name: TypeScript
+        run: bunx tsc --noEmit
+      - name: Production build
+        run: bun run build
+      - name: Dependency advisory report
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun audit > /tmp/bun-audit.txt 2>&1 || true
+          cat /tmp/bun-audit.txt
+          if grep -Eiq '(^|[^a-z])(critical|high)([^a-z]|$)' /tmp/bun-audit.txt; then
+            echo 'High/critical dependency advisory detected.' >&2
+            exit 1
+          fi
