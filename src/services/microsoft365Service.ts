@@ -36,6 +36,7 @@ export const microsoft365Service = {
   },
   disconnect: () => request('/api/microsoft/connection', { method: 'DELETE' }),
   calendarEvents: (days = 30) => request(`/api/microsoft/calendar/events?days=${days}`),
+  spipMeetings: () => request('/api/crm/meetings'),
   publishMeeting: (meetingId: string) => request('/api/microsoft/calendar/publish', { method: 'POST', body: JSON.stringify({ meetingId }) }),
   sendMail: (payload: { to: string; subject: string; body: string; prospectId?: string; prospectName?: string }) =>
     request('/api/microsoft/mail/send', { method: 'POST', body: JSON.stringify(payload) }),
