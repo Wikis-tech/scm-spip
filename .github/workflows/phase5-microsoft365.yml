@@ -43,5 +43,13 @@ jobs:
         run: bunx tsc --noEmit
       - name: Production build
         run: bun run build
-      - name: Dependency high-severity audit
-        run: bun audit --level high || npm audit --audit-level=high
+      - name: Dependency advisory report
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun audit > /tmp/bun-audit.txt 2>&1 || true
+          cat /tmp/bun-audit.txt
+          if grep -Eiq '(^|[^a-z])(critical|high)([^a-z]|$)' /tmp/bun-audit.txt; then
+            echo 'High/critical dependency advisory detected.' >&2
+            exit 1
+          fi
