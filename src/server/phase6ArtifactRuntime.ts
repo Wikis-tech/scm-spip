@@ -1,10 +1,14 @@
 import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { Document, HeadingLevel, Packer, Paragraph, TextRun } from 'docx';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
-import PptxGenJS from '@lofcz/pptxgenjs';
 import ExcelJS from 'exceljs-hardened';
 import mammoth from 'mammoth';
 import { authenticatePhase6, phase6Supabase } from './phase6AiRuntime.js';
+
+const nodeRequire = createRequire(import.meta.url);
+const pptxModule = nodeRequire('@lofcz/pptxgenjs');
+const PptxGenJS: any = pptxModule.default || pptxModule;
 
 const PRIVATE_BUCKET = 'spip-ai-private';
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
