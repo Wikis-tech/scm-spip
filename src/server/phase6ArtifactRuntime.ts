@@ -80,7 +80,7 @@ async function renderDocx(title: string, content: string) {
   const sections = parseSections(content);
   const children: Paragraph[] = [
     new Paragraph({ text: title, heading: HeadingLevel.TITLE }),
-    new Paragraph({ text: 'SCM Capital Asset Management', heading: HeadingLevel.SUBTITLE }),
+    new Paragraph({ children: [new TextRun({ text: 'SCM Capital Asset Management', bold: true, size: 20 })], spacing: { after: 220 } }),
   ];
 
   for (const section of sections) {
@@ -148,11 +148,9 @@ async function renderPptx(title: string, content: string) {
   pptx.subject = 'SCM Capital Asset Management draft';
   pptx.title = title;
   pptx.company = 'SCM Capital Asset Management';
-  pptx.lang = 'en-NG';
   pptx.theme = {
     headFontFace: 'Aptos Display',
     bodyFontFace: 'Aptos',
-    lang: 'en-NG',
   };
 
   const cover = pptx.addSlide();
@@ -173,7 +171,7 @@ async function renderPptx(title: string, content: string) {
     ];
     slide.addText(body.length ? body : [{ text: 'No additional content supplied.', options: {} }], {
       x: 0.9, y: 1.55, w: 11.5, h: 5.2, fontSize: 16, color: '334155', breakLine: false,
-      margin: 0.08, valign: 'top', paraSpaceAfterPt: 10,
+      margin: 0.08, valign: 'top', paraSpaceAfter: 10,
     });
     slide.addText('SCM Capital Asset Management', { x: 0.9, y: 7.05, w: 5, h: 0.2, fontSize: 8, color: '94A3B8' });
   });
