@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
+import path from 'node:path';
 import { Document, HeadingLevel, Packer, Paragraph, TextRun } from 'docx';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import ExcelJS from 'exceljs-hardened';
@@ -7,8 +8,6 @@ import mammoth from 'mammoth';
 import { authenticatePhase6, phase6Supabase } from './phase6AiRuntime.js';
 
 const nodeRequire = createRequire(import.meta.url);
-const pptxModule = nodeRequire('@lofcz/pptxgenjs');
-const PptxGenJS: any = pptxModule.default || pptxModule;
 
 const PRIVATE_BUCKET = 'spip-ai-private';
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
@@ -139,6 +138,12 @@ async function renderPdf(title: string, content: string) {
 }
 
 async function renderPptx(title: string, content: string) {
+  // Load the browser bundle only when PPTX is requested. The bundle includes its ZIP
+  // runtime and avoids Vercel's mixed ESM/CommonJS dependency loader conflict.
+  const packageEntry = nodeRequire.resolve('@lofcz/pptxgenjs');
+  const bundlePath = path.join(path.dirname(packageEntry), 'pptxgen.bundle.js');
+  const pptxModule = nodeRequire(bundlePath);
+  const PptxGenJS: any = pptxModule.default || pptxModule.PptxGenJS || pptxModule;
   const pptx = new PptxGenJS();
   pptx.layout = 'LAYOUT_WIDE';
   pptx.author = 'SCM Intelligence Copilot';
