@@ -111,7 +111,7 @@ export function providerStatus() {
   return providers().map((provider) => ({
     id: provider.id,
     label: provider.label,
-    configured: Boolean(provider.apiKey),
+    configured: Boolean(provider.apiKey && provider.endpoint),
     model: provider.model,
     confidentialAllowed: provider.confidentialAllowed,
   }));
@@ -119,10 +119,6 @@ export function providerStatus() {
 
 async function workspaceContext(supabase: SupabaseClient, identity: ActiveIdentity, workspaceId?: string | null) {
   if (!workspaceId) return { text: '', workspace: null };
-
-  // Deliberately do not grant administrators automatic access to another employee's
-  // AI workspace. Phase 6 private AI context is owner-scoped unless explicit sharing
-  // is introduced in a future audited feature.
   const { data: workspace, error } = await supabase
     .from('workspaces')
     .select('id, prospect_id, owner_user_id, company_name, status, apollo_findings, company_profile, industry_analysis, executive_insights, investment_opportunities, research_summaries')
@@ -178,7 +174,6 @@ async function documentContext(supabase: SupabaseClient, identity: ActiveIdentit
 
 function modeInstructions(mode: AiMode): string {
   const shared = `Write like an experienced SCM Capital professional, not like a generic chatbot. Use direct Nigerian/West African institutional-business language where relevant, but remain formal. Do not use filler such as "in today's rapidly evolving landscape". Never invent names, emails, phone numbers, revenue, addresses, regulation status, yields, dates or financial figures. Distinguish verified facts from assumptions. If evidence is missing, say "Information Not Found" or ask for the missing input. Never present a draft as approved legal, investment, compliance or regulatory advice.`;
-
   const modes: Record<AiMode, string> = {
     assistant: 'Answer the employee clearly and practically. Prefer useful action over long exposition.',
     research: 'Act as an enterprise research analyst. Separate VERIFIED FACTS, ANALYSIS, GAPS/QUESTIONS, and SOURCES when source material is available. Never manufacture citations.',
@@ -201,7 +196,6 @@ async function getConversationHistory(
   conversationId?: string | null,
 ): Promise<{ conversationId: string | null; history: ChatMessage[]; classification?: DataClassification; mode?: AiMode }> {
   if (!conversationId) return { conversationId: null, history: [] };
-
   const { data: conversation, error } = await supabase
     .from('spip_ai_conversations')
     .select('id, user_id, mode, data_classification')
@@ -243,29 +237,22 @@ async function createConversation(
     mode,
     data_classification: classification,
   }).select('id').single();
-  if (error || !data) throw new Error('Phase 6 database migration is required before AI conversations can be saved.');
+  if (error || !data) {
+    const safeCode = String((error as any)?.code || 'PERSISTENCE_UNAVAILABLE').slice(0, 80);
+    const safeMessage = String((error as any)?.message || 'conversation persistence unavailable').replace(/[A-Za-z0-9_-]{24,}/g, '[REDACTED]').slice(0, 220);
+    console.error('[PHASE6 CONVERSATION PERSISTENCE]', safeCode, safeMessage);
+    throw new Error(`Conversation history is temporarily unavailable (${safeCode}).`);
+  }
   return data.id as string;
 }
 
 async function providerHealth(supabase: SupabaseClient, providerId: string) {
-  const { data } = await supabase
-    .from('spip_ai_provider_health')
-    .select('provider, status, cooldown_until, consecutive_failures')
-    .eq('provider', providerId)
-    .maybeSingle();
+  const { data } = await supabase.from('spip_ai_provider_health').select('provider, status, cooldown_until, consecutive_failures').eq('provider', providerId).maybeSingle();
   return data || null;
 }
 
 async function markProviderSuccess(supabase: SupabaseClient, providerId: string) {
-  await supabase.from('spip_ai_provider_health').upsert({
-    provider: providerId,
-    status: 'HEALTHY',
-    cooldown_until: null,
-    consecutive_failures: 0,
-    last_error_code: null,
-    last_success_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-  }, { onConflict: 'provider' });
+  await supabase.from('spip_ai_provider_health').upsert({ provider: providerId, status: 'HEALTHY', cooldown_until: null, consecutive_failures: 0, last_error_code: null, last_success_at: new Date().toISOString(), updated_at: new Date().toISOString() }, { onConflict: 'provider' });
 }
 
 function retryAfterMs(response: Response) {
@@ -281,27 +268,15 @@ function retryAfterMs(response: Response) {
 
 async function markProviderFailure(supabase: SupabaseClient, providerId: string, code: string, cooldownMs: number, disabled = false) {
   const current = await providerHealth(supabase, providerId);
-  await supabase.from('spip_ai_provider_health').upsert({
-    provider: providerId,
-    status: disabled ? 'DISABLED' : 'COOLDOWN',
-    cooldown_until: disabled ? null : new Date(Date.now() + cooldownMs).toISOString(),
-    consecutive_failures: Number(current?.consecutive_failures || 0) + 1,
-    last_error_code: code.slice(0, 120),
-    last_failure_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-  }, { onConflict: 'provider' });
+  await supabase.from('spip_ai_provider_health').upsert({ provider: providerId, status: disabled ? 'DISABLED' : 'COOLDOWN', cooldown_until: disabled ? null : new Date(Date.now() + cooldownMs).toISOString(), consecutive_failures: Number(current?.consecutive_failures || 0) + 1, last_error_code: code.slice(0, 120), last_failure_at: new Date().toISOString(), updated_at: new Date().toISOString() }, { onConflict: 'provider' });
 }
 
 async function providerAvailable(supabase: SupabaseClient, provider: ProviderConfig) {
-  if (!provider.apiKey) return false;
+  if (!provider.apiKey || !provider.endpoint) return false;
   const health = await providerHealth(supabase, provider.id);
   if (!health) return true;
-  // Recover providers disabled by older Phase 6 builds. Invalid credentials/model errors are now
-  // handled with cooldowns instead of permanent disablement, so a corrected key/model can recover.
   if (health.status === 'DISABLED') return true;
-  if (health.status === 'COOLDOWN' && health.cooldown_until) {
-    return new Date(health.cooldown_until).getTime() <= Date.now();
-  }
+  if (health.status === 'COOLDOWN' && health.cooldown_until) return new Date(health.cooldown_until).getTime() <= Date.now();
   return true;
 }
 
@@ -322,15 +297,9 @@ async function callProvider(provider: ProviderConfig, messages: ChatMessage[]): 
         'Content-Type': 'application/json',
         ...(provider.id === 'openrouter' ? { 'HTTP-Referer': process.env.APP_URL || 'https://scm-spip.vercel.app', 'X-Title': 'SCM SPIP' } : {}),
       },
-      body: JSON.stringify({
-        model: provider.model,
-        messages,
-        temperature: 0.35,
-        max_tokens: 6000,
-      }),
+      body: JSON.stringify({ model: provider.model, messages, temperature: 0.35, max_tokens: 6000 }),
       signal: controller.signal,
     });
-
     const body = await response.json().catch(() => ({}));
     if (!response.ok) {
       const error: any = new Error(body?.error?.message || body?.message || `${provider.label} request failed (${response.status}).`);
@@ -338,18 +307,9 @@ async function callProvider(provider: ProviderConfig, messages: ChatMessage[]): 
       error.retryAfterMs = retryAfterMs(response);
       throw error;
     }
-
     const text = String(body?.choices?.[0]?.message?.content || body?.choices?.[0]?.text || '').trim();
     if (!text) throw new Error(`${provider.label} returned an empty response.`);
-    return {
-      provider: provider.id,
-      model: provider.model,
-      text,
-      inputTokens: Number(body?.usage?.prompt_tokens || body?.usage?.input_tokens || 0),
-      outputTokens: Number(body?.usage?.completion_tokens || body?.usage?.output_tokens || 0),
-      latencyMs: Date.now() - started,
-      citations: extractCitations(body),
-    };
+    return { provider: provider.id, model: provider.model, text, inputTokens: Number(body?.usage?.prompt_tokens || body?.usage?.input_tokens || 0), outputTokens: Number(body?.usage?.completion_tokens || body?.usage?.output_tokens || 0), latencyMs: Date.now() - started, citations: extractCitations(body) };
   } finally {
     clearTimeout(timeout);
   }
@@ -359,25 +319,12 @@ function allowedProviders(classification: DataClassification, mode: AiMode): Pro
   const list = providers();
   const research = mode === 'research' ? researchProvider() : null;
   const ordered = research ? [research, ...list] : list;
-  return ordered
-    .filter((provider) => provider.apiKey)
-    .filter((provider) => classification !== 'CONFIDENTIAL' || provider.confidentialAllowed)
-    .sort((a, b) => a.priority - b.priority);
+  return ordered.filter((provider) => provider.apiKey && provider.endpoint).filter((provider) => classification !== 'CONFIDENTIAL' || provider.confidentialAllowed).sort((a, b) => a.priority - b.priority);
 }
 
-async function routeAcrossProviders(
-  supabase: SupabaseClient,
-  classification: DataClassification,
-  mode: AiMode,
-  messages: ChatMessage[],
-): Promise<ProviderResult> {
+async function routeAcrossProviders(supabase: SupabaseClient, classification: DataClassification, mode: AiMode, messages: ChatMessage[]): Promise<ProviderResult> {
   const candidates = allowedProviders(classification, mode);
-  if (!candidates.length) {
-    throw new Error(classification === 'CONFIDENTIAL'
-      ? 'No AI provider is currently approved for CONFIDENTIAL SCM data. Configure an approved provider before sending this prompt.'
-      : 'No Phase 6 AI provider key is configured yet.');
-  }
-
+  if (!candidates.length) throw new Error(classification === 'CONFIDENTIAL' ? 'No AI provider is currently approved for CONFIDENTIAL SCM data. Configure an approved provider before sending this prompt.' : 'No Phase 6 AI provider key is configured yet.');
   const errors: string[] = [];
   for (const provider of candidates) {
     if (!(await providerAvailable(supabase, provider))) continue;
@@ -389,39 +336,17 @@ async function routeAcrossProviders(
       const status = Number(error?.status || 0);
       const code = status ? `HTTP_${status}` : error?.name === 'AbortError' ? 'TIMEOUT' : 'NETWORK_OR_PROVIDER_ERROR';
       errors.push(`${provider.label}: ${code}`);
-
       const safeMessage = String(error?.message || '').replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [REDACTED]').slice(0, 220);
       console.warn('[PHASE6 PROVIDER FAILURE]', provider.id, code, safeMessage);
-
-      // Never permanently disable a configured provider. A key/model can be corrected in Vercel
-      // without touching the database, and the router must automatically recover afterwards.
-      const cooldown = status === 429
-        ? Number(error?.retryAfterMs || 300_000)
-        : (status === 401 || status === 403)
-          ? 30 * 60_000
-          : (status === 400 || status === 404)
-            ? 10 * 60_000
-            : Math.min(30 * 60_000, 90_000 * (1 + errors.length));
+      const cooldown = status === 429 ? Number(error?.retryAfterMs || 300_000) : (status === 401 || status === 403) ? 30 * 60_000 : (status === 400 || status === 404) ? 10 * 60_000 : Math.min(30 * 60_000, 90_000 * (1 + errors.length));
       await markProviderFailure(supabase, provider.id, code, cooldown, false);
     }
   }
-
   throw new Error(`All configured AI providers are unavailable right now. ${errors.join('; ')}`);
 }
 
 async function logUsage(supabase: SupabaseClient, identity: ActiveIdentity, conversationId: string | null, mode: AiMode, result?: ProviderResult, errorCode?: string) {
-  await supabase.from('spip_ai_usage_events').insert({
-    user_id: identity.id,
-    conversation_id: conversationId,
-    provider: result?.provider || null,
-    model: result?.model || null,
-    task_type: mode,
-    status: result ? 'SUCCESS' : 'FAILED',
-    input_tokens: result?.inputTokens || 0,
-    output_tokens: result?.outputTokens || 0,
-    latency_ms: result?.latencyMs || 0,
-    error_code: errorCode || null,
-  });
+  await supabase.from('spip_ai_usage_events').insert({ user_id: identity.id, conversation_id: conversationId, provider: result?.provider || null, model: result?.model || null, task_type: mode, status: result ? 'SUCCESS' : 'FAILED', input_tokens: result?.inputTokens || 0, output_tokens: result?.outputTokens || 0, latency_ms: result?.latencyMs || 0, error_code: errorCode || null });
 }
 
 export async function runPhase6Assistant(req: any) {
@@ -433,13 +358,9 @@ export async function runPhase6Assistant(req: any) {
   if (query.length > 30_000) return { status: 413, body: { error: 'This prompt is too large. Upload the source document instead of pasting it into chat.' } };
 
   const requestedMode = String(req.body?.mode || req.body?.serenaModule || 'assistant').toLowerCase();
-  const mode: AiMode = ['assistant','research','proposal','email','meeting','followup','analysis'].includes(requestedMode)
-    ? requestedMode as AiMode
-    : 'assistant';
+  const mode: AiMode = ['assistant','research','proposal','email','meeting','followup','analysis'].includes(requestedMode) ? requestedMode as AiMode : 'assistant';
   const requestedClassification = String(req.body?.classification || 'INTERNAL').toUpperCase();
-  let classification: DataClassification = ['PUBLIC','INTERNAL','CONFIDENTIAL'].includes(requestedClassification)
-    ? requestedClassification as DataClassification
-    : 'INTERNAL';
+  let classification: DataClassification = ['PUBLIC','INTERNAL','CONFIDENTIAL'].includes(requestedClassification) ? requestedClassification as DataClassification : 'INTERNAL';
 
   const workspaceId = req.body?.workspaceId ? String(req.body.workspaceId) : null;
   const existingConversationId = req.body?.conversationId ? String(req.body.conversationId) : null;
@@ -454,14 +375,16 @@ export async function runPhase6Assistant(req: any) {
 
     if (saved.classification) classification = saved.classification;
     const effectiveMode = saved.mode || mode;
-    const conversationId = saved.conversationId || await createConversation(
-      phase6Supabase,
-      identity,
-      query,
-      workspaceId,
-      effectiveMode,
-      classification,
-    );
+    let conversationId = saved.conversationId;
+    let persistenceWarning: string | null = null;
+
+    if (!conversationId) {
+      try {
+        conversationId = await createConversation(phase6Supabase, identity, query, workspaceId, effectiveMode, classification);
+      } catch (error: any) {
+        persistenceWarning = String(error?.message || 'Conversation history is temporarily unavailable.').slice(0, 240);
+      }
+    }
 
     const messages: ChatMessage[] = [
       { role: 'system', content: systemPrompt(identity, effectiveMode, classification, [workspace.text, sourceDocuments].filter(Boolean).join('\n\n')) },
@@ -469,40 +392,39 @@ export async function runPhase6Assistant(req: any) {
       { role: 'user', content: query },
     ];
 
-    await phase6Supabase.from('spip_ai_messages').insert({
-      conversation_id: conversationId,
-      user_id: identity.id,
-      role: 'user',
-      content: query,
-    });
+    if (conversationId) {
+      const { error: userMessageError } = await phase6Supabase.from('spip_ai_messages').insert({ conversation_id: conversationId, user_id: identity.id, role: 'user', content: query });
+      if (userMessageError) {
+        console.error('[PHASE6 USER MESSAGE PERSISTENCE]', String((userMessageError as any)?.code || 'UNKNOWN'), String((userMessageError as any)?.message || '').slice(0, 220));
+        persistenceWarning ||= 'This answer will be returned, but conversation history could not be updated.';
+      }
+    }
 
     const result = await routeAcrossProviders(phase6Supabase, classification, effectiveMode, messages);
 
-    await phase6Supabase.from('spip_ai_messages').insert({
-      conversation_id: conversationId,
-      user_id: identity.id,
-      role: 'assistant',
-      content: result.text,
-      provider: result.provider,
-      model: result.model,
-      citations: result.citations,
-      input_tokens: result.inputTokens,
-      output_tokens: result.outputTokens,
-      latency_ms: result.latencyMs,
-    });
-    await phase6Supabase.from('spip_ai_conversations').update({ updated_at: new Date().toISOString() }).eq('id', conversationId).eq('user_id', identity.id);
-    await logUsage(phase6Supabase, identity, conversationId, effectiveMode, result);
+    if (conversationId) {
+      const { error: assistantMessageError } = await phase6Supabase.from('spip_ai_messages').insert({ conversation_id: conversationId, user_id: identity.id, role: 'assistant', content: result.text, provider: result.provider, model: result.model, citations: result.citations, input_tokens: result.inputTokens, output_tokens: result.outputTokens, latency_ms: result.latencyMs });
+      if (assistantMessageError) {
+        console.error('[PHASE6 ASSISTANT MESSAGE PERSISTENCE]', String((assistantMessageError as any)?.code || 'UNKNOWN'), String((assistantMessageError as any)?.message || '').slice(0, 220));
+        persistenceWarning ||= 'The answer was generated, but conversation history could not be saved.';
+      } else {
+        await phase6Supabase.from('spip_ai_conversations').update({ updated_at: new Date().toISOString() }).eq('id', conversationId).eq('user_id', identity.id);
+      }
+    }
+
+    await logUsage(phase6Supabase, identity, conversationId, effectiveMode, result).catch(() => undefined);
 
     return {
       status: 200,
       body: {
         reply: result.text,
-        conversationId,
+        conversationId: conversationId || null,
         provider: result.provider,
         model: result.model,
         citations: result.citations,
         classification,
         mode: effectiveMode,
+        persistence: { saved: Boolean(conversationId && !persistenceWarning), warning: persistenceWarning },
         usage: { inputTokens: result.inputTokens, outputTokens: result.outputTokens, latencyMs: result.latencyMs },
       },
     };
@@ -514,39 +436,23 @@ export async function runPhase6Assistant(req: any) {
 }
 
 export async function listUserConversations(identity: ActiveIdentity) {
-  const { data, error } = await phase6Supabase
-    .from('spip_ai_conversations')
-    .select('id, workspace_id, title, mode, data_classification, created_at, updated_at')
-    .eq('user_id', identity.id)
-    .order('updated_at', { ascending: false })
-    .limit(100);
-  if (error) throw error;
+  const { data, error } = await phase6Supabase.from('spip_ai_conversations').select('id, workspace_id, title, mode, data_classification, created_at, updated_at').eq('user_id', identity.id).order('updated_at', { ascending: false }).limit(100);
+  if (error) {
+    console.error('[PHASE6 CONVERSATION LIST]', String((error as any)?.code || 'UNKNOWN'), String((error as any)?.message || '').slice(0, 220));
+    return [];
+  }
   return data || [];
 }
 
 export async function getUserConversation(identity: ActiveIdentity, conversationId: string) {
-  const { data: conversation, error } = await phase6Supabase
-    .from('spip_ai_conversations')
-    .select('id, workspace_id, title, mode, data_classification, created_at, updated_at')
-    .eq('id', conversationId)
-    .eq('user_id', identity.id)
-    .maybeSingle();
+  const { data: conversation, error } = await phase6Supabase.from('spip_ai_conversations').select('id, workspace_id, title, mode, data_classification, created_at, updated_at').eq('id', conversationId).eq('user_id', identity.id).maybeSingle();
   if (error || !conversation) return null;
-  const { data: messages, error: messageError } = await phase6Supabase
-    .from('spip_ai_messages')
-    .select('id, role, content, provider, model, citations, created_at')
-    .eq('conversation_id', conversationId)
-    .eq('user_id', identity.id)
-    .order('created_at', { ascending: true });
+  const { data: messages, error: messageError } = await phase6Supabase.from('spip_ai_messages').select('id, role, content, provider, model, citations, created_at').eq('conversation_id', conversationId).eq('user_id', identity.id).order('created_at', { ascending: true });
   if (messageError) throw messageError;
   return { ...conversation, messages: messages || [] };
 }
 
 export async function deleteUserConversation(identity: ActiveIdentity, conversationId: string) {
-  const { error } = await phase6Supabase
-    .from('spip_ai_conversations')
-    .delete()
-    .eq('id', conversationId)
-    .eq('user_id', identity.id);
+  const { error } = await phase6Supabase.from('spip_ai_conversations').delete().eq('id', conversationId).eq('user_id', identity.id);
   if (error) throw error;
 }
