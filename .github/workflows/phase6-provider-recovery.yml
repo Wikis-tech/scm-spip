@@ -1,0 +1,41 @@
+name: Phase 6 Provider Recovery
+on:
+  push:
+    branches: [phase-6-provider-recovery]
+permissions:
+  contents: write
+jobs:
+  recover:
+    if: ${{ !contains(github.event.head_commit.message, '[provider-recovery]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: phase-6-provider-recovery
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: node scripts/phase6-provider-recovery.mjs
+      - run: bun install --frozen-lockfile || bun install
+      - run: bunx tsc --noEmit
+      - run: bun run build
+      - name: Validate provider router hardening
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q "PHASE6 PROVIDER FAILURE" src/server/phase6AiRuntime.ts
+          grep -q "health.status === 'DISABLED') return true" src/server/phase6AiRuntime.ts
+          grep -q "@cf/openai/gpt-oss-20b" src/server/phase6AiRuntime.ts
+          grep -q "CLOUDFLARE_API_TOKEN" .env.example
+      - name: Commit recovery patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/server/phase6AiRuntime.ts .env.example
+          if ! git diff --cached --quiet; then
+            git commit -m "fix(phase6): recover AI providers automatically [provider-recovery]"
+            git push origin HEAD:phase-6-provider-recovery
+          fi
