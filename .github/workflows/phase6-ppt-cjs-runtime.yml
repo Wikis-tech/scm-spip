@@ -1,0 +1,53 @@
+name: Phase 6 PPT CommonJS Runtime
+
+on:
+  push:
+    branches: [phase-6-ppt-cjs-runtime]
+    paths: ['.github/workflows/phase6-ppt-cjs-runtime.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: phase-6-ppt-cjs-runtime
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Use Node require condition for PPT library
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/server/phase6ArtifactRuntime.ts')
+          s=p.read_text()
+          s=s.replace("import { createHash } from 'node:crypto';", "import { createHash } from 'node:crypto';\nimport { createRequire } from 'node:module';")
+          s=s.replace("import PptxGenJS from '@lofcz/pptxgenjs';\n", "")
+          marker="import { authenticatePhase6, phase6Supabase } from './phase6AiRuntime.js';\n"
+          replacement=marker+"\nconst nodeRequire = createRequire(import.meta.url);\nconst pptxModule = nodeRequire('@lofcz/pptxgenjs');\nconst PptxGenJS: any = pptxModule.default || pptxModule;\n"
+          if marker not in s: raise SystemExit('artifact import marker not found')
+          s=s.replace(marker,replacement,1)
+          p.write_text(s)
+          PY
+      - name: Validate runtime build
+        run: |
+          bun install --frozen-lockfile
+          bunx tsc --noEmit
+          bun run build
+      - name: Commit runtime fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/server/phase6ArtifactRuntime.ts
+          if ! git diff --cached --quiet; then
+            git commit -m "fix(phase6): load PPT generator through CommonJS runtime"
+            git push origin HEAD:phase-6-ppt-cjs-runtime
+          fi
