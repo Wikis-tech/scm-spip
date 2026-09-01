@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { Document, HeadingLevel, Packer, Paragraph, TextRun } from 'docx';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
-import PptxGenJS from 'pptxgenjs';
-import * as XLSX from 'xlsx';
+import PptxGenJS from 'pptxgenjs-plus';
+import ExcelJS from 'exceljs-hardened';
 import mammoth from 'mammoth';
 import { authenticatePhase6, phase6Supabase } from './phase6AiRuntime';
 
@@ -93,12 +93,7 @@ async function renderDocx(title: string, content: string) {
     creator: 'SCM Intelligence Copilot',
     title,
     description: 'Draft generated within SCM Prospect Intelligence Platform',
-    sections: [{
-      properties: {},
-      headers: {},
-      footers: {},
-      children,
-    }],
+    sections: [{ properties: {}, headers: {}, footers: {}, children }],
   });
   return Buffer.from(await Packer.toBuffer(doc));
 }
@@ -133,11 +128,9 @@ async function renderPdf(title: string, content: string) {
       y -= 6;
     }
     for (const bullet of section.bullets) {
-      const lines = wrapText(`• ${bullet}`, 88);
-      for (const line of lines) addLine(line, 10.5, false, 14);
+      for (const line of wrapText(`• ${bullet}`, 88)) addLine(line, 10.5, false, 14);
     }
   }
-
   return Buffer.from(await pdf.save());
 }
 
@@ -148,10 +141,7 @@ async function renderPptx(title: string, content: string) {
   pptx.subject = 'SCM Capital Asset Management draft';
   pptx.title = title;
   pptx.company = 'SCM Capital Asset Management';
-  pptx.theme = {
-    headFontFace: 'Aptos Display',
-    bodyFontFace: 'Aptos',
-  };
+  pptx.theme = { headFontFace: 'Aptos Display', bodyFontFace: 'Aptos' };
 
   const cover = pptx.addSlide();
   cover.background = { color: '091B2D' };
@@ -159,8 +149,7 @@ async function renderPptx(title: string, content: string) {
   cover.addText('SCM Capital Asset Management', { x: 0.8, y: 3.1, w: 11.5, h: 0.4, fontSize: 14, color: 'D7DEE8' });
   cover.addShape(pptx.ShapeType.rect, { x: 0.8, y: 3.8, w: 1.4, h: 0.08, line: { color: 'B1191F' }, fill: { color: 'B1191F' } });
 
-  const sections = parseSections(content).slice(0, 18);
-  sections.forEach((section, index) => {
+  parseSections(content).slice(0, 18).forEach((section, index) => {
     const slide = pptx.addSlide();
     slide.background = { color: 'F8FAFC' };
     slide.addText(section.heading || `Section ${index + 1}`, { x: 0.7, y: 0.55, w: 12.0, h: 0.55, fontSize: 22, bold: true, color: '091B2D' });
@@ -181,18 +170,21 @@ async function renderPptx(title: string, content: string) {
 }
 
 async function renderXlsx(title: string, content: string) {
-  const workbook = XLSX.utils.book_new();
-  const rows: any[][] = [['SCM Capital Asset Management'], [title], []];
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = 'SCM Intelligence Copilot';
+  const sheet = workbook.addWorksheet('Copilot Output');
+  sheet.columns = [{ width: 18 }, { width: 100 }];
+  sheet.addRow(['SCM Capital Asset Management']);
+  sheet.addRow([title]);
+  sheet.addRow([]);
   for (const section of parseSections(content)) {
-    if (section.heading) rows.push([section.heading]);
-    section.paragraphs.forEach((p) => rows.push([p]));
-    section.bullets.forEach((b) => rows.push(['•', b]));
-    rows.push([]);
+    if (section.heading) sheet.addRow([section.heading]);
+    section.paragraphs.forEach((p) => sheet.addRow([p]));
+    section.bullets.forEach((b) => sheet.addRow(['•', b]));
+    sheet.addRow([]);
   }
-  const sheet = XLSX.utils.aoa_to_sheet(rows);
-  sheet['!cols'] = [{ wch: 18 }, { wch: 100 }];
-  XLSX.utils.book_append_sheet(workbook, sheet, 'Copilot Output');
-  return Buffer.from(XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' }));
+  const data = await workbook.xlsx.writeBuffer();
+  return Buffer.from(data as any);
 }
 
 async function renderArtifact(format: ArtifactFormat, title: string, content: string) {
@@ -220,14 +212,9 @@ export async function generateArtifact(req: any) {
     if (!conversation) return { status: 404, body: { error: 'Conversation not found.' } };
     if (!content) {
       const { data: latest } = await phase6Supabase
-        .from('spip_ai_messages')
-        .select('content')
-        .eq('conversation_id', conversationId)
-        .eq('user_id', identity.id)
-        .eq('role', 'assistant')
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
+        .from('spip_ai_messages').select('content')
+        .eq('conversation_id', conversationId).eq('user_id', identity.id).eq('role', 'assistant')
+        .order('created_at', { ascending: false }).limit(1).maybeSingle();
       content = String(latest?.content || '').trim();
     }
   }
@@ -242,13 +229,8 @@ export async function generateArtifact(req: any) {
   if (uploadError) return { status: 500, body: { error: 'The export could not be stored securely.' } };
 
   const { data: artifact, error: insertError } = await phase6Supabase.from('spip_ai_artifacts').insert({
-    user_id: identity.id,
-    conversation_id: conversationId || null,
-    artifact_type: format,
-    title,
-    storage_path: storagePath,
-    mime_type: mime,
-    byte_size: buffer.byteLength,
+    user_id: identity.id, conversation_id: conversationId || null, artifact_type: format, title,
+    storage_path: storagePath, mime_type: mime, byte_size: buffer.byteLength,
     metadata: { generatedBy: 'SCM Intelligence Copilot' },
   }).select('id').single();
   if (insertError) {
@@ -267,8 +249,22 @@ async function extractDocument(buffer: Buffer, filename: string, mimeType: strin
     return result.value.trim();
   }
   if (ext === 'xlsx' || ext === 'xls') {
-    const workbook = XLSX.read(buffer, { type: 'buffer' });
-    const parts = workbook.SheetNames.map((name) => `SHEET: ${name}\n${XLSX.utils.sheet_to_csv(workbook.Sheets[name])}`);
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(buffer as any);
+    const parts: string[] = [];
+    workbook.eachSheet((sheet) => {
+      const rows: string[] = [];
+      sheet.eachRow({ includeEmpty: false }, (row) => {
+        const values = Array.isArray(row.values) ? row.values.slice(1) : [];
+        rows.push(values.map((value: any) => {
+          if (value == null) return '';
+          if (typeof value === 'object' && 'text' in value) return String(value.text || '');
+          if (typeof value === 'object' && 'result' in value) return String(value.result ?? '');
+          return String(value);
+        }).join(','));
+      });
+      parts.push(`SHEET: ${sheet.name}\n${rows.join('\n')}`);
+    });
     return parts.join('\n\n').trim();
   }
   if (['txt', 'md', 'csv', 'json'].includes(ext) || mimeType.startsWith('text/')) return buffer.toString('utf8').trim();
@@ -306,16 +302,9 @@ export async function ingestDocument(req: any) {
   if (uploadError) return { status: 500, body: { error: 'The source document could not be stored securely.' } };
 
   const { data: document, error: insertError } = await phase6Supabase.from('spip_ai_documents').insert({
-    user_id: identity.id,
-    workspace_id: workspaceId,
-    conversation_id: conversationId,
-    filename,
-    mime_type: mimeType,
-    storage_path: storagePath,
-    byte_size: buffer.byteLength,
-    sha256: hash,
-    extracted_text: extractedText,
-    extraction_status: 'READY',
+    user_id: identity.id, workspace_id: workspaceId, conversation_id: conversationId, filename,
+    mime_type: mimeType, storage_path: storagePath, byte_size: buffer.byteLength, sha256: hash,
+    extracted_text: extractedText, extraction_status: 'READY',
   }).select('id, filename, mime_type, byte_size, extraction_status').single();
 
   if (insertError) {
