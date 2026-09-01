@@ -1,0 +1,23 @@
+name: Phase 6 TSC Diagnostics
+on:
+  push:
+    branches: [phase-6-ai-orchestration]
+    paths: ['.github/workflows/phase6-tsc-diagnostics.yml']
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile || bun install
+      - shell: bash
+        run: |
+          set +e
+          bunx tsc --noEmit > phase6-tsc.log 2>&1
+          cat phase6-tsc.log
+          exit 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phase6-tsc-current
+          path: phase6-tsc.log
+          retention-days: 1
