@@ -2,6 +2,15 @@ import { createRequire } from 'node:module';
 import { createClient } from '@supabase/supabase-js';
 import webpush from 'web-push';
 import crypto from 'node:crypto';
+import {
+  authenticatePhase6,
+  deleteUserConversation,
+  getUserConversation,
+  listUserConversations,
+  providerStatus,
+  runPhase6Assistant,
+} from '../src/server/phase6AiRuntime.js';
+import { generateArtifact, ingestDocument } from '../src/server/phase6ArtifactRuntime.js';
 
 const require = createRequire(import.meta.url);
 const serverModule = require('../dist/server.cjs');
@@ -274,9 +283,93 @@ async function handleNotificationHotfix(req: any, res: any, path: string) {
   return false;
 }
 
+async function handlePhase6Ai(req: any, res: any, path: string) {
+  if (path === 'gemini/assistant' && req.method === 'POST') {
+    const result = await runPhase6Assistant(req);
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(result.status).json(result.body);
+    return true;
+  }
+
+  if (path === 'ai/documents' && req.method === 'POST') {
+    try {
+      const result = await ingestDocument(req);
+      res.setHeader('Cache-Control', 'no-store');
+      res.status(result.status).json(result.body);
+    } catch (error: any) {
+      console.error('[PHASE 6 DOCUMENT ERROR]', String(error?.message || error).slice(0, 300));
+      res.status(500).json({ error: 'The source document could not be processed.' });
+    }
+    return true;
+  }
+
+  if (path === 'ai/artifacts' && req.method === 'POST') {
+    try {
+      const result = await generateArtifact(req);
+      res.setHeader('Cache-Control', 'no-store');
+      res.status(result.status).json(result.body);
+    } catch (error: any) {
+      console.error('[PHASE 6 ARTIFACT ERROR]', String(error?.message || error).slice(0, 300));
+      res.status(500).json({ error: 'The requested export could not be generated.' });
+    }
+    return true;
+  }
+
+  if (!path.startsWith('ai/')) return false;
+  const identity = await authenticatePhase6(req);
+  if (!identity) {
+    res.status(401).json({ error: 'Authentication required.' });
+    return true;
+  }
+
+  const parts = path.slice(3).split('/').filter(Boolean);
+  const aiPath = parts.join('/');
+  try {
+    if (aiPath === 'status' && req.method === 'GET') {
+      const configured = providerStatus();
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({
+        ready: configured.some((provider) => provider.configured),
+        providers: configured,
+        privacy: {
+          conversationIsolation: 'per-user',
+          directBrowserDatabaseAccess: false,
+          confidentialRoutingRequiresApproval: true,
+        },
+      });
+      return true;
+    }
+    if (aiPath === 'conversations' && req.method === 'GET') {
+      res.json(await listUserConversations(identity));
+      return true;
+    }
+    if (parts[0] === 'conversations' && parts[1] && req.method === 'GET') {
+      const conversation = await getUserConversation(identity, parts[1]);
+      if (!conversation) res.status(404).json({ error: 'Conversation not found.' });
+      else res.json(conversation);
+      return true;
+    }
+    if (parts[0] === 'conversations' && parts[1] && req.method === 'DELETE') {
+      await deleteUserConversation(identity, parts[1]);
+      res.json({ ok: true });
+      return true;
+    }
+    res.status(404).json({ error: 'Phase 6 AI endpoint not found.' });
+  } catch (error: any) {
+    console.error('[PHASE 6 API ERROR]', aiPath, String(error?.message || error).slice(0, 300));
+    res.status(500).json({ error: 'SCM Intelligence Copilot could not complete this request.' });
+  }
+  return true;
+}
+
 export default async function handler(req: any, res: any) {
   const rawPath = req.query?.path;
   const path = Array.isArray(rawPath) ? rawPath.join('/') : String(rawPath || '').replace(/^\/+/, '');
+
+  // Phase 6 AI must bypass the legacy Express/PostgreSQL availability gate. The
+  // Copilot uses authenticated Supabase + server-side AI providers and should not
+  // fail merely because an unrelated legacy DATABASE_URL is unavailable.
+  if (await handlePhase6Ai(req, res, path)) return;
 
   // Handle Phase 4 push/cron traffic before Express body-parser. Supabase pg_net sends
   // an empty POST body, which the legacy Express stack can otherwise reject as invalid JSON.
