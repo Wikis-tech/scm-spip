@@ -49,7 +49,24 @@ jobs:
           ! grep -R "process.env.CEREBRAS_API_KEY" src/pages src/components
 
       - name: TypeScript
-        run: bunx tsc --noEmit
+        id: typescript
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          bunx tsc --noEmit 2>&1 | tee phase6-tsc.log
+
+      - name: Upload TypeScript diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase6-typescript-diagnostics
+          path: phase6-tsc.log
+          retention-days: 1
+
+      - name: Enforce TypeScript success
+        if: steps.typescript.outcome != 'success'
+        run: exit 1
 
       - name: Production build
         run: bun run build
