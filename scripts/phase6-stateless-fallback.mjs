@@ -3,7 +3,6 @@ import fs from 'node:fs';
 const path = 'src/server/phase6AiRuntime.ts';
 let s = fs.readFileSync(path, 'utf8');
 
-const target = "    throw new Error(`Conversation history is temporarily unavailable (${safeCode}).`);".replace('${safeCode}', '${safeCode}');
 const literalTarget = '    throw new Error(`Conversation history is temporarily unavailable (${safeCode}).`);';
 const replacement = `    // Do not take Copilot inference offline just because history persistence is unavailable.
     // The response remains user-scoped and is returned without saved history for this turn.
