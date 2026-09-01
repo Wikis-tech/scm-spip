@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Document, HeadingLevel, Packer, Paragraph, TextRun } from 'docx';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
-import PptxGenJS from 'pptxgenjs-plus';
+import PptxGenJS from '@lofcz/pptxgenjs';
 import ExcelJS from 'exceljs-hardened';
 import mammoth from 'mammoth';
 import { authenticatePhase6, phase6Supabase } from './phase6AiRuntime.js';
