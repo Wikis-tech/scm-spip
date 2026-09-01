@@ -89,7 +89,7 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
   // SERENA AI & OUTREACH SYNTHESIZER STATES
   const [serenaQuery, setSerenaQuery] = useState('');
   const [serenaMessages, setSerenaMessages] = useState<{ sender: 'user' | 'serena', text: string }[]>([
-    { sender: 'serena', text: 'Good day! I am Serena, SCM Capital Markets AI assistant. Ask me questions about our active registry, high-scoring targets, or ask me which corporate accounts require urgent follow-ups.' }
+    { sender: 'serena', text: 'Good day. I am SCM Intelligence Copilot. Ask me about active prospects, high-scoring targets, SCM context, or which corporate accounts require follow-up.' }
   ]);
   const [isSerenaLoading, setIsSerenaLoading] = useState(false);
 
@@ -320,7 +320,7 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
       setSerenaMessages(prev => [...prev, { sender: 'serena', text: data.reply || "I encountered a lag connecting with our asset databases. Let's analyze our high score leads directly on the Prospects dashboard." }]);
     } catch (err) {
       console.error(err);
-      setSerenaMessages(prev => [...prev, { sender: 'serena', text: "Error connecting to SCM core AI models." }]);
+      setSerenaMessages(prev => [...prev, { sender: 'serena', text: "SCM Intelligence Copilot is temporarily unavailable. Please retry in a moment." }]);
     } finally {
       setIsSerenaLoading(false);
     }
@@ -1984,9 +1984,9 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
           <div className="space-y-1.5 border-b border-slate-100 pb-3">
             <h3 className="font-display font-semibold text-xs text-slate-800 flex items-center gap-1.5 uppercase tracking-wide">
               <Sparkles className="w-4 h-4 text-[#b1191f] animate-pulse" />
-              <span>Serena: SCM Institutional AI assistant</span>
+              <span>SCM Intelligence Copilot</span>
             </h3>
-            <p className="text-[10px] text-slate-500 font-medium">Ask Serena tactical recommendations about SCM money markets, private trusts, or follow-up timelines</p>
+            <p className="text-[10px] text-slate-500 font-medium">Ask Copilot for practical recommendations using approved SCM context, prospect intelligence, and follow-up history</p>
           </div>
 
           {/* Chat log wrapper */}
@@ -1994,7 +1994,7 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
             {serenaMessages.map((msg, i) => (
               <div key={i} className={`flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
                 <div className={`p-2.5 rounded-lg max-w-[85%] leading-relaxed ${msg.sender === 'user' ? 'bg-[#b1191f] text-white' : 'bg-white text-slate-705 border border-slate-200/80 shadow-xs'}`}>
-                  <span className="font-bold block text-[9px] uppercase tracking-wider mb-0.5">{msg.sender === 'user' ? 'Relationship Manager' : 'Serena AI'}</span>
+                  <span className="font-bold block text-[9px] uppercase tracking-wider mb-0.5">{msg.sender === 'user' ? 'Relationship Manager' : 'SCM Copilot'}</span>
                   <p className="whitespace-pre-wrap">{msg.text}</p>
                 </div>
               </div>
@@ -2003,7 +2003,7 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
               <div className="flex justify-start">
                 <div className="p-2.5 bg-white text-slate-600 border border-slate-200/80 rounded-lg shadow-xs flex items-center gap-2">
                   <div className="w-3 h-3 border-2 border-slate-200 border-t-[#b1191f] rounded-full animate-spin"></div>
-                  <span className="text-[10px] font-medium animate-pulse">Serena modeling portfolio outcomes...</span>
+                  <span className="text-[10px] font-medium animate-pulse">Copilot is analysing SCM context...</span>
                 </div>
               </div>
             )}
@@ -2036,7 +2036,7 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
           <div className="space-y-1.5 border-b border-slate-100 pb-3">
             <h3 className="font-display font-semibold text-xs text-slate-900 flex items-center gap-1.5 uppercase tracking-wide">
               <Mail className="w-4 h-4 text-[#b1191f]" />
-              <span>Smart Outreach Email Synthesizer (Gemini V2)</span>
+              <span>Smart Outreach Email Synthesizer</span>
             </h3>
             <p className="text-[10px] text-slate-500 font-medium">Generate high-yield cold briefs, literacy session invites, or short term placement proposals</p>
           </div>
