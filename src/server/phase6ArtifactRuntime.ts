@@ -4,7 +4,7 @@ import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import PptxGenJS from 'pptxgenjs-plus';
 import ExcelJS from 'exceljs-hardened';
 import mammoth from 'mammoth';
-import { authenticatePhase6, phase6Supabase } from './phase6AiRuntime';
+import { authenticatePhase6, phase6Supabase } from './phase6AiRuntime.js';
 
 const PRIVATE_BUCKET = 'spip-ai-private';
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
