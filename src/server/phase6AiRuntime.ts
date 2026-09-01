@@ -241,7 +241,9 @@ async function createConversation(
     const safeCode = String((error as any)?.code || 'PERSISTENCE_UNAVAILABLE').slice(0, 80);
     const safeMessage = String((error as any)?.message || 'conversation persistence unavailable').replace(/[A-Za-z0-9_-]{24,}/g, '[REDACTED]').slice(0, 220);
     console.error('[PHASE6 CONVERSATION PERSISTENCE]', safeCode, safeMessage);
-    throw new Error(`Conversation history is temporarily unavailable (${safeCode}).`);
+    // Do not take Copilot inference offline just because history persistence is unavailable.
+    // The response remains user-scoped and is returned without saved history for this turn.
+    return null;
   }
   return data.id as string;
 }
