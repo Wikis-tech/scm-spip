@@ -24,7 +24,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          grep -q "PHASE6 PERSISTENCE ERROR" src/server/phase6AiRuntime.ts
+          grep -q "Do not take Copilot inference offline just because history persistence is unavailable" src/server/phase6AiRuntime.ts
+          grep -q "PHASE6 CONVERSATION PERSISTENCE" src/server/phase6AiRuntime.ts
           ! grep -R "VITE_GROQ_API_KEY\|VITE_CEREBRAS_API_KEY\|VITE_OPENROUTER_API_KEY\|VITE_CLOUDFLARE_API_TOKEN" -n src api
           grep -q "eq('user_id', identity.id)" src/server/phase6AiRuntime.ts
       - name: TypeScript
