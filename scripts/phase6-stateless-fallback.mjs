@@ -3,120 +3,48 @@ import fs from 'node:fs';
 const path = 'src/server/phase6AiRuntime.ts';
 let s = fs.readFileSync(path, 'utf8');
 
-const originalCreate = `  const { data, error } = await supabase.from('spip_ai_conversations').insert({
-    user_id: identity.id,
-    workspace_id: workspaceId || null,
-    title,
-    mode,
-    data_classification: classification,
-  }).select('id').single();
-  if (error || !data) throw new Error('Phase 6 database migration is required before AI conversations can be saved.');
-  return data.id as string;
-}`;
+function mustReplace(label, regex, replacement) {
+  const before = s;
+  s = s.replace(regex, replacement);
+  if (s === before) throw new Error(`${label} target not found`);
+}
 
-const patchedCreate = `  const { data, error } = await supabase.from('spip_ai_conversations').insert({
-    user_id: identity.id,
-    workspace_id: workspaceId || null,
-    title,
-    mode,
-    data_classification: classification,
-  }).select('id').single();
-  if (error || !data) {
-    // Conversation persistence must never take the Copilot itself offline. The user can
-    // still receive a secure stateless answer while the persistence layer is repaired.
-    const code = String(error?.code || 'UNKNOWN').slice(0, 80);
-    const message = String(error?.message || 'AI conversation persistence unavailable')
-      .replace(/Bearer\\s+[A-Za-z0-9._-]+/gi, 'Bearer [REDACTED]')
-      .slice(0, 240);
-    console.error('[PHASE6 PERSISTENCE ERROR] createConversation', code, message);
-    return null;
-  }
-  return data.id as string;
-}`;
+mustReplace(
+  'createConversation failure',
+  /if \(error \|\| !data\) throw new Error\('Phase 6 database migration is required before AI conversations can be saved\.'\);/,
+  `if (error || !data) {\n    // Conversation persistence must never take the Copilot itself offline. The user can\n    // still receive a secure stateless answer while the persistence layer is repaired.\n    const code = String(error?.code || 'UNKNOWN').slice(0, 80);\n    const message = String(error?.message || 'AI conversation persistence unavailable')\n      .replace(/Bearer\\s+[A-Za-z0-9._-]+/gi, 'Bearer [REDACTED]')\n      .slice(0, 240);\n    console.error('[PHASE6 PERSISTENCE ERROR] createConversation', code, message);\n    return null;\n  }`,
+);
 
-if (!s.includes(originalCreate)) throw new Error('createConversation target not found');
-s = s.replace(originalCreate, patchedCreate);
+mustReplace(
+  'user message insert',
+  /\s{4}await phase6Supabase\.from\('spip_ai_messages'\)\.insert\(\{\s*conversation_id: conversationId,\s*user_id: identity\.id,\s*role: 'user',\s*content: query,\s*\}\);/m,
+  `\n    if (conversationId) {\n      const { error: userMessageError } = await phase6Supabase.from('spip_ai_messages').insert({\n        conversation_id: conversationId,\n        user_id: identity.id,\n        role: 'user',\n        content: query,\n      });\n      if (userMessageError) {\n        console.error('[PHASE6 PERSISTENCE ERROR] userMessage', String(userMessageError.code || 'UNKNOWN').slice(0, 80), String(userMessageError.message || '').slice(0, 240));\n      }\n    }`,
+);
 
-const originalUserInsert = `    await phase6Supabase.from('spip_ai_messages').insert({
-      conversation_id: conversationId,
-      user_id: identity.id,
-      role: 'user',
-      content: query,
-    });`;
+mustReplace(
+  'assistant message insert',
+  /\s{4}await phase6Supabase\.from\('spip_ai_messages'\)\.insert\(\{\s*conversation_id: conversationId,\s*user_id: identity\.id,\s*role: 'assistant',\s*content: result\.text,\s*provider: result\.provider,\s*model: result\.model,\s*citations: result\.citations,\s*input_tokens: result\.inputTokens,\s*output_tokens: result\.outputTokens,\s*latency_ms: result\.latencyMs,\s*\}\);\s*await phase6Supabase\.from\('spip_ai_conversations'\)\.update\(\{ updated_at: new Date\(\)\.toISOString\(\) \}\)\.eq\('id', conversationId\)\.eq\('user_id', identity\.id\);/m,
+  `\n    if (conversationId) {\n      const { error: assistantMessageError } = await phase6Supabase.from('spip_ai_messages').insert({\n        conversation_id: conversationId,\n        user_id: identity.id,\n        role: 'assistant',\n        content: result.text,\n        provider: result.provider,\n        model: result.model,\n        citations: result.citations,\n        input_tokens: result.inputTokens,\n        output_tokens: result.outputTokens,\n        latency_ms: result.latencyMs,\n      });\n      if (assistantMessageError) {\n        console.error('[PHASE6 PERSISTENCE ERROR] assistantMessage', String(assistantMessageError.code || 'UNKNOWN').slice(0, 80), String(assistantMessageError.message || '').slice(0, 240));\n      }\n      await phase6Supabase.from('spip_ai_conversations').update({ updated_at: new Date().toISOString() }).eq('id', conversationId).eq('user_id', identity.id);\n    }`,
+);
 
-const patchedUserInsert = `    if (conversationId) {
-      const { error: userMessageError } = await phase6Supabase.from('spip_ai_messages').insert({
-        conversation_id: conversationId,
-        user_id: identity.id,
-        role: 'user',
-        content: query,
-      });
-      if (userMessageError) {
-        console.error('[PHASE6 PERSISTENCE ERROR] userMessage', String(userMessageError.code || 'UNKNOWN').slice(0, 80), String(userMessageError.message || '').slice(0, 240));
-      }
-    }`;
-
-if (!s.includes(originalUserInsert)) throw new Error('user message insert target not found');
-s = s.replace(originalUserInsert, patchedUserInsert);
-
-const originalAssistantInsert = `    await phase6Supabase.from('spip_ai_messages').insert({
-      conversation_id: conversationId,
-      user_id: identity.id,
-      role: 'assistant',
-      content: result.text,
-      provider: result.provider,
-      model: result.model,
-      citations: result.citations,
-      input_tokens: result.inputTokens,
-      output_tokens: result.outputTokens,
-      latency_ms: result.latencyMs,
-    });
-    await phase6Supabase.from('spip_ai_conversations').update({ updated_at: new Date().toISOString() }).eq('id', conversationId).eq('user_id', identity.id);`;
-
-const patchedAssistantInsert = `    if (conversationId) {
-      const { error: assistantMessageError } = await phase6Supabase.from('spip_ai_messages').insert({
-        conversation_id: conversationId,
-        user_id: identity.id,
-        role: 'assistant',
-        content: result.text,
-        provider: result.provider,
-        model: result.model,
-        citations: result.citations,
-        input_tokens: result.inputTokens,
-        output_tokens: result.outputTokens,
-        latency_ms: result.latencyMs,
-      });
-      if (assistantMessageError) {
-        console.error('[PHASE6 PERSISTENCE ERROR] assistantMessage', String(assistantMessageError.code || 'UNKNOWN').slice(0, 80), String(assistantMessageError.message || '').slice(0, 240));
-      }
-      await phase6Supabase.from('spip_ai_conversations').update({ updated_at: new Date().toISOString() }).eq('id', conversationId).eq('user_id', identity.id);
-    }`;
-
-if (!s.includes(originalAssistantInsert)) throw new Error('assistant message insert target not found');
-s = s.replace(originalAssistantInsert, patchedAssistantInsert);
-
-const responseAnchor = `        usage: { inputTokens: result.inputTokens, outputTokens: result.outputTokens, latencyMs: result.latencyMs },`;
-if (!s.includes(responseAnchor)) throw new Error('response anchor not found');
-s = s.replace(responseAnchor, `${responseAnchor}\n        persistence: conversationId ? 'saved' : 'stateless',`);
-
-const listOriginal = `  if (error) throw error;
-  return data || [];
-}`;
-const listPatched = `  if (error) {
-    console.error('[PHASE6 PERSISTENCE ERROR] listConversations', String(error.code || 'UNKNOWN').slice(0, 80), String(error.message || '').slice(0, 240));
-    // Empty private history is safer than taking the entire Copilot offline.
-    return [];
-  }
-  return data || [];
-}`;
+mustReplace(
+  'response persistence flag',
+  /(usage: \{ inputTokens: result\.inputTokens, outputTokens: result\.outputTokens, latencyMs: result\.latencyMs \},)/,
+  `$1\n        persistence: conversationId ? 'saved' : 'stateless',`,
+);
 
 const listStart = s.indexOf('export async function listUserConversations');
 if (listStart < 0) throw new Error('listUserConversations not found');
-const beforeList = s.slice(0, listStart);
-let listTail = s.slice(listStart);
-if (!listTail.includes(listOriginal)) throw new Error('list conversation error target not found');
-listTail = listTail.replace(listOriginal, listPatched);
-s = beforeList + listTail;
+const listEnd = s.indexOf('export async function getUserConversation', listStart);
+if (listEnd < 0) throw new Error('getUserConversation boundary not found');
+let listBlock = s.slice(listStart, listEnd);
+const oldListBlock = listBlock;
+listBlock = listBlock.replace(
+  /if \(error\) throw error;\s*return data \|\| \[\];/,
+  `if (error) {\n    console.error('[PHASE6 PERSISTENCE ERROR] listConversations', String(error.code || 'UNKNOWN').slice(0, 80), String(error.message || '').slice(0, 240));\n    // Empty private history is safer than taking the entire Copilot offline.\n    return [];\n  }\n  return data || [];`,
+);
+if (listBlock === oldListBlock) throw new Error('list conversations error target not found');
+s = s.slice(0, listStart) + listBlock + s.slice(listEnd);
 
 if (!s.includes("persistence: conversationId ? 'saved' : 'stateless'")) throw new Error('persistence response flag missing');
 if (!s.includes('[PHASE6 PERSISTENCE ERROR] createConversation')) throw new Error('persistence logging missing');
