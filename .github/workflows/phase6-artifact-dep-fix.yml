@@ -1,0 +1,56 @@
+name: Phase 6 Artifact Dependency Fix
+
+on:
+  push:
+    branches: [phase-6-artifact-runtime-fix]
+    paths: ['.github/workflows/phase6-artifact-dep-fix.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: phase-6-artifact-runtime-fix
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Replace PPT library with Vercel-safe dual-module build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/server/phase6ArtifactRuntime.ts')
+          s = p.read_text()
+          s = s.replace("from 'pptxgenjs-plus';", "from '@lofcz/pptxgenjs';")
+          p.write_text(s)
+          
+          import json
+          pkg_path = Path('package.json')
+          pkg = json.loads(pkg_path.read_text())
+          deps = pkg.setdefault('dependencies', {})
+          deps.pop('pptxgenjs-plus', None)
+          deps['@lofcz/pptxgenjs'] = '^4.1.17'
+          pkg_path.write_text(json.dumps(pkg, indent=2) + '\n')
+          PY
+      - name: Install and validate
+        run: |
+          bun install
+          bunx tsc --noEmit
+          bun run build
+      - name: Commit dependency fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/server/phase6ArtifactRuntime.ts package.json bun.lock
+          if ! git diff --cached --quiet; then
+            git commit -m "fix(phase6): use Vercel-safe PPT artifact runtime"
+            git push origin HEAD:phase-6-artifact-runtime-fix
+          fi
