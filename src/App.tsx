@@ -23,6 +23,7 @@ import { WeeklyReport } from './pages/WeeklyReport';
 import { ManagementReports } from './pages/ManagementReports';
 import { ExecutiveSummary } from './pages/ExecutiveSummary';
 import { Workspaces } from './pages/Workspaces';
+import { IntelligenceCopilot } from './pages/IntelligenceCopilot';
 import { HelpCircle, Sparkles, ShieldCheck } from 'lucide-react';
 import { UserProfile, UserRole, Prospect, Contact, Activity, Meeting, DashboardMetrics, Task, NewsArticle, DiscoveredLead, StaffPerformance } from './types';
 import { registerServiceWorkerAndSubscribe, isPushSupported } from './services/pushService';
@@ -809,6 +810,8 @@ export default function App() {
             onUpdateTask={handleUpdateTask}
           />
         );
+      case 'copilot':
+        return <IntelligenceCopilot currentUser={currentUser} />;
       case 'intelligence':
         return (
           <Intelligence

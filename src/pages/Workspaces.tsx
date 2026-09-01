@@ -107,7 +107,7 @@ export const Workspaces: React.FC<WorkspacesProps> = ({
   const [presentationType, setPresentationType] = useState('Client Pitch Deck');
   const [presentationContent, setPresentationContent] = useState('');
 
-  // Serena AI Chat States
+  // SCM Intelligence Copilot Chat States
   const [serenaPrompt, setSerenaPrompt] = useState('');
   const [serenaChatHistory, setSerenaChatHistory] = useState<any[]>([]);
   const [aiGenerating, setAiGenerating] = useState(false);
@@ -414,7 +414,7 @@ export const Workspaces: React.FC<WorkspacesProps> = ({
         })
       });
 
-      // 2. Call the REAL Serena V2 backend route!
+      // 2. Call the REAL SCM Intelligence Copilot backend route!
       const res = await scmFetch('/api/gemini/assistant', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -427,7 +427,7 @@ export const Workspaces: React.FC<WorkspacesProps> = ({
 
       if (res.ok) {
         const data = await res.json();
-        const serenaResponseText = data.reply || "No response received.";
+        const serenaResponseText = data.reply || "No response was returned.";
         
         const newAiMsg = { sender: 'serena', text: serenaResponseText, timestamp: new Date().toISOString() };
         setSerenaChatHistory(prev => [...prev, newAiMsg]);
@@ -439,13 +439,13 @@ export const Workspaces: React.FC<WorkspacesProps> = ({
           body: JSON.stringify({
             userPrompt: userPromptText,
             responseText: serenaResponseText,
-            modelUsed: 'gemini-3.5-flash',
+            modelUsed: 'phase6-provider-router',
             tokens: 1500
           })
         });
       } else {
         const errorData = await res.json().catch(() => ({ error: "Server response error." }));
-        const errorText = `Error calling Serena backend: ${errorData.error || "Please try again."}`;
+        const errorText = `Copilot request failed: ${errorData.error || "Please try again."}`;
         const newAiMsg = { sender: 'serena', text: errorText, timestamp: new Date().toISOString() };
         setSerenaChatHistory(prev => [...prev, newAiMsg]);
       }
@@ -682,7 +682,7 @@ export const Workspaces: React.FC<WorkspacesProps> = ({
                   { id: 'tasks', label: 'CRM Action Items', icon: CheckSquare, count: activeWorkspaceDetail?.tasks?.filter((t: any) => !t.isCompleted).length },
                   { id: 'proposals', label: 'Investment Proposals', icon: FileSpreadsheet, count: activeWorkspaceDetail?.proposals?.length },
                   { id: 'presentations', label: 'Presentations Pitch', icon: Paperclip, count: activeWorkspaceDetail?.presentations?.length },
-                  { id: 'serena', label: 'Consult Serena AI', icon: Sparkles, highlight: true },
+                  { id: 'serena', label: 'Consult SCM Intelligence Copilot', icon: Sparkles, highlight: true },
                   { id: 'search-history', label: 'Search Inquiry Logs', icon: History, count: activeWorkspaceDetail?.searchHistory?.length },
                   { id: 'timeline', label: 'Audited Timeline Feed', icon: Clock }
                 ].map((t) => {
@@ -1219,7 +1219,7 @@ export const Workspaces: React.FC<WorkspacesProps> = ({
                   </div>
                 )}
 
-                {/* SERENA AI ASSISTANT INQUIRY BOX */}
+                {/* SCM INTELLIGENCE COPILOT ASSISTANT INQUIRY BOX */}
                 {activeTab === 'serena' && (
                   <div className="flex flex-col h-[580px]">
                     <div className="p-4 bg-slate-50 border-b border-slate-200/80 flex items-center justify-between shrink-0">
@@ -1356,7 +1356,7 @@ export const Workspaces: React.FC<WorkspacesProps> = ({
                               : 'bg-slate-50 border border-slate-200 text-slate-800 leading-relaxed font-sans whitespace-pre-wrap'
                           }`}>
                             <span className="text-[9px] uppercase tracking-wider block mb-1 font-bold opacity-60">
-                              {chat.sender === 'user' ? 'Relationship Officer' : 'Serena AI Assistant'}
+                              {chat.sender === 'user' ? 'Relationship Officer' : 'SCM Intelligence Copilot Assistant'}
                             </span>
                             <span>{chat.text}</span>
                           </div>
@@ -1379,7 +1379,7 @@ export const Workspaces: React.FC<WorkspacesProps> = ({
                     <form onSubmit={handleConsultSerena} className="p-4 bg-slate-50 border-t border-slate-200 shrink-0 flex gap-2">
                       <input
                         type="text"
-                        placeholder={`Ask Serena ${activeSerenaModule} to compile corporate briefings, write pitches, or construct proposals...`}
+                        placeholder={`Ask Copilot ${activeSerenaModule} to compile corporate briefings, write pitches, or construct proposals...`}
                         value={serenaPrompt}
                         onChange={(e) => setSerenaPrompt(e.target.value)}
                         className="flex-1 p-3 text-xs border border-slate-200 rounded-lg bg-white focus:outline-none"

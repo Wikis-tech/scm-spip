@@ -52,53 +52,19 @@ const MAX_HISTORY_MESSAGES = Math.max(4, Math.min(40, num(process.env.AI_MAX_HIS
 const MAX_CONTEXT_CHARS = Math.max(8_000, Math.min(120_000, num(process.env.AI_MAX_CONTEXT_CHARS, 48_000)));
 
 function providers(): ProviderConfig[] {
-  return [
-    {
-      id: 'groq',
-      label: 'Groq',
-      endpoint: 'https://api.groq.com/openai/v1/chat/completions',
-      apiKey: process.env.GROQ_API_KEY?.trim(),
-      model: process.env.GROQ_MODEL?.trim() || 'qwen/qwen3.8-27b',
-      confidentialAllowed: process.env.GROQ_CONFIDENTIAL_ALLOWED === 'true',
-      priority: 10,
-    },
-    {
-      id: 'cerebras',
-      label: 'Cerebras',
-      endpoint: 'https://api.cerebras.ai/v1/chat/completions',
-      apiKey: process.env.CEREBRAS_API_KEY?.trim(),
-      model: process.env.CEREBRAS_MODEL?.trim() || 'gpt-oss-120b',
-      confidentialAllowed: process.env.CEREBRAS_CONFIDENTIAL_ALLOWED === 'true',
-      priority: 20,
-    },
-    {
-      id: 'zai',
-      label: 'Z.ai',
-      endpoint: 'https://api.z.ai/api/paas/v4/chat/completions',
-      apiKey: process.env.ZAI_API_KEY?.trim(),
-      model: process.env.ZAI_MODEL?.trim() || 'glm-4.7-flash',
-      confidentialAllowed: process.env.ZAI_CONFIDENTIAL_ALLOWED === 'true',
-      priority: 30,
-    },
-    {
-      id: 'deepseek',
-      label: 'DeepSeek',
-      endpoint: 'https://api.deepseek.com/chat/completions',
-      apiKey: process.env.DEEPSEEK_API_KEY?.trim(),
-      model: process.env.DEEPSEEK_MODEL?.trim() || 'deepseek-v4-flash',
-      confidentialAllowed: process.env.DEEPSEEK_CONFIDENTIAL_ALLOWED === 'true',
-      priority: 40,
-    },
-    {
-      id: 'openrouter',
-      label: 'OpenRouter',
-      endpoint: 'https://openrouter.ai/api/v1/chat/completions',
-      apiKey: process.env.OPENROUTER_API_KEY?.trim(),
-      model: process.env.OPENROUTER_MODEL?.trim() || 'openrouter/free',
-      confidentialAllowed: false,
-      priority: 50,
-    },
-  ];
+  const registry: Record<string, ProviderConfig> = {
+    groq: { id: 'groq', label: 'Groq', endpoint: 'https://api.groq.com/openai/v1/chat/completions', apiKey: process.env.GROQ_API_KEY?.trim(), model: process.env.GROQ_MODEL?.trim() || 'openai/gpt-oss-120b', confidentialAllowed: process.env.GROQ_CONFIDENTIAL_ALLOWED === 'true', priority: 10 },
+    cerebras: { id: 'cerebras', label: 'Cerebras', endpoint: 'https://api.cerebras.ai/v1/chat/completions', apiKey: process.env.CEREBRAS_API_KEY?.trim(), model: process.env.CEREBRAS_MODEL?.trim() || 'gpt-oss-120b', confidentialAllowed: process.env.CEREBRAS_CONFIDENTIAL_ALLOWED === 'true', priority: 20 },
+    openrouter: { id: 'openrouter', label: 'OpenRouter', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: process.env.OPENROUTER_API_KEY?.trim(), model: process.env.OPENROUTER_MODEL?.trim() || 'openrouter/free', confidentialAllowed: false, priority: 30 },
+    deepseek: { id: 'deepseek', label: 'DeepSeek', endpoint: 'https://api.deepseek.com/chat/completions', apiKey: process.env.DEEPSEEK_API_KEY?.trim(), model: process.env.DEEPSEEK_MODEL?.trim() || 'deepseek-chat', confidentialAllowed: process.env.DEEPSEEK_CONFIDENTIAL_ALLOWED === 'true', priority: 40 },
+    zai: { id: 'zai', label: 'Z.ai', endpoint: 'https://api.z.ai/api/paas/v4/chat/completions', apiKey: process.env.ZAI_API_KEY?.trim(), model: process.env.ZAI_MODEL?.trim() || 'glm-4.7-flash', confidentialAllowed: process.env.ZAI_CONFIDENTIAL_ALLOWED === 'true', priority: 50 },
+  };
+  const requested = String(process.env.AI_PROVIDER_ORDER || 'groq,cerebras,openrouter,deepseek,zai').split(',').map((value) => value.trim().toLowerCase()).filter(Boolean);
+  const seen = new Set<string>();
+  const ordered: ProviderConfig[] = [];
+  for (const id of requested) { const item = registry[id]; if (item && !seen.has(id)) { ordered.push(item); seen.add(id); } }
+  for (const item of Object.values(registry).sort((a, b) => a.priority - b.priority)) { if (!seen.has(item.id)) ordered.push(item); }
+  return ordered.map((item, index) => ({ ...item, priority: index + 1 }));
 }
 
 function researchProvider(): ProviderConfig | null {
@@ -199,6 +165,14 @@ async function workspaceContext(supabase: SupabaseClient, identity: ActiveIdenti
   }
 
   return { text: blocks.join('\n\n').slice(0, MAX_CONTEXT_CHARS), workspace };
+}
+
+async function documentContext(supabase: SupabaseClient, identity: ActiveIdentity, documentIds: string[]) {
+  const safeIds = [...new Set(documentIds.filter((value) => /^[0-9a-f-]{36}$/i.test(value)))].slice(0, 6);
+  if (!safeIds.length) return '';
+  const { data, error } = await supabase.from('spip_ai_documents').select('id, filename, extracted_text, extraction_status').eq('user_id', identity.id).in('id', safeIds).eq('extraction_status', 'READY');
+  if (error) throw new Error('One or more source documents could not be loaded.');
+  return (data || []).map((doc: any) => 'SOURCE DOCUMENT: ' + doc.filename + '\n' + String(doc.extracted_text || '').slice(0, 30000)).join('\n\n').slice(0, MAX_CONTEXT_CHARS);
 }
 
 function modeInstructions(mode: AiMode): string {
@@ -460,11 +434,13 @@ export async function runPhase6Assistant(req: any) {
 
   const workspaceId = req.body?.workspaceId ? String(req.body.workspaceId) : null;
   const existingConversationId = req.body?.conversationId ? String(req.body.conversationId) : null;
+  const documentIds = Array.isArray(req.body?.documentIds) ? req.body.documentIds.map(String) : [];
 
   try {
-    const [workspace, saved] = await Promise.all([
+    const [workspace, saved, sourceDocuments] = await Promise.all([
       workspaceContext(phase6Supabase, identity, workspaceId),
       getConversationHistory(phase6Supabase, identity, existingConversationId),
+      documentContext(phase6Supabase, identity, documentIds),
     ]);
 
     if (saved.classification) classification = saved.classification;
@@ -479,7 +455,7 @@ export async function runPhase6Assistant(req: any) {
     );
 
     const messages: ChatMessage[] = [
-      { role: 'system', content: systemPrompt(identity, effectiveMode, classification, workspace.text) },
+      { role: 'system', content: systemPrompt(identity, effectiveMode, classification, [workspace.text, sourceDocuments].filter(Boolean).join('\n\n')) },
       ...saved.history,
       { role: 'user', content: query },
     ];

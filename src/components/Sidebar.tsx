@@ -13,6 +13,7 @@ import {
   TrendingUp,
   Users2,
   Award,
+  Bot,
 } from 'lucide-react';
 import { UserProfile } from '../types';
 import { ScmLogo } from './ScmLogo';
@@ -38,6 +39,7 @@ const workspaceItems: NavItem[] = [
   { id: 'prospects', label: 'Prospects', icon: Building2, activeFor: ['prospects', 'pipeline'] },
   { id: 'client-360', label: 'Clients', icon: Users2, activeFor: ['client-360', 'crm'] },
   { id: 'intelligence', label: 'Research', icon: SearchCode, activeFor: ['intelligence', 'workspaces'] },
+  { id: 'copilot', label: 'Intelligence Copilot', icon: Bot },
   { id: 'calendar', label: 'Calendar', icon: Calendar },
   { id: 'reports', label: 'Reports', icon: TrendingUp, activeFor: ['reports', 'weekly-report'] },
 ];
