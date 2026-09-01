@@ -1,0 +1,60 @@
+name: Phase 6 Remove Serena UI
+
+on:
+  push:
+    branches: [phase-6-remove-serena-ui]
+    paths: ['.github/workflows/phase6-remove-serena-ui.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: phase-6-remove-serena-ui
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Replace legacy user-facing AI branding
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/pages/Intelligence.tsx')
+          s=p.read_text()
+          replacements = {
+            "Good day! I am Serena, SCM Capital Markets AI assistant. Ask me questions about our active registry, high-scoring targets, or ask me which corporate accounts require urgent follow-ups.": "Good day. I am SCM Intelligence Copilot. Ask me about active prospects, high-scoring targets, SCM context, or which corporate accounts require follow-up.",
+            "<span>Serena: SCM Institutional AI assistant</span>": "<span>SCM Intelligence Copilot</span>",
+            "Ask Serena tactical recommendations about SCM money markets, private trusts, or follow-up timelines": "Ask Copilot for practical recommendations using approved SCM context, prospect intelligence, and follow-up history",
+            "'Serena AI'": "'SCM Copilot'",
+            "Serena modeling portfolio outcomes...": "Copilot is analysing SCM context...",
+            "Smart Outreach Email Synthesizer (Gemini V2)": "Smart Outreach Email Synthesizer",
+            "Error connecting to SCM core AI models.": "SCM Intelligence Copilot is temporarily unavailable. Please retry in a moment."
+          }
+          for old,new in replacements.items():
+            if old not in s:
+              print('warning: string not found:', old)
+            s=s.replace(old,new)
+          p.write_text(s)
+          PY
+      - name: Validate UI and production build
+        run: |
+          bun install --frozen-lockfile
+          bunx tsc --noEmit
+          bun run build
+      - name: Commit UI retirement
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/pages/Intelligence.tsx
+          if ! git diff --cached --quiet; then
+            git commit -m "fix(phase6): retire remaining Serena and provider branding"
+            git push origin HEAD:phase-6-remove-serena-ui
+          fi
