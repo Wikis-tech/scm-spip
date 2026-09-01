@@ -1,4 +1,4 @@
-import { runPhase6Assistant } from '../../src/server/phase6AiRuntime';
+import { runPhase6Assistant } from '../../src/server/phase6AiRuntime.js';
 
 export default async function handler(req: any, res: any) {
   if (req.method !== 'POST') {

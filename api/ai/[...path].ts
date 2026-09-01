@@ -4,7 +4,7 @@ import {
   getUserConversation,
   listUserConversations,
   providerStatus,
-} from '../../src/server/phase6AiRuntime';
+} from '../../src/server/phase6AiRuntime.js';
 
 export default async function handler(req: any, res: any) {
   res.setHeader('Cache-Control', 'no-store');

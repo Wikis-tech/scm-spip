@@ -1,0 +1,44 @@
+name: Phase 6 Runtime Hotfix
+on:
+  push:
+    branches: [phase-6-runtime-hotfix]
+    paths: ['.github/workflows/phase6-runtime-hotfix.yml']
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: phase-6-runtime-hotfix
+          fetch-depth: 0
+      - name: Fix ESM local runtime imports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/server/phase6ArtifactRuntime.ts')
+          s=p.read_text()
+          old="from './phase6AiRuntime';"
+          new="from './phase6AiRuntime.js';"
+          if old in s:
+              p.write_text(s.replace(old,new))
+          PY
+      - name: Validate TypeScript and build
+        run: |
+          npm install
+          npx tsc --noEmit
+          npm run build
+      - name: Commit hotfix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/server/phase6ArtifactRuntime.ts
+          if ! git diff --cached --quiet; then
+            git commit -m "fix(phase6): resolve nested Vercel ESM runtime import [phase6-runtime-fix]"
+            git push origin HEAD:phase-6-runtime-hotfix
+          fi

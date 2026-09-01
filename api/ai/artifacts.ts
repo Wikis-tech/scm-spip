@@ -1,4 +1,4 @@
-import { generateArtifact } from '../../src/server/phase6ArtifactRuntime';
+import { generateArtifact } from '../../src/server/phase6ArtifactRuntime.js';
 
 export default async function handler(req: any, res: any) {
   res.setHeader('Cache-Control', 'no-store');
