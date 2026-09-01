@@ -1,0 +1,80 @@
+name: Phase 6 Complete Implementation
+
+on:
+  push:
+    branches: [phase-6-ai-orchestration]
+
+permissions:
+  contents: write
+
+jobs:
+  complete:
+    if: ${{ !contains(github.event.head_commit.message, '[phase6-complete]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: phase-6-ai-orchestration
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Apply Phase 6 completion patch
+        run: node scripts/phase6-complete.mjs
+
+      - name: Resolve dependency graph and lockfile
+        run: bun install
+
+      - name: Phase 6 security and architecture assertions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f src/pages/IntelligenceCopilot.tsx
+          test -f src/server/phase6ArtifactRuntime.ts
+          test -f api/ai/artifacts.ts
+          test -f api/ai/documents.ts
+          grep -q "AI_PROVIDER_ORDER" src/server/phase6AiRuntime.ts
+          grep -q "documentIds" src/server/phase6AiRuntime.ts
+          grep -q "eq('user_id', identity.id)" src/server/phase6AiRuntime.ts
+          grep -q "eq('user_id', identity.id)" src/server/phase6ArtifactRuntime.ts
+          grep -q "spip-ai-private" src/server/phase6ArtifactRuntime.ts
+          grep -q "Intelligence Copilot" src/components/Sidebar.tsx
+          grep -q "case 'copilot'" src/App.tsx
+          grep -q "openrouter" src/server/phase6AiRuntime.ts
+          grep -q "CEREBRAS_API_KEY" src/server/phase6AiRuntime.ts
+          grep -q "GROQ_API_KEY" src/server/phase6AiRuntime.ts
+          ! grep -R "VITE_GROQ_API_KEY\|VITE_CEREBRAS_API_KEY\|VITE_OPENROUTER_API_KEY" src api
+          ! grep -R "process.env.GROQ_API_KEY" src/pages src/components
+          ! grep -R "process.env.CEREBRAS_API_KEY" src/pages src/components
+
+      - name: TypeScript
+        run: bunx tsc --noEmit
+
+      - name: Production build
+        run: bun run build
+
+      - name: Dependency security audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun audit > /tmp/audit.txt 2>&1 || true
+          cat /tmp/audit.txt
+          if grep -Eiq '(^|[^a-z])(critical|high)([^a-z]|$)' /tmp/audit.txt; then
+            echo 'High or critical dependency advisory detected.' >&2
+            exit 1
+          fi
+
+      - name: Commit completed Phase 6 implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/server/phase6AiRuntime.ts src/App.tsx src/components/Sidebar.tsx src/pages/Workspaces.tsx .env.example package.json bun.lock
+          if git diff --cached --quiet; then
+            echo "No generated changes to commit."
+          else
+            git commit -m "feat: complete Phase 6 Copilot integration [phase6-complete]"
+            git push origin HEAD:phase-6-ai-orchestration
+          fi
