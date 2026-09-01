@@ -56,11 +56,11 @@ function providers(): ProviderConfig[] {
     groq: { id: 'groq', label: 'Groq', endpoint: 'https://api.groq.com/openai/v1/chat/completions', apiKey: process.env.GROQ_API_KEY?.trim(), model: process.env.GROQ_MODEL?.trim() || 'openai/gpt-oss-120b', confidentialAllowed: process.env.GROQ_CONFIDENTIAL_ALLOWED === 'true', priority: 10 },
     cerebras: { id: 'cerebras', label: 'Cerebras', endpoint: 'https://api.cerebras.ai/v1/chat/completions', apiKey: process.env.CEREBRAS_API_KEY?.trim(), model: process.env.CEREBRAS_MODEL?.trim() || 'gpt-oss-120b', confidentialAllowed: process.env.CEREBRAS_CONFIDENTIAL_ALLOWED === 'true', priority: 20 },
     openrouter: { id: 'openrouter', label: 'OpenRouter', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: process.env.OPENROUTER_API_KEY?.trim(), model: process.env.OPENROUTER_MODEL?.trim() || 'openrouter/free', confidentialAllowed: process.env.OPENROUTER_CONFIDENTIAL_ALLOWED === 'true', priority: 30 },
-    cloudflare: { id: 'cloudflare', label: 'Cloudflare Workers AI', endpoint: process.env.CLOUDFLARE_ACCOUNT_ID?.trim() ? `https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID.trim()}/ai/v1/chat/completions` : '', apiKey: process.env.CLOUDFLARE_ACCOUNT_ID?.trim() ? process.env.CLOUDFLARE_API_TOKEN?.trim() : undefined, model: process.env.CLOUDFLARE_MODEL?.trim() || '@cf/openai/gpt-oss-120b', confidentialAllowed: process.env.CLOUDFLARE_CONFIDENTIAL_ALLOWED === 'true', priority: 40 },
+    cloudflare: { id: 'cloudflare', label: 'Cloudflare Workers AI', endpoint: process.env.CLOUDFLARE_ACCOUNT_ID?.trim() ? `https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID.trim()}/ai/v1/chat/completions` : '', apiKey: process.env.CLOUDFLARE_ACCOUNT_ID?.trim() ? process.env.CLOUDFLARE_API_TOKEN?.trim() : undefined, model: process.env.CLOUDFLARE_MODEL?.trim() || '@cf/openai/gpt-oss-20b', confidentialAllowed: process.env.CLOUDFLARE_CONFIDENTIAL_ALLOWED === 'true', priority: 40 },
     deepseek: { id: 'deepseek', label: 'DeepSeek', endpoint: 'https://api.deepseek.com/chat/completions', apiKey: process.env.DEEPSEEK_API_KEY?.trim(), model: process.env.DEEPSEEK_MODEL?.trim() || 'deepseek-chat', confidentialAllowed: process.env.DEEPSEEK_CONFIDENTIAL_ALLOWED === 'true', priority: 50 },
     zai: { id: 'zai', label: 'Z.ai', endpoint: 'https://api.z.ai/api/paas/v4/chat/completions', apiKey: process.env.ZAI_API_KEY?.trim(), model: process.env.ZAI_MODEL?.trim() || 'glm-4.7-flash', confidentialAllowed: process.env.ZAI_CONFIDENTIAL_ALLOWED === 'true', priority: 60 },
   };
-  const requested = String(process.env.AI_PROVIDER_ORDER || 'groq,cerebras,openrouter,cloudflare,deepseek,zai').split(',').map((value) => value.trim().toLowerCase()).filter(Boolean);
+  const requested = String(process.env.AI_PROVIDER_ORDER || 'groq,cerebras,cloudflare,openrouter,deepseek,zai').split(',').map((value) => value.trim().toLowerCase()).filter(Boolean);
   const seen = new Set<string>();
   const ordered: ProviderConfig[] = [];
   for (const id of requested) { const item = registry[id]; if (item && !seen.has(id)) { ordered.push(item); seen.add(id); } }
@@ -296,7 +296,9 @@ async function providerAvailable(supabase: SupabaseClient, provider: ProviderCon
   if (!provider.apiKey) return false;
   const health = await providerHealth(supabase, provider.id);
   if (!health) return true;
-  if (health.status === 'DISABLED') return false;
+  // Recover providers disabled by older Phase 6 builds. Invalid credentials/model errors are now
+  // handled with cooldowns instead of permanent disablement, so a corrected key/model can recover.
+  if (health.status === 'DISABLED') return true;
   if (health.status === 'COOLDOWN' && health.cooldown_until) {
     return new Date(health.cooldown_until).getTime() <= Date.now();
   }
@@ -388,13 +390,19 @@ async function routeAcrossProviders(
       const code = status ? `HTTP_${status}` : error?.name === 'AbortError' ? 'TIMEOUT' : 'NETWORK_OR_PROVIDER_ERROR';
       errors.push(`${provider.label}: ${code}`);
 
-      // Invalid credentials/configuration should not be retried as a quota failure.
-      if (status === 400 || status === 401 || status === 403 || status === 404) {
-        await markProviderFailure(supabase, provider.id, code, 0, true);
-      } else {
-        const cooldown = status === 429 ? Number(error?.retryAfterMs || 300_000) : Math.min(30 * 60_000, 90_000 * (1 + errors.length));
-        await markProviderFailure(supabase, provider.id, code, cooldown, false);
-      }
+      const safeMessage = String(error?.message || '').replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [REDACTED]').slice(0, 220);
+      console.warn('[PHASE6 PROVIDER FAILURE]', provider.id, code, safeMessage);
+
+      // Never permanently disable a configured provider. A key/model can be corrected in Vercel
+      // without touching the database, and the router must automatically recover afterwards.
+      const cooldown = status === 429
+        ? Number(error?.retryAfterMs || 300_000)
+        : (status === 401 || status === 403)
+          ? 30 * 60_000
+          : (status === 400 || status === 404)
+            ? 10 * 60_000
+            : Math.min(30 * 60_000, 90_000 * (1 + errors.length));
+      await markProviderFailure(supabase, provider.id, code, cooldown, false);
     }
   }
 
