@@ -69,7 +69,18 @@ function inlineParts(text: string) {
 }
 
 function splitTableRow(line: string) {
-  return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim());
+  const value = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+  const cells: string[] = [];
+  let current = '';
+  let escaped = false;
+  for (const char of value) {
+    if (escaped) { current += char; escaped = false; }
+    else if (char === '\\') escaped = true;
+    else if (char === '|') { cells.push(current.trim()); current = ''; }
+    else current += char;
+  }
+  cells.push(current.trim());
+  return cells;
 }
 
 function isTableSeparator(line: string) {
@@ -121,12 +132,12 @@ function RichMessage({ content }: { content: string }) {
         <div key={`t-${nodes.length}`} className="my-3 overflow-x-auto rounded-xl border border-slate-200 bg-white">
           <table className="min-w-full border-collapse text-left text-xs">
             <thead className="bg-slate-50 text-slate-700">
-              <tr>{headers.map((cell, idx) => <th key={idx} className="border-b border-slate-200 px-3 py-2 font-semibold">{inlineParts(cell)}</th>)}</tr>
+              <tr>{headers.map((cell, idx) => <th key={idx} className="border border-slate-300 px-3 py-2 font-semibold">{inlineParts(cell)}</th>)}</tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {rows.map((row, rowIndex) => (
                 <tr key={rowIndex} className="align-top">
-                  {headers.map((_, cellIndex) => <td key={cellIndex} className="px-3 py-2 text-slate-700">{inlineParts(row[cellIndex] || '')}</td>)}
+                  {headers.map((_, cellIndex) => <td key={cellIndex} className="border border-slate-200 px-3 py-2 text-slate-700">{inlineParts(row[cellIndex] || '')}</td>)}
                 </tr>
               ))}
             </tbody>
@@ -421,7 +432,7 @@ export const IntelligenceCopilot: React.FC<IntelligenceCopilotProps> = ({ curren
             <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-full border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50">
               {uploading ? <Upload className="h-3.5 w-3.5 animate-pulse" /> : <Paperclip className="h-3.5 w-3.5" />}
               {uploading ? 'Processing…' : 'Add source document'}
-              <input type="file" className="hidden" accept=".docx,.xlsx,.csv,.txt,.md,.json" onChange={(e) => { const file = e.target.files?.[0]; if (file) uploadSource(file); e.currentTarget.value = ''; }} />
+              <input type="file" className="hidden" accept=".docx,.pptx,.xlsx,.csv,.txt,.md,.json" onChange={(e) => { const file = e.target.files?.[0]; if (file) uploadSource(file); e.currentTarget.value = ''; }} />
             </label>
             {documents.map((doc) => <span key={doc.id} className="rounded-full bg-slate-100 px-2.5 py-1 text-[10px] text-slate-600">{doc.filename}</span>)}
             {configuredProviders.length > 0 && <span className="ml-auto text-[10px] text-slate-400">Router: {configuredProviders.map((provider) => provider.label).join(' → ')}</span>}

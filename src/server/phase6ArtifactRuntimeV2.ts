@@ -20,7 +20,18 @@ function safeName(input: string, fallback: string) {
 }
 
 function splitTableRow(line: string) {
-  return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim());
+  const value = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+  const cells: string[] = [];
+  let current = '';
+  let escaped = false;
+  for (const char of value) {
+    if (escaped) { current += char; escaped = false; }
+    else if (char === '\\') escaped = true;
+    else if (char === '|') { cells.push(current.trim()); current = ''; }
+    else current += char;
+  }
+  cells.push(current.trim());
+  return cells;
 }
 
 function isSeparatorRow(line: string) {
@@ -116,8 +127,11 @@ async function renderPdf(title: string, content: string) {
   const margin = 48;
   let page = pdf.addPage(pageSize);
   let y = pageSize[1] - margin;
+  const pdfSafe = (text: string) => text
+    .replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/[–—]/g, '-')
+    .replace(/•/g, '-').replace(/…/g, '...').replace(/[^\x20-\x7E\n]/g, '');
   const add = (text: string, size = 10, isBold = false, indent = 0) => {
-    for (const line of wrapText(text, indent ? 82 : 90)) {
+    for (const line of wrapText(pdfSafe(text), indent ? 82 : 90)) {
       if (y < 60) { page = pdf.addPage(pageSize); y = pageSize[1] - margin; }
       page.drawText(line, { x: margin + indent, y, size, font: isBold ? bold : regular, color: rgb(0.05, 0.1, 0.17) });
       y -= size + 5;
@@ -129,7 +143,7 @@ async function renderPdf(title: string, content: string) {
   for (const block of parseBlocks(content)) {
     if (block.type === 'heading') add(block.text, block.level === 1 ? 14 : 12, true);
     else if (block.type === 'paragraph') add(block.text);
-    else if (block.type === 'bullet') add(`• ${block.text}`, 10, false, 10);
+    else if (block.type === 'bullet') add(`- ${block.text}`, 10, false, 10);
     else {
       add(block.headers.join(' | '), 9, true);
       block.rows.forEach((row) => add(row.join(' | '), 9));
@@ -215,7 +229,7 @@ async function renderXlsx(title: string, content: string) {
   return Buffer.from(data as any);
 }
 
-async function renderArtifact(format: ArtifactFormat, title: string, content: string) {
+export async function renderArtifact(format: ArtifactFormat, title: string, content: string) {
   if (format === 'docx') return { buffer: await renderDocx(title, content), mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' };
   if (format === 'pdf') return { buffer: await renderPdf(title, content), mime: 'application/pdf' };
   if (format === 'pptx') return { buffer: await renderPptx(title, content), mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' };
