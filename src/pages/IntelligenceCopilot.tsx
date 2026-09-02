@@ -421,7 +421,7 @@ export const IntelligenceCopilot: React.FC<IntelligenceCopilotProps> = ({ curren
             <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-full border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50">
               {uploading ? <Upload className="h-3.5 w-3.5 animate-pulse" /> : <Paperclip className="h-3.5 w-3.5" />}
               {uploading ? 'Processing…' : 'Add source document'}
-              <input type="file" className="hidden" accept=".docx,.xlsx,.xls,.csv,.txt,.md,.json" onChange={(e) => { const file = e.target.files?.[0]; if (file) uploadSource(file); e.currentTarget.value = ''; }} />
+              <input type="file" className="hidden" accept=".docx,.xlsx,.csv,.txt,.md,.json" onChange={(e) => { const file = e.target.files?.[0]; if (file) uploadSource(file); e.currentTarget.value = ''; }} />
             </label>
             {documents.map((doc) => <span key={doc.id} className="rounded-full bg-slate-100 px-2.5 py-1 text-[10px] text-slate-600">{doc.filename}</span>)}
             {configuredProviders.length > 0 && <span className="ml-auto text-[10px] text-slate-400">Router: {configuredProviders.map((provider) => provider.label).join(' → ')}</span>}

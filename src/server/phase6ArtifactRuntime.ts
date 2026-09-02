@@ -257,7 +257,7 @@ async function extractDocument(buffer: Buffer, filename: string, mimeType: strin
     const result = await mammoth.extractRawText({ buffer });
     return result.value.trim();
   }
-  if (ext === 'xlsx' || ext === 'xls') {
+  if (ext === 'xlsx') {
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.load(buffer as any);
     const parts: string[] = [];

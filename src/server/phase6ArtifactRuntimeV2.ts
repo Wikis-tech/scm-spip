@@ -174,13 +174,18 @@ async function renderPptx(title: string, content: string) {
     slide.addText(section.title, { x: 0.7, y: 0.45, w: 12, h: 0.55, fontSize: 22, bold: true, color: '091B2D' });
     slide.addShape(pptx.ShapeType.line, { x: 0.7, y: 1.12, w: 12, h: 0, line: { color: 'B1191F', width: 2 } });
     if (section.table) {
-      slide.addTable([section.table.headers, ...section.table.rows], {
+      const tableRows = [section.table.headers, ...section.table.rows]
+        .map((row) => row.map((cell) => ({ text: cell })));
+      slide.addTable(tableRows, {
         x: 0.8, y: 1.5, w: 11.7, h: 4.8, border: { color: 'CBD5E1', pt: 1 },
-        color: '334155', fontSize: 12, rowH: 0.45, fill: 'FFFFFF',
+        color: '334155', fontSize: 12, rowH: 0.45, fill: { color: 'FFFFFF' },
       });
     } else {
-      const body = section.items.slice(0, 10).map((text) => ({ text, options: { breakLine: true, bullet: text.startsWith('• ') ? { indent: 14 } : false } }));
-      slide.addText(body, { x: 0.85, y: 1.5, w: 11.5, h: 5.2, fontSize: 16, color: '334155', valign: 'top', margin: 0.08, breakLine: false, paraSpaceAfterPt: 10 });
+      const body = section.items.slice(0, 10).map((text) => ({
+        text: text.startsWith('• ') ? text.slice(2) : text,
+        options: { breakLine: true, bullet: text.startsWith('• ') ? { indent: 14 } : false },
+      }));
+      slide.addText(body, { x: 0.85, y: 1.5, w: 11.5, h: 5.2, fontSize: 16, color: '334155', valign: 'top', margin: 0.08, breakLine: false, paraSpaceAfter: 10 });
     }
     slide.addText('SCM Capital Asset Management', { x: 0.85, y: 7.05, w: 5, h: 0.2, fontSize: 8, color: '94A3B8' });
   });
