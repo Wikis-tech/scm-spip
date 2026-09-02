@@ -29,11 +29,11 @@
     "nodemailer": "^9.0.0",
     "pdf-lib": "^1.17.1",
     "pg": "^8.21.0",
+    "pptxgenjs": "^4.0.1",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "recharts": "^3.1.2",
-    "web-push": "^3.6.7",
-    "@lofcz/pptxgenjs": "^4.1.17"
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
