@@ -1,4 +1,4 @@
-import PptxGenJS from 'pptxgenjs';
+import { createRequire } from 'node:module';
 import { Document, HeadingLevel, Packer, Paragraph, Table, TableCell, TableRow, TextRun, WidthType } from 'docx';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import ExcelJS from 'exceljs-hardened';
@@ -6,6 +6,7 @@ import { authenticatePhase6, phase6Supabase } from './phase6AiRuntime.js';
 
 const PRIVATE_BUCKET = 'spip-ai-private';
 const MAX_ARTIFACT_CHARS = 120_000;
+const nodeRequire = createRequire(import.meta.url);
 
 type ArtifactFormat = 'docx' | 'pdf' | 'pptx' | 'xlsx' | 'txt';
 type Block =
@@ -153,6 +154,11 @@ async function renderPdf(title: string, content: string) {
 }
 
 async function renderPptx(title: string, content: string) {
+  // Vercel compiles this API entry as CommonJS. Loading the package through
+  // createRequire selects its declared CJS export and, importantly, avoids
+  // crashing every API route while the module is initialised.
+  const pptxModule = nodeRequire('pptxgenjs');
+  const PptxGenJS: any = pptxModule.default || pptxModule;
   const pptx = new PptxGenJS();
   pptx.layout = 'LAYOUT_WIDE';
   pptx.author = 'SCM Intelligence Copilot';
