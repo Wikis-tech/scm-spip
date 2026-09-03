@@ -195,7 +195,7 @@ async function workspaceContext(supabase: SupabaseClient, identity: ActiveIdenti
       const safeProspect = {
         name: prospect.name,
         industry: prospect.industry,
-        organizationType: prospect.organization_type,
+        organizationType: prospect.org_type,
         website: prospect.website,
         location: prospect.location,
         status: prospect.status,
