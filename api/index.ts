@@ -10,7 +10,8 @@ import {
   providerStatus,
   runPhase6Assistant,
 } from '../src/server/phase6AiRuntime.js';
-import { generateArtifact, ingestDocument } from '../src/server/phase6ArtifactRuntime.js';
+import { ingestDocument } from '../src/server/phase6ArtifactRuntime.js';
+import { generateArtifactV2 } from '../src/server/phase6ArtifactRuntimeV2.js';
 
 const require = createRequire(import.meta.url);
 const serverModule = require('../dist/server.cjs');
@@ -305,7 +306,7 @@ async function handlePhase6Ai(req: any, res: any, path: string) {
 
   if (path === 'ai/artifacts' && req.method === 'POST') {
     try {
-      const result = await generateArtifact(req);
+      const result = await generateArtifactV2(req);
       res.setHeader('Cache-Control', 'no-store');
       res.status(result.status).json(result.body);
     } catch (error: any) {
