@@ -131,13 +131,57 @@ async function renderPdf(title: string, content: string) {
   const pdfSafe = (text: string) => text
     .replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/[–—]/g, '-')
     .replace(/•/g, '-').replace(/…/g, '...').replace(/[^\x20-\x7E\n]/g, '');
+  const newPage = () => { page = pdf.addPage(pageSize); y = pageSize[1] - margin; };
+  const ensureSpace = (height: number) => { if (y - height < margin) newPage(); };
   const add = (text: string, size = 10, isBold = false, indent = 0) => {
     for (const line of wrapText(pdfSafe(text), indent ? 82 : 90)) {
-      if (y < 60) { page = pdf.addPage(pageSize); y = pageSize[1] - margin; }
+      if (y < 60) newPage();
       page.drawText(line, { x: margin + indent, y, size, font: isBold ? bold : regular, color: rgb(0.05, 0.1, 0.17) });
       y -= size + 5;
     }
     y -= 3;
+  };
+  const addTable = (headers: string[], rows: string[][]) => {
+    const columnCount = Math.max(1, headers.length);
+    const tableWidth = pageSize[0] - (margin * 2);
+    const columnWidth = tableWidth / columnCount;
+    const fontSize = columnCount > 4 ? 7 : 8.5;
+    const lineHeight = fontSize + 3;
+    const horizontalPadding = 5;
+    const charsPerLine = Math.max(8, Math.floor((columnWidth - horizontalPadding * 2) / (fontSize * 0.52)));
+
+    const drawRow = (cells: string[], header: boolean) => {
+      const wrapped = headers.map((_, index) => wrapText(pdfSafe(cells[index] || ''), charsPerLine).slice(0, 8));
+      const rowHeight = Math.max(24, Math.max(...wrapped.map((lines) => lines.length), 1) * lineHeight + 10);
+      ensureSpace(rowHeight);
+      const rowBottom = y - rowHeight;
+      wrapped.forEach((lines, index) => {
+        const x = margin + index * columnWidth;
+        page.drawRectangle({
+          x, y: rowBottom, width: columnWidth, height: rowHeight,
+          color: header ? rgb(0.94, 0.96, 0.98) : rgb(1, 1, 1),
+          borderColor: rgb(0.62, 0.68, 0.75), borderWidth: 0.7,
+        });
+        lines.forEach((line, lineIndex) => page.drawText(line, {
+          x: x + horizontalPadding,
+          y: y - 8 - fontSize - lineIndex * lineHeight,
+          size: fontSize,
+          font: header ? bold : regular,
+          color: rgb(0.05, 0.1, 0.17),
+        }));
+      });
+      y = rowBottom;
+    };
+
+    drawRow(headers, true);
+    rows.forEach((row) => {
+      if (y < margin + 30) {
+        newPage();
+        drawRow(headers, true);
+      }
+      drawRow(row, false);
+    });
+    y -= 12;
   };
   add(title, 18, true);
   add('SCM Capital Asset Management', 10, true);
@@ -145,10 +189,7 @@ async function renderPdf(title: string, content: string) {
     if (block.type === 'heading') add(block.text, block.level === 1 ? 14 : 12, true);
     else if (block.type === 'paragraph') add(block.text);
     else if (block.type === 'bullet') add(`- ${block.text}`, 10, false, 10);
-    else {
-      add(block.headers.join(' | '), 9, true);
-      block.rows.forEach((row) => add(row.join(' | '), 9));
-    }
+    else addTable(block.headers, block.rows);
   }
   return Buffer.from(await pdf.save());
 }

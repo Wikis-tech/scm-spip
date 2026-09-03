@@ -1,4 +1,5 @@
 import { renderArtifact } from '../src/server/phase6ArtifactRuntimeV2.js';
+import { mkdirSync, writeFileSync } from 'node:fs';
 
 const content = `# FCMB Proposal
 Human-ready draft — verified.
@@ -18,6 +19,10 @@ async function main() {
       const signature = result.buffer.subarray(0, 4).toString('hex');
       if (format === 'pdf' && signature !== '25504446') throw new Error('Invalid PDF signature');
       if (format !== 'pdf' && signature !== '504b0304') throw new Error(`Invalid ${format} ZIP signature`);
+      if (pass === 1 && format === 'pdf' && process.env.PHASE6_PDF_PREVIEW) {
+        mkdirSync('tmp/pdfs', { recursive: true });
+        writeFileSync('tmp/pdfs/phase6-table-preview.pdf', result.buffer);
+      }
       console.log(`pass=${pass} format=${format} bytes=${result.buffer.length} signature=${signature}`);
     }
   }
