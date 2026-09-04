@@ -5,6 +5,8 @@ import { AuthScreen } from './components/AuthScreen';
 import { TrustHelpCenter } from './components/TrustHelpCenter';
 import { OnboardingWizard } from './components/OnboardingWizard';
 import { MeetingReminderManager } from './components/MeetingReminderManager';
+import { MobileNavigation } from './components/MobileNavigation';
+import { PwaExperience } from './components/PwaExperience';
 import { Dashboard } from './pages/Dashboard';
 import { Prospects } from './pages/Prospects';
 import { Intelligence } from './pages/Intelligence';
@@ -27,12 +29,14 @@ import { Workspaces } from './pages/Workspaces';
 import { IntelligenceCopilot } from './pages/IntelligenceCopilot';
 import { AlertTriangle, HelpCircle, RefreshCw, Sparkles, ShieldCheck } from 'lucide-react';
 import { UserProfile, UserRole, Prospect, Contact, Activity, Meeting, DashboardMetrics, Task, NewsArticle, DiscoveredLead, StaffPerformance } from './types';
-import { registerServiceWorkerAndSubscribe, isPushSupported } from './services/pushService';
 import { supabase } from './lib/supabase';
 
 export default function App() {
   // Navigation states
-  const [activeTab, setActiveTab] = useState<string>('dashboard');
+  const [activeTab, setActiveTab] = useState<string>(() => {
+    const requested = new URLSearchParams(window.location.search).get('view');
+    return ['dashboard', 'prospects', 'copilot', 'analytics'].includes(requested || '') ? requested! : 'dashboard';
+  });
   const [crmSubTab, setCrmSubTab] = useState<string>('contacts');
   const [searchTerm, setSearchTerm] = useState<string>('');
   
@@ -127,23 +131,6 @@ export default function App() {
       data.subscription.unsubscribe();
     };
   }, []);
-
-  // Auto-register background service worker and push subscription for authenticated user
-  useEffect(() => {
-    if (currentUser && isPushSupported()) {
-      if (Notification.permission !== 'denied') {
-        registerServiceWorkerAndSubscribe(currentUser.id, currentUser.email, currentUser.role)
-          .then((success) => {
-            if (success) {
-              console.log('[PUSH SERVICE] Successfully auto-registered and synchronized web push subscription.');
-            }
-          })
-          .catch((err) => {
-            console.error('[PUSH SERVICE ERROR] Failed to register or synchronize:', err);
-          });
-      }
-    }
-  }, [currentUser]);
 
   // SCM CRM Database states
   const [metrics, setMetrics] = useState<DashboardMetrics>({
@@ -986,7 +973,7 @@ export default function App() {
       </div>
 
       {/* Floating Unified Help & Onboarding Trigger (Phase 9 & 10) */}
-      <div className="fixed bottom-4 right-4 z-40 flex items-center gap-2 sm:bottom-6 sm:right-6">
+      <div className="fixed bottom-[calc(5rem+env(safe-area-inset-bottom))] right-3 z-30 flex items-center gap-2 md:bottom-6 md:right-6 md:z-40">
         <button
           id="global-onboarding-restart-btn"
           onClick={() => setOnboardingActive(true)}
@@ -1028,6 +1015,12 @@ export default function App() {
 
       {/* SCM Browser-Based Meeting Reminders Engine */}
       <MeetingReminderManager meetings={meetings} />
+      <PwaExperience />
+      <MobileNavigation
+        activeTab={activeTab}
+        onNavigate={(tab) => { setActiveTab(tab); setSidebarCollapsed(true); }}
+        onMore={() => setSidebarCollapsed(false)}
+      />
     </div>
   );
 }
