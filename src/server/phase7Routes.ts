@@ -230,6 +230,7 @@ export function registerPhase7Routes(app: Express, supabase: SupabaseClient) {
     res.setHeader('Cache-Control', 'no-store');
     return res.json({
       logoUrl: data?.value?.logoUrl || '',
+      faviconUrl: data?.value?.faviconUrl || '',
       organisationName: data?.value?.organisationName || 'SCM CAPITAL',
       divisionName: data?.value?.divisionName || 'ASSET MANAGEMENT',
     });
@@ -255,7 +256,7 @@ export function registerPhase7Routes(app: Express, supabase: SupabaseClient) {
       return res.status(500).json({ error: 'The logo could not be uploaded. Please try again.' });
     }
     const { data: publicData } = supabase.storage.from('spip-brand-assets').getPublicUrl(path);
-    const value = { logoUrl: publicData.publicUrl, logoPath: path, organisationName: 'SCM CAPITAL', divisionName: 'ASSET MANAGEMENT' };
+    const value = { ...(previous?.value || {}), logoUrl: publicData.publicUrl, logoPath: path, organisationName: 'SCM CAPITAL', divisionName: 'ASSET MANAGEMENT' };
     const { error } = await supabase.from('platform_settings').upsert({ key: 'branding', value, updated_by: user.userId, updated_at: new Date().toISOString() });
     if (error) {
       await supabase.storage.from('spip-brand-assets').remove([path]);
@@ -266,6 +267,40 @@ export function registerPhase7Routes(app: Express, supabase: SupabaseClient) {
     if (previousPath.startsWith('logos/') && previousPath !== path) {
       const { error: cleanupError } = await supabase.storage.from('spip-brand-assets').remove([previousPath]);
       if (cleanupError) console.warn('[BRANDING] Previous logo cleanup failed:', cleanupError.message);
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json(value);
+  });
+
+  app.post('/api/admin/branding/favicon', express.raw({
+    type: 'image/png',
+    limit: 512 * 1024,
+  }), async (req, res) => {
+    const user = requestUser(req);
+    if (!user?.isAdmin) return res.status(403).json({ error: 'Administrator access is required.' });
+    const bytes = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    if (detectLogoMime(bytes) !== 'image/png') return res.status(400).json({ error: 'Upload a valid PNG favicon.' });
+    if (bytes.length > 512 * 1024) return res.status(413).json({ error: 'Favicon files must be 512 KB or smaller.' });
+
+    const path = `favicons/spip-favicon-${Date.now()}.png`;
+    const { data: previous } = await supabase.from('platform_settings').select('value').eq('key', 'branding').maybeSingle();
+    const { error: uploadError } = await supabase.storage.from('spip-brand-assets').upload(path, bytes, { contentType: 'image/png', upsert: false });
+    if (uploadError) {
+      console.error('[BRANDING] Favicon storage upload failed:', uploadError.message);
+      return res.status(500).json({ error: 'The favicon could not be uploaded. Please try again.' });
+    }
+    const { data: publicData } = supabase.storage.from('spip-brand-assets').getPublicUrl(path);
+    const value = { ...(previous?.value || {}), faviconUrl: publicData.publicUrl, faviconPath: path, organisationName: 'SCM CAPITAL', divisionName: 'ASSET MANAGEMENT' };
+    const { error } = await supabase.from('platform_settings').upsert({ key: 'branding', value, updated_by: user.userId, updated_at: new Date().toISOString() });
+    if (error) {
+      await supabase.storage.from('spip-brand-assets').remove([path]);
+      console.error('[BRANDING] Favicon setting update failed:', error.message);
+      return res.status(500).json({ error: 'The favicon could not be saved. Please try again.' });
+    }
+    const previousPath = String(previous?.value?.faviconPath || '');
+    if (previousPath.startsWith('favicons/') && previousPath !== path) {
+      const { error: cleanupError } = await supabase.storage.from('spip-brand-assets').remove([previousPath]);
+      if (cleanupError) console.warn('[BRANDING] Previous favicon cleanup failed:', cleanupError.message);
     }
     res.setHeader('Cache-Control', 'no-store');
     return res.json(value);

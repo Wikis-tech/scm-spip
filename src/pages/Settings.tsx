@@ -27,10 +27,15 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
   const [activeSection, setActiveSection] = useState<SectionKey>('profile');
   const [message, setMessage] = useState<string>('');
   const [busy, setBusy] = useState(false);
+  const [uploadTarget, setUploadTarget] = useState<'logo' | 'favicon' | null>(null);
   const [logoUrl, setLogoUrl] = useState('');
+  const [faviconUrl, setFaviconUrl] = useState('');
 
   React.useEffect(() => {
-    if (isAdmin) getSpipBranding().then((branding) => setLogoUrl(branding.logoUrl));
+    if (isAdmin) getSpipBranding().then((branding) => {
+      setLogoUrl(branding.logoUrl);
+      setFaviconUrl(branding.faviconUrl);
+    });
   }, [isAdmin]);
 
   const uploadLogo = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -46,7 +51,7 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
       setMessage('The logo must be 2 MB or smaller.');
       return;
     }
-    setBusy(true);
+    setUploadTarget('logo');
     try {
       const controller = new AbortController();
       const timeout = window.setTimeout(() => controller.abort(), 30_000);
@@ -70,7 +75,45 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
         ? 'The logo upload timed out. Please check your connection and try again.'
         : error?.message || 'Unable to upload the logo right now.');
     } finally {
-      setBusy(false);
+      setUploadTarget(null);
+    }
+  };
+
+  const uploadFavicon = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    setMessage('');
+    if (file.type !== 'image/png') {
+      setMessage('Upload the browser favicon as a PNG image.');
+      return;
+    }
+    if (file.size > 512 * 1024) {
+      setMessage('The favicon must be 512 KB or smaller.');
+      return;
+    }
+    setUploadTarget('favicon');
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 30_000);
+    try {
+      const response = await fetch('/api/admin/branding/favicon', {
+        method: 'POST',
+        headers: { 'Content-Type': file.type },
+        body: file,
+        signal: controller.signal,
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || 'Unable to upload the favicon.');
+      setFaviconUrl(payload.faviconUrl);
+      refreshSpipBranding();
+      setMessage('The official SPIP favicon has been updated for everyone.');
+    } catch (error: any) {
+      setMessage(error?.name === 'AbortError'
+        ? 'The favicon upload timed out. Please check your connection and try again.'
+        : error?.message || 'Unable to upload the favicon right now.');
+    } finally {
+      window.clearTimeout(timeout);
+      setUploadTarget(null);
     }
   };
 
@@ -253,8 +296,26 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                   </div>
                   <label className="inline-flex shrink-0 cursor-pointer items-center justify-center gap-2 rounded-lg bg-[#b1191f] px-4 py-2.5 text-xs font-semibold text-white transition hover:bg-[#94151a]">
                     <Upload className="h-4 w-4" />
-                    {busy ? 'Uploading…' : 'Upload logo'}
-                    <input type="file" accept="image/png,image/jpeg,image/webp" className="sr-only" disabled={busy} onChange={uploadLogo} />
+                    {uploadTarget === 'logo' ? 'Uploading…' : 'Upload logo'}
+                    <input type="file" accept="image/png,image/jpeg,image/webp" className="sr-only" disabled={uploadTarget !== null} onChange={uploadLogo} />
+                  </label>
+                </div>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-5">
+                <div className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex min-w-0 items-center gap-4">
+                    <div className="flex h-16 w-16 shrink-0 items-center justify-center overflow-hidden rounded-xl border border-slate-200 bg-white p-2">
+                      {faviconUrl ? <img src={faviconUrl} alt="Current SPIP favicon" className="h-10 w-10 object-contain" /> : <ImageIcon className="h-6 w-6 text-slate-300" />}
+                    </div>
+                    <div>
+                      <div className="font-semibold text-slate-900">Official favicon</div>
+                      <p className="mt-1 text-xs leading-5 text-slate-500">Upload a square PNG for browser tabs and bookmarks. Recommended: 512 × 512 px. Maximum size: 512 KB.</p>
+                    </div>
+                  </div>
+                  <label className="inline-flex shrink-0 cursor-pointer items-center justify-center gap-2 rounded-lg bg-slate-950 px-4 py-2.5 text-xs font-semibold text-white transition hover:bg-slate-800">
+                    <Upload className="h-4 w-4" />
+                    {uploadTarget === 'favicon' ? 'Uploading…' : 'Upload favicon'}
+                    <input type="file" accept="image/png" className="sr-only" disabled={uploadTarget !== null} onChange={uploadFavicon} />
                   </label>
                 </div>
               </div>
