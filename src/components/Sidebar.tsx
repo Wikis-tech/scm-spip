@@ -42,6 +42,7 @@ const workspaceItems: NavItem[] = [
   { id: 'intelligence', label: 'Research', icon: SearchCode, activeFor: ['intelligence', 'workspaces'] },
   { id: 'copilot', label: 'Intelligence Copilot', icon: Bot },
   { id: 'calendar', label: 'Calendar', icon: Calendar },
+  { id: 'analytics', label: 'Analytics', icon: BarChart3 },
   { id: 'reports', label: 'Reports', icon: FileSpreadsheet, activeFor: ['reports', 'weekly-report'] },
 ];
 
