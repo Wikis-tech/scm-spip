@@ -38,7 +38,7 @@ const workspaceItems: NavItem[] = [
   { id: 'dashboard', label: 'My Dashboard', icon: BarChart3 },
   { id: 'prospects', label: 'Prospects', icon: Building2 },
   { id: 'pipeline', label: 'Relationship Pipeline', icon: TrendingUp },
-  { id: 'client-360', label: 'Clients', icon: Users2, activeFor: ['client-360', 'crm'] },
+  { id: 'client-360', label: 'Client 360', icon: Users2, activeFor: ['client-360', 'crm'] },
   { id: 'intelligence', label: 'Research', icon: SearchCode, activeFor: ['intelligence', 'workspaces'] },
   { id: 'copilot', label: 'Intelligence Copilot', icon: Bot },
   { id: 'calendar', label: 'Calendar', icon: Calendar },
@@ -100,7 +100,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   return (
     <aside
       id="scm-sidebar"
-      className={`fixed inset-y-0 left-0 z-30 flex ${isCollapsed ? 'w-16 -translate-x-full md:translate-x-0' : 'w-64 translate-x-0'} flex-col border-r border-slate-800 bg-[#091b2d] text-white shadow-xl transition-all duration-300`}
+      className={`fixed inset-y-0 left-0 z-30 flex ${isCollapsed ? 'w-[72px] -translate-x-full md:translate-x-0' : 'w-[272px] translate-x-0'} flex-col border-r border-white/8 bg-[#07192b] text-white shadow-[12px_0_40px_rgba(7,25,43,0.12)] transition-all duration-300`}
     >
       <div className="flex min-h-0 flex-1 flex-col">
         <div className="flex h-16 items-center justify-between border-b border-white/8 px-3.5">
@@ -114,7 +114,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </button>
         </div>
 
-        <nav className="flex-1 overflow-y-auto px-2.5 py-4">
+        <nav aria-label="Primary navigation" className="flex-1 overflow-y-auto px-3 py-5">
           {!isCollapsed && (
             <div className="px-3 pb-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500">
               Workspace

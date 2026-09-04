@@ -26,6 +26,7 @@ import { registerPhase2WeeklyRoutes } from "./src/server/phase2WeeklyRoutes.ts";
 import { registerPublicAuthRoutes } from "./src/server/publicAuthRoutes.ts";
 import { registerPhase3Routes } from "./src/server/phase3Routes.ts";
 import { registerPhase3CrudRoutes } from "./src/server/phase3CrudRoutes.ts";
+import { registerPhase7Routes } from "./src/server/phase7Routes.ts";
 import { discoveryQueueEngine, DBClientContext } from "./src/services/discovery/discoveryQueueEngine.ts";
 
 // Helper to validate corporate email domain and format
@@ -358,7 +359,8 @@ const PUBLIC_API_PATHS = new Set([
   '/api/auth/register',
   '/api/auth/verify',
   '/api/auth/forgot-password',
-  '/api/auth/reset-password'
+  '/api/auth/reset-password',
+  '/api/branding'
 ]);
 
 app.use(async (req, res, next) => {
@@ -457,6 +459,7 @@ registerPhase2WeeklyRoutes(app, supabaseServer);
 // the legacy direct-PostgreSQL health gate.
 registerPhase3Routes(app, supabaseServer);
 registerPhase3CrudRoutes(app, supabaseServer);
+registerPhase7Routes(app, supabaseServer);
 
 const PORT = Number(process.env.PORT || 3000);
 

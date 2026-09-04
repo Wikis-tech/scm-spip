@@ -5,6 +5,8 @@ import {
   ChevronRight,
   LockKeyhole,
   MonitorCog,
+  ImageIcon,
+  Upload,
   Settings2,
   ShieldCheck,
   UserRound,
@@ -12,6 +14,7 @@ import {
 import { UserProfile } from '../types';
 import { registerServiceWorkerAndSubscribe, isPushSupported } from '../services/pushService';
 import { supabase } from '../lib/supabase';
+import { getSpipBranding, refreshSpipBranding } from '../lib/branding';
 
 interface SettingsProps {
   currentUser: UserProfile;
@@ -24,6 +27,49 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
   const [activeSection, setActiveSection] = useState<SectionKey>('profile');
   const [message, setMessage] = useState<string>('');
   const [busy, setBusy] = useState(false);
+  const [logoUrl, setLogoUrl] = useState('');
+
+  React.useEffect(() => {
+    if (isAdmin) getSpipBranding().then((branding) => setLogoUrl(branding.logoUrl));
+  }, [isAdmin]);
+
+  const uploadLogo = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    setMessage('');
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
+      setMessage('Upload the official SCM logo as a PNG, JPEG or WebP image.');
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      setMessage('The logo must be 2 MB or smaller.');
+      return;
+    }
+    setBusy(true);
+    try {
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.onerror = () => reject(new Error('Unable to read the selected image.'));
+        reader.readAsDataURL(file);
+      });
+      const response = await fetch('/api/admin/branding/logo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dataUrl, fileName: file.name }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || 'Unable to upload the logo.');
+      setLogoUrl(payload.logoUrl);
+      refreshSpipBranding();
+      setMessage('The official SCM logo has been updated across SPIP.');
+    } catch (error: any) {
+      setMessage(error?.message || 'Unable to upload the logo right now.');
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const sections = useMemo(() => {
     const rows: { key: SectionKey; label: string; description: string; icon: any; admin?: boolean }[] = [
@@ -190,6 +236,24 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                 <StatusCard title="Database" detail="Supabase PostgreSQL" />
                 <StatusCard title="Prospect intelligence" detail="Apollo API" />
                 <StatusCard title="Hosting" detail="Vercel" />
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-5">
+                <div className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex min-w-0 items-center gap-4">
+                    <div className="flex h-16 w-28 shrink-0 items-center justify-center overflow-hidden rounded-xl border border-slate-200 bg-white p-2">
+                      {logoUrl ? <img src={logoUrl} alt="Current SCM logo" className="max-h-full max-w-full object-contain" /> : <ImageIcon className="h-6 w-6 text-slate-300" />}
+                    </div>
+                    <div>
+                      <div className="font-semibold text-slate-900">Official SCM logo</div>
+                      <p className="mt-1 text-xs leading-5 text-slate-500">Upload the approved transparent PNG, JPEG or WebP. Maximum size: 2 MB.</p>
+                    </div>
+                  </div>
+                  <label className="inline-flex shrink-0 cursor-pointer items-center justify-center gap-2 rounded-lg bg-[#b1191f] px-4 py-2.5 text-xs font-semibold text-white transition hover:bg-[#94151a]">
+                    <Upload className="h-4 w-4" />
+                    {busy ? 'Uploading…' : 'Upload logo'}
+                    <input type="file" accept="image/png,image/jpeg,image/webp" className="sr-only" disabled={busy} onChange={uploadLogo} />
+                  </label>
+                </div>
               </div>
               <div className="flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
                 <MonitorCog className="mt-0.5 h-5 w-5 shrink-0" />

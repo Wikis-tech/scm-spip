@@ -218,14 +218,17 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess }) => {
   }[mode];
 
   return (
-    <div className="min-h-screen bg-[#071524] text-slate-100">
-      <header className="mx-auto flex w-full max-w-7xl items-center justify-between border-b border-white/10 px-6 py-5">
+    <div className="spip-auth-grid relative min-h-screen overflow-hidden text-slate-100">
+      <div aria-hidden="true" className="pointer-events-none absolute -left-28 top-24 h-96 w-96 rounded-full bg-[#b1191f]/20 blur-3xl" />
+      <div aria-hidden="true" className="pointer-events-none absolute bottom-0 right-0 h-80 w-80 rounded-full bg-sky-900/20 blur-3xl" />
+      <header className="relative mx-auto flex w-full max-w-7xl items-center justify-between border-b border-white/10 px-5 py-5 sm:px-8">
         <ScmLogo variant="light" size="md" />
         <span className="hidden text-xs text-slate-400 sm:block">SCM Capital Asset Management</span>
       </header>
 
-      <main className="flex min-h-[calc(100vh-81px)] items-center justify-center px-5 py-10">
-        <div className="w-full max-w-md rounded-3xl border border-white/10 bg-slate-900/90 p-7 shadow-2xl backdrop-blur sm:p-8">
+      <main className="relative flex min-h-[calc(100vh-81px)] items-center justify-center px-5 py-10">
+        <div className="relative w-full max-w-md overflow-hidden rounded-3xl border border-white/10 bg-[#0b2035]/90 p-7 shadow-[0_32px_80px_rgba(0,0,0,0.32)] backdrop-blur-xl sm:p-8">
+          <div aria-hidden="true" className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-[#d72a32] to-transparent" />
           <div className="mb-7">
             <div className="mb-5 flex justify-center"><ScmLogo variant="light" size="lg" showText={false} /></div>
             <h1 className="text-center text-2xl font-bold tracking-tight text-white">{content.title}</h1>
