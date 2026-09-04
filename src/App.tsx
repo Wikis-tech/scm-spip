@@ -24,7 +24,7 @@ import { ManagementReports } from './pages/ManagementReports';
 import { ExecutiveSummary } from './pages/ExecutiveSummary';
 import { Workspaces } from './pages/Workspaces';
 import { IntelligenceCopilot } from './pages/IntelligenceCopilot';
-import { HelpCircle, Sparkles, ShieldCheck } from 'lucide-react';
+import { AlertTriangle, HelpCircle, RefreshCw, Sparkles, ShieldCheck } from 'lucide-react';
 import { UserProfile, UserRole, Prospect, Contact, Activity, Meeting, DashboardMetrics, Task, NewsArticle, DiscoveredLead, StaffPerformance } from './types';
 import { registerServiceWorkerAndSubscribe, isPushSupported } from './services/pushService';
 import { supabase } from './lib/supabase';
@@ -165,6 +165,7 @@ export default function App() {
   const [staffPerformance, setStaffPerformance] = useState<StaffPerformance[]>([]);
   
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [dataLoadError, setDataLoadError] = useState<string>('');
 
   const scmFetch = async (url: string, options: RequestInit = {}) => {
     const { data } = await supabase.auth.getSession();
@@ -178,23 +179,47 @@ export default function App() {
   const refreshDatabase = async () => {
     if (!currentUser) return;
     setIsLoading(true);
+    setDataLoadError('');
+
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 20_000);
 
     const isAdminUser = currentUser.permissionLevel === 'SUPER_ADMIN' || currentUser.permissionLevel === 'HOD_ADMIN';
 
     try {
+      let failedRequests = 0;
+      const loadJson = async <T,>(url: string, fallback: T): Promise<T> => {
+        try {
+          const response = await scmFetch(url, { signal: controller.signal });
+          if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+          return await response.json();
+        } catch (error) {
+          failedRequests += 1;
+          console.error(`[SCM DATA] Unable to load ${url}:`, error);
+          return fallback;
+        }
+      };
+
       const [resMetrics, resProspects, resContacts, resActivities, resMeetings, resTasks, resNews, resLeads, resStaff] = await Promise.all([
-        scmFetch('/api/dashboard/metrics').then(r => r.json()).catch(() => ({})),
-        scmFetch('/api/crm/prospects').then(r => r.json()).catch(() => []),
-        scmFetch('/api/crm/contacts').then(r => r.json()).catch(() => []),
-        scmFetch('/api/crm/activities').then(r => r.json()).catch(() => []),
-        scmFetch('/api/crm/meetings').then(r => r.json()).catch(() => []),
-        scmFetch('/api/crm/tasks').then(r => r.json()).catch(() => []),
-        scmFetch('/api/news').then(r => r.json()).catch(() => []),
-        scmFetch('/api/discovery/leads').then(r => r.json()).catch(() => []),
+        loadJson('/api/dashboard/metrics', {}),
+        loadJson('/api/crm/prospects', []),
+        loadJson('/api/crm/contacts', []),
+        loadJson('/api/crm/activities', []),
+        loadJson('/api/crm/meetings', []),
+        loadJson('/api/crm/tasks', []),
+        loadJson('/api/news', []),
+        loadJson('/api/discovery/leads', []),
         isAdminUser 
-          ? scmFetch('/api/team/performance').then(r => r.json()).catch(() => [])
+          ? loadJson('/api/team/performance', [])
           : Promise.resolve([])
       ]);
+
+      const requestCount = isAdminUser ? 9 : 8;
+      if (failedRequests === requestCount) {
+        setDataLoadError('SPIP could not reach the secure CRM service. Your session is still active; please retry.');
+      } else if (failedRequests > 0) {
+        setDataLoadError('Some workspace information could not be refreshed. Available records are shown below.');
+      }
 
       const safeProspects = Array.isArray(resProspects) ? resProspects : [];
       const safeContacts = Array.isArray(resContacts) ? resContacts : [];
@@ -223,7 +248,9 @@ export default function App() {
       setStaffPerformance(safeStaff);
     } catch (err) {
       console.error('Core synchronizer engine encountering lags accessing Node server:', err);
+      setDataLoadError('SPIP could not refresh the secure CRM data. Please check your connection and try again.');
     } finally {
+      window.clearTimeout(timeout);
       setIsLoading(false);
     }
   };
@@ -620,9 +647,12 @@ export default function App() {
     if (!currentUser) return null;
     if (isLoading) {
       return (
-        <div className="flex flex-col items-center justify-center p-20 space-y-4">
-          <div className="w-10 h-10 border-4 border-slate-200 border-t-primary-brand rounded-full animate-spin"></div>
-          <span className="text-xs font-semibold text-slate-500 animate-pulse uppercase tracking-widest font-mono">Loading secure CRM data...</span>
+        <div className="flex min-h-[55vh] flex-col items-center justify-center space-y-4 p-8" role="status" aria-live="polite">
+          <div className="h-10 w-10 animate-spin rounded-full border-4 border-slate-200 border-t-primary-brand" />
+          <div className="text-center">
+            <span className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-600">Loading secure CRM data</span>
+            <p className="mt-2 text-xs text-slate-400">Synchronising your permitted workspace records.</p>
+          </div>
         </div>
       );
     }
@@ -936,6 +966,17 @@ export default function App() {
         {/* Dynamic page content rendering */}
         <main id="main-content" className="flex-1 overflow-y-auto bg-transparent p-3 focus:outline-none sm:p-5 lg:p-7">
           <div className="spip-page-content">
+            {dataLoadError && (
+              <div className="mb-4 flex flex-col gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-amber-950 shadow-sm sm:flex-row sm:items-center sm:justify-between" role="alert">
+                <div className="flex min-w-0 items-start gap-3">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                  <p className="text-xs font-medium leading-relaxed">{dataLoadError}</p>
+                </div>
+                <button onClick={refreshDatabase} className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-900 transition hover:bg-amber-100">
+                  <RefreshCw className="h-3.5 w-3.5" /> Retry sync
+                </button>
+              </div>
+            )}
             {getActiveTabScreen()}
           </div>
         </main>
