@@ -48,24 +48,27 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
     }
     setBusy(true);
     try {
-      const dataUrl = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result || ''));
-        reader.onerror = () => reject(new Error('Unable to read the selected image.'));
-        reader.readAsDataURL(file);
-      });
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 30_000);
       const response = await fetch('/api/admin/branding/logo', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dataUrl, fileName: file.name }),
+        headers: {
+          'Content-Type': file.type,
+          'X-File-Name': encodeURIComponent(file.name),
+        },
+        body: file,
+        signal: controller.signal,
       });
+      window.clearTimeout(timeout);
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.error || 'Unable to upload the logo.');
       setLogoUrl(payload.logoUrl);
       refreshSpipBranding();
       setMessage('The official SCM logo has been updated across SPIP.');
     } catch (error: any) {
-      setMessage(error?.message || 'Unable to upload the logo right now.');
+      setMessage(error?.name === 'AbortError'
+        ? 'The logo upload timed out. Please check your connection and try again.'
+        : error?.message || 'Unable to upload the logo right now.');
     } finally {
       setBusy(false);
     }

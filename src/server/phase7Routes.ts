@@ -1,4 +1,4 @@
-import type { Express, Request, Response } from 'express';
+import express, { type Express, type Request, type Response } from 'express';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
 import { providerRegistry } from '../services/discovery/providers/providerRegistry.ts';
@@ -61,6 +61,13 @@ function usableContact(value: unknown): string | null {
   const text = String(value || '').trim();
   if (!text || /^(n\/?a|not found|unavailable|available in apollo)$/i.test(text)) return null;
   return text;
+}
+
+function detectLogoMime(bytes: Buffer): 'image/png' | 'image/jpeg' | 'image/webp' | null {
+  if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'image/png';
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+  if (bytes.length >= 12 && bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
+  return null;
 }
 
 async function runDiscoveryScan(req: Request, res: Response, supabase: SupabaseClient) {
@@ -220,6 +227,7 @@ async function runDiscoveryScan(req: Request, res: Response, supabase: SupabaseC
 export function registerPhase7Routes(app: Express, supabase: SupabaseClient) {
   app.get('/api/branding', async (_req, res) => {
     const { data } = await supabase.from('platform_settings').select('value').eq('key', 'branding').maybeSingle();
+    res.setHeader('Cache-Control', 'no-store');
     return res.json({
       logoUrl: data?.value?.logoUrl || '',
       organisationName: data?.value?.organisationName || 'SCM CAPITAL',
@@ -227,21 +235,39 @@ export function registerPhase7Routes(app: Express, supabase: SupabaseClient) {
     });
   });
 
-  app.post('/api/admin/branding/logo', async (req, res) => {
+  app.post('/api/admin/branding/logo', express.raw({
+    type: ['image/png', 'image/jpeg', 'image/webp'],
+    limit: 2 * 1024 * 1024,
+  }), async (req, res) => {
     const user = requestUser(req);
     if (!user?.isAdmin) return res.status(403).json({ error: 'Administrator access is required.' });
-    const match = String(req.body?.dataUrl || '').match(/^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/);
-    if (!match) return res.status(400).json({ error: 'Upload a PNG, JPEG or WebP logo.' });
-    const bytes = Buffer.from(match[2], 'base64');
+    const bytes = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    const detectedMime = detectLogoMime(bytes);
+    const declaredMime = String(req.headers['content-type'] || '').split(';')[0].trim();
+    if (!detectedMime || detectedMime !== declaredMime) return res.status(400).json({ error: 'Upload a valid PNG, JPEG or WebP logo.' });
     if (bytes.length > 2 * 1024 * 1024) return res.status(413).json({ error: 'Logo files must be 2 MB or smaller.' });
-    const extension = match[1] === 'image/png' ? 'png' : match[1] === 'image/webp' ? 'webp' : 'jpg';
+    const extension = detectedMime === 'image/png' ? 'png' : detectedMime === 'image/webp' ? 'webp' : 'jpg';
     const path = `logos/scm-logo-${Date.now()}.${extension}`;
-    const { error: uploadError } = await supabase.storage.from('spip-brand-assets').upload(path, bytes, { contentType: match[1], upsert: false });
-    if (uploadError) return res.status(500).json({ error: 'The logo could not be uploaded.' });
+    const { data: previous } = await supabase.from('platform_settings').select('value').eq('key', 'branding').maybeSingle();
+    const { error: uploadError } = await supabase.storage.from('spip-brand-assets').upload(path, bytes, { contentType: detectedMime, upsert: false });
+    if (uploadError) {
+      console.error('[BRANDING] Logo storage upload failed:', uploadError.message);
+      return res.status(500).json({ error: 'The logo could not be uploaded. Please try again.' });
+    }
     const { data: publicData } = supabase.storage.from('spip-brand-assets').getPublicUrl(path);
-    const value = { logoUrl: publicData.publicUrl, organisationName: 'SCM CAPITAL', divisionName: 'ASSET MANAGEMENT' };
+    const value = { logoUrl: publicData.publicUrl, logoPath: path, organisationName: 'SCM CAPITAL', divisionName: 'ASSET MANAGEMENT' };
     const { error } = await supabase.from('platform_settings').upsert({ key: 'branding', value, updated_by: user.userId, updated_at: new Date().toISOString() });
-    if (error) return res.status(500).json({ error: 'The platform branding could not be saved.' });
+    if (error) {
+      await supabase.storage.from('spip-brand-assets').remove([path]);
+      console.error('[BRANDING] Branding setting update failed:', error.message);
+      return res.status(500).json({ error: 'The platform branding could not be saved. Please try again.' });
+    }
+    const previousPath = String(previous?.value?.logoPath || '');
+    if (previousPath.startsWith('logos/') && previousPath !== path) {
+      const { error: cleanupError } = await supabase.storage.from('spip-brand-assets').remove([previousPath]);
+      if (cleanupError) console.warn('[BRANDING] Previous logo cleanup failed:', cleanupError.message);
+    }
+    res.setHeader('Cache-Control', 'no-store');
     return res.json(value);
   });
 
