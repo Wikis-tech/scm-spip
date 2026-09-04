@@ -21,6 +21,7 @@ import { CalendarPage } from './pages/CalendarPage';
 import { AdminDashboard } from './pages/AdminDashboard';
 import { WeeklyReport } from './pages/WeeklyReport';
 import { ManagementReports } from './pages/ManagementReports';
+import { Analytics } from './pages/Analytics';
 import { ExecutiveSummary } from './pages/ExecutiveSummary';
 import { Workspaces } from './pages/Workspaces';
 import { IntelligenceCopilot } from './pages/IntelligenceCopilot';
@@ -860,6 +861,8 @@ export default function App() {
             currentUser={currentUser}
           />
         );
+      case 'analytics':
+        return <Analytics currentUser={currentUser} scmFetch={scmFetch} />;
       case 'weekly-report':
         return (
           <WeeklyReport

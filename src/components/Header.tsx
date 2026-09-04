@@ -23,6 +23,7 @@ const titles: Record<string, string> = {
   workspaces: 'Research',
   copilot: 'Intelligence Copilot',
   calendar: 'Calendar',
+  analytics: 'Performance Analytics',
   reports: 'Reports',
   'weekly-report': 'Weekly Report',
   'executive-summary': 'Executive Overview',
