@@ -1,7508 +1,1694 @@
-import express from "express";
-import path from "path";
-import fs from "fs";
-import { createServer as createViteServer } from "vite";
-import { GoogleGenAI, Type } from "@google/genai";
-import dotenv from "dotenv";
-import { createClient as createSupabaseClient } from "@supabase/supabase-js";
-import { db, createPool } from "./src/db/index.ts";
-import { users, prospects, contacts, activities, meetings, tasks, newsArticles, discoveredLeads, discoverySessions, discoveryQueues, apolloEnrichmentCache, auditLogs, reminders, savedSessions, serenaAuditLogs, systemAuditLogs, weeklyReports, workspaces, workspaceNotes, workspaceProposals, workspacePresentations, workspaceAiConversations, workspaceSearchHistory, aiSearchHistory, notifications, pushSubscriptions } from "./src/db/schema.ts";
-import { eq, and, desc, asc, sql, inArray, or } from "drizzle-orm";
-import { 
-  sendVerificationEmail, 
-  sendPasswordResetEmail, 
-  sendProspectInvitationEmail, 
-  sendNotificationEmail 
-} from "./src/lib/mailer.ts";
-
-// Load environment variables
-dotenv.config();
-
-import { searchOrganizations, discoverDecisionMakers, enrichOrganization, apolloDiagnostics } from "./src/services/apolloService.ts";
-import { verifyData } from "./src/services/verificationService.ts";
-import { calculateProductRecommendations } from "./src/utils/recommendationEngine.ts";
-import { registerPhase2Routes } from "./src/server/phase2Routes.ts";
-import { registerPhase2WeeklyRoutes } from "./src/server/phase2WeeklyRoutes.ts";
-import { registerPublicAuthRoutes } from "./src/server/publicAuthRoutes.ts";
-import { registerPhase3Routes } from "./src/server/phase3Routes.ts";
-import { registerPhase3CrudRoutes } from "./src/server/phase3CrudRoutes.ts";
-import { discoveryQueueEngine, DBClientContext } from "./src/services/discovery/discoveryQueueEngine.ts";
-
-// Helper to validate corporate email domain and format
-function isValidScmEmail(email: string): boolean {
-  if (!email) return false;
-  const trimmed = email.trim().toLowerCase();
-  if (!trimmed.endsWith("@scmcapitalng.com")) return false;
-  const localPart = trimmed.split("@")[0];
-  if (!localPart) return false;
-  return /^[a-z0-9._-]+$/.test(localPart);
-}
-
-const initialUsers: any[] = [];
-
-const initialProspects: Prospect[] = [];
-const initialContacts: Contact[] = [];
-const initialActivities: Activity[] = [];
-const initialMeetings: Meeting[] = [];
-import { Prospect, Contact, Activity, Meeting, UserProfile, Task, NewsArticle, DiscoveredLead, StaffPerformance, Reminder, UserRole } from "./src/types";
-
-// Active user OAuth access tokens mapping cached securely in memory on the server
-const activeUserTokens = new Map<string, string>();
-
-// Authenticated identity is established exclusively by the Supabase JWT middleware below.
-function getRequestUser(req: any) {
-  if (req?.user) return req.user;
-  return {
-    userId: null,
-    role: null,
-    email: '',
-    isAdmin: false,
-    status: 'UNAUTHENTICATED',
-    isSuperAdmin: false,
-    permissionLevel: null
-  };
-}
-
-// Resolve only users that already exist in the SCM user directory. Never auto-provision accounts.
-async function ensureValidUser(requestedUserId?: string | null, requestedEmail?: string | null, requestedName?: string | null) {
-  const targetId = requestedUserId ? String(requestedUserId).trim() : null;
-  const targetEmail = requestedEmail ? String(requestedEmail).trim().toLowerCase() : null;
-
-  if (!targetId && !targetEmail) {
-    throw new Error('A valid assigned SCM user is required.');
-  }
-
-  const found = targetId
-    ? await db.select().from(users).where(eq(users.id, targetId))
-    : await db.select().from(users).where(eq(users.email, targetEmail!));
-
-  if (found.length === 0) {
-    throw new Error('Assigned SCM user does not exist or has not been activated.');
-  }
-
-  return { id: found[0].id, fullName: found[0].fullName, email: found[0].email };
-}
-
-// System logging helper for auditing and security tracking
-async function logSystemEvent(
-  action: string,
-  target: string | null,
-  status: string,
-  req: any,
-  metadata?: any
-) {
-  const { userId, email } = getRequestUser(req);
-  let userName = "System";
-  if (userId || email) {
-    try {
-      const condition = userId ? eq(users.id, userId) : eq(users.email, email.toLowerCase());
-      const pgUsers = await db.select().from(users).where(condition);
-      if (pgUsers.length > 0) {
-        userName = pgUsers[0].fullName;
-      } else if (email) {
-        userName = email.split('@')[0];
-      }
-    } catch (err) {
-      if (email) userName = email.split('@')[0];
-    }
-  }
-
-  const logEntry = {
-    id: `audit-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-    timestamp: new Date().toISOString(),
-    userId: userId || null,
-    userEmail: email || null,
-    userName: userName || null,
-    action,
-    target,
-    status,
-    metadata: metadata || {}
-  };
-
-  try {
-    await db.insert(systemAuditLogs).values({
-      id: logEntry.id,
-      timestamp: logEntry.timestamp,
-      userId: logEntry.userId,
-      userEmail: logEntry.userEmail,
-      userName: logEntry.userName,
-      action: logEntry.action,
-      target: logEntry.target,
-      status: logEntry.status,
-      metadata: logEntry.metadata
-    });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to write system audit log:", err);
-  }
-}
-
-async function getProspectsForUser(req: any) {
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return [];
-  try {
-    if (isAdmin) {
-      return await db.select().from(prospects);
-    }
-    return await db.select().from(prospects).where(
-      and(
-        eq(prospects.assignedOfficerId, userId),
-        sql`${prospects.status} != 'Archived'`,
-        sql`${prospects.status} != 'Seed Data'`
-      )
-    );
-  } catch (err: any) {
-    console.error('[SPIP DATABASE] Prospect query failed:', err?.message || err);
-    throw err;
-  }
-}
-
-async function getMeetingsForUser(req: any) {
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return [];
-  try {
-    if (isAdmin) {
-      return await db.select().from(meetings);
-    }
-    return await db.select().from(meetings).where(eq(meetings.officerId, userId));
-  } catch (err: any) {
-    console.error('[SPIP DATABASE] Meeting query failed:', err?.message || err);
-    throw err;
-  }
-}
-
-async function getTasksForUser(req: any) {
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return [];
-  try {
-    if (isAdmin) {
-      return await db.select().from(tasks);
-    }
-    return await db.select().from(tasks).where(eq(tasks.officerId, userId));
-  } catch (err: any) {
-    console.error('[SPIP DATABASE] Task query failed:', err?.message || err);
-    throw err;
-  }
-}
-
-async function getActivitiesForUser(req: any) {
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return [];
-  try {
-    if (isAdmin) {
-      return await db.select().from(activities);
-    }
-    return await db.select().from(activities).where(eq(activities.officerId, userId));
-  } catch (err: any) {
-    console.error('[SPIP DATABASE] Activity query failed:', err?.message || err);
-    throw err;
-  }
-}
-
-async function getContactsForUser(req: any) {
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return [];
-  try {
-    if (isAdmin) {
-      return await db.select().from(contacts);
-    }
-    const officerProspects = await db.select({ id: prospects.id }).from(prospects).where(eq(prospects.assignedOfficerId, userId));
-    const prospectIds = officerProspects.map(p => p.id);
-    if (prospectIds.length > 0) {
-      return await db.select().from(contacts).where(inArray(contacts.prospectId, prospectIds));
-    }
-    return [];
-  } catch (err: any) {
-    console.error('[SPIP DATABASE] Contact query failed:', err?.message || err);
-    throw err;
-  }
-}
-
-async function getRemindersForUser(req: any) {
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return [];
-  try {
-    if (isAdmin) {
-      return await db.select().from(reminders);
-    }
-    return await db.select().from(reminders).where(eq(reminders.userId, userId));
-  } catch (err: any) {
-    console.error('[SPIP DATABASE] Reminder query failed:', err?.message || err);
-    throw err;
-  }
-}
-
-// In-memory runtime database holding custom state
-let dbUsers: UserProfile[] = [...initialUsers];
-let dbProspects: Prospect[] = [...initialProspects];
-let dbContacts: Contact[] = [...initialContacts];
-let dbActivities: Activity[] = [...initialActivities];
-let dbMeetings: Meeting[] = [...initialMeetings];
-let dbReminders: Reminder[] = [];
-
-let dbTasks: Task[] = [];
-
-let dbNewsArticles: NewsArticle[] = [];
-
-let dbDiscoveredLeads: DiscoveredLead[] = [];
-
-let dbStaffPerformance: StaffPerformance[] = [];
-
-// Phase 14: In-Memory Admin Audit Logs database for validating system reliability
-let dbAuditLogs: any[] = [];
-let dbSerenaLogs: any[] = [];
-let dbSavedSessions: any[] = [];
-let dbWeeklyReports: any[] = [];
-
-
-// Safely initialize Gemini Client
-let aiClient: GoogleGenAI | null = null;
-if (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY") {
-  try {
-    aiClient = new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        }
-      }
-    });
-    console.log("Status: Server-side GoogleGenAI Client authorized successfully.");
-  } catch (err) {
-    console.error("Error setting up GoogleGenAI Client:", err);
-  }
-} else {
-  console.log("Status: Serving intelligence queries using SCM Premium Nigerian Corporates Fallback Engine.");
-}
-
-async function robustGenerateContent(params: { model?: string; contents: any; config?: any }): Promise<any> {
-  if (!aiClient) {
-    throw new Error("aiClient is not initialized");
-  }
-
-  const primaryModel = params.model || "gemini-3.5-flash";
-  const backupModel = "gemini-3.1-flash-lite";
-
-  const queryWithRetries = async (modelName: string, maxAttempts = 3, initialDelay = 500): Promise<any> => {
-    let currentDelay = initialDelay;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        console.log(`[GEMINI INFO] Attempting content pipeline with target "${modelName}" (run ${attempt}/${maxAttempts})`);
-        const response = await aiClient!.models.generateContent({
-          model: modelName,
-          contents: params.contents,
-          config: params.config
-        });
-        console.log(`[GEMINI INFO] Target "${modelName}" successfully completed processing.`);
-        return response;
-      } catch (err: any) {
-        const msg = err?.message || String(err);
-        const isTransient = msg.includes("503") || msg.includes("UNAVAILABLE") || msg.includes("demand") || msg.includes("temporary");
-        
-        // Sanitize the logged message to avoid outputting raw 'error' JSON strings or the word 'error'
-        // which triggers platform alert scanners on healthy retry actions.
-        const cleanMsg = msg
-          .replace(/error/gi, "status_detail")
-          .substring(0, 150);
-        
-        console.log(`[GEMINI INFO] Target "${modelName}" transaction status: deferred (Attempt ${attempt}/${maxAttempts}). Message payload: ${cleanMsg}`);
-        
-        if (attempt === maxAttempts) {
-          throw err;
-        }
-        
-        // Add random jitter to delay to prevent the thundering herd problem
-        const jitter = Math.floor(Math.random() * 200);
-        const delayTime = (isTransient ? currentDelay : 500) + jitter;
-        await new Promise(resolve => setTimeout(resolve, delayTime));
-        currentDelay *= 1.5; 
-      }
-    }
-  };
-
-  try {
-    return await queryWithRetries(primaryModel, 3, 600);
-  } catch (primaryException) {
-    console.log(`[GEMINI INFO] Routing task execution to secondary pipeline: "${backupModel}"`);
-    try {
-      return await queryWithRetries(backupModel, 2, 500);
-    } catch (secondaryException) {
-      console.log(`[GEMINI INFO] Handled exception at secondary model pathway completion.`);
-      throw primaryException; 
-    }
-  }
-}
-
-const app = express();
-app.use(express.json());
-
-const supabaseUrl = process.env.SUPABASE_URL?.trim();
-const supabaseServerKey = (process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY)?.trim();
-
-if (!supabaseUrl || !supabaseServerKey) {
-  console.warn('[SPIP SECURITY] Server-side Supabase configuration is incomplete.');
-}
-
-const supabaseServer = createSupabaseClient(
-  supabaseUrl || 'https://invalid.supabase.co',
-  supabaseServerKey || 'missing-server-key',
-  { auth: { persistSession: false, autoRefreshToken: false } }
-);
-
-// Registration is registered before the authentication middleware because it creates
-// a PENDING account and never returns a signed-in session.
-registerPublicAuthRoutes(app, supabaseServer);
-
-const PUBLIC_API_PATHS = new Set([
-  '/api/auth/config',
-  '/api/auth/login',
-  '/api/auth/register',
-  '/api/auth/verify',
-  '/api/auth/forgot-password',
-  '/api/auth/reset-password'
-]);
-
-app.use(async (req, res, next) => {
-  if (!req.path.startsWith('/api')) return next();
-  if (PUBLIC_API_PATHS.has(req.path)) return next();
-
-  const authorization = req.headers.authorization || '';
-  if (!authorization.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Authentication required.' });
-  }
-
-  const token = authorization.slice(7).trim();
-  if (!token) return res.status(401).json({ error: 'Authentication required.' });
-
-  try {
-    const { data: authData, error: authError } = await supabaseServer.auth.getUser(token);
-    const authUser = authData?.user;
-    if (authError || !authUser?.id || !authUser.email) {
-      return res.status(401).json({ error: 'Your session is invalid or has expired.' });
-    }
-
-    const email = authUser.email.trim().toLowerCase();
-    if (!isValidScmEmail(email)) {
-      return res.status(403).json({ error: 'SPIP access requires an SCM Capital corporate email.' });
-    }
-
-    const { data: profile, error: profileError } = await supabaseServer
-      .from('profiles')
-      .select('id, full_name, email, permission_level, job_title, department, status, avatar_url')
-      .eq('id', authUser.id)
-      .single();
-
-    if (profileError || !profile) {
-      return res.status(403).json({ error: 'Your SPIP profile is unavailable. Contact an administrator.' });
-    }
-
-    if (profile.status !== 'ACTIVE') {
-      return res.status(403).json({
-        error: profile.status === 'PENDING'
-          ? 'Your SPIP access request is pending administrator approval.'
-          : `Your SPIP account is ${String(profile.status).toLowerCase()}. Contact an administrator.`
-      });
-    }
-
-    const permissionLevel = profile.permission_level;
-    const isSuperAdmin = permissionLevel === 'SUPER_ADMIN';
-    const isAdmin = isSuperAdmin || permissionLevel === 'HOD_ADMIN';
-    const legacyRole = isSuperAdmin ? 'SUPER_ADMIN' : permissionLevel === 'HOD_ADMIN' ? 'Admin' : 'Business Development Officer';
-
-    // Identity is sourced from the ACTIVE Supabase profile above. The Phase 1B profile
-    // trigger owns legacy users-directory synchronization, so authentication never waits
-    // for the separate direct PostgreSQL connection.
-
-    (req as any).user = {
-      userId: authUser.id,
-      email,
-      role: legacyRole,
-      permissionLevel,
-      isAdmin,
-      isSuperAdmin,
-      status: 'ACTIVE',
-      fullName: profile.full_name,
-      department: profile.department || 'Asset Management',
-      avatarUrl: profile.avatar_url || ''
-    };
-
-    if (req.path === '/api/auth/me') {
-      await supabaseServer.from('profiles').update({ last_login_at: new Date().toISOString() }).eq('id', authUser.id);
-      return res.json({
-        user: {
-          id: authUser.id,
-          fullName: profile.full_name,
-          email,
-          role: legacyRole,
-          permissionLevel,
-          department: profile.department || 'Asset Management',
-          avatarUrl: profile.avatar_url || '',
-          status: 'Active',
-          verified: true
-        }
-      });
-    }
-
-    return next();
-  } catch (error: any) {
-    console.error('[SPIP SECURITY] Authentication middleware failure:', error?.message || error);
-    return res.status(503).json({ error: 'Authentication service is temporarily unavailable.' });
-  }
-});
-
-// Phase 2 identity, administration and reporting routes use the trusted Supabase
-// server client and are registered before the legacy PostgreSQL health gate.
-registerPhase2Routes(app, supabaseServer);
-registerPhase2WeeklyRoutes(app, supabaseServer);
-// Phase 3 core CRM routes also run on the canonical Supabase data plane, before
-// the legacy direct-PostgreSQL health gate.
-registerPhase3Routes(app, supabaseServer);
-registerPhase3CrudRoutes(app, supabaseServer);
-
-const PORT = Number(process.env.PORT || 3000);
-
-// API ROUTES
-
-let isDatabaseHealthy = false;
-
-app.use('/api', (req, res, next) => {
-  // Authentication, Supabase-backed CRM/admin routes and stateless research endpoints
-  // do not depend on the legacy direct PostgreSQL pool. They remain protected by the
-  // Supabase bearer-token middleware registered above this gate.
-  const databaseIndependentPrefixes = [
-    '/auth/',
-    '/admin/',
-    '/crm/',
-    '/weekly-reports',
-    '/campaigns',
-    '/client-360',
-    '/apollo/',
-    '/gemini/',
-    '/serena/',
-  ];
-  if (databaseIndependentPrefixes.some((prefix) => req.path.startsWith(prefix))) return next();
-
-  if (process.env.NODE_ENV === 'production' && !isDatabaseHealthy) {
-    return res.status(503).json({
-      error: 'This legacy data service is temporarily unavailable. Your authenticated SPIP session remains active.',
-      code: 'LEGACY_DATABASE_UNAVAILABLE',
-    });
-  }
-  return next();
-});
-
-async function seedDefaultAdmins() {
-  // Authentication identities are created only in Supabase Auth. No default users or passwords are seeded.
-  return;
-}
-
-// In-Memory Workspace Storage Fallbacks
-export let dbWorkspaces: any[] = [];
-export let dbWorkspaceNotes: any[] = [];
-export let dbWorkspaceProposals: any[] = [];
-export let dbWorkspacePresentations: any[] = [];
-export let dbWorkspaceAiConversations: any[] = [];
-export let dbWorkspaceSearchHistory: any[] = [];
-export let dbAiSearchHistory: any[] = [];
-
-// Global AI Interaction Logger
-export async function logAiInteraction(
-  req: any,
-  params: {
-    searchQuery: string;
-    searchType: string;
-    companyName?: string | null;
-    workspaceId?: string | null;
-    modelUsed?: string | null;
-    tokensConsumed?: number;
-    estimatedCost?: number;
-    responseTime?: number;
-    searchResult?: string | null;
-    status?: string;
-  }
-) {
-  const { userId, email } = getRequestUser(req);
-  if (!userId) return; // Strict role isolation and access guard
-
-  let userName = "User";
-  try {
-    const condition = userId ? eq(users.id, userId) : eq(users.email, email.toLowerCase());
-    const pgUsers = await db.select().from(users).where(condition);
-    if (pgUsers.length > 0) {
-      userName = pgUsers[0].fullName;
-    } else if (email) {
-      userName = email.split('@')[0];
-    }
-  } catch (err) {
-    if (email) userName = email.split('@')[0];
-  }
-
-  const entryId = `ai-hist-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-  const timestamp = new Date().toISOString();
-  const finalStatus = params.status || 'Success';
-
-  const tokens = params.tokensConsumed || 0;
-  const cost = params.estimatedCost || (tokens * 0.00000015);
-
-  const logEntry = {
-    id: entryId,
-    userId: userId,
-    userName: userName,
-    userEmail: email || "unknown@scmcapitalng.com",
-    companyName: params.companyName || null,
-    searchQuery: params.searchQuery,
-    searchType: params.searchType,
-    timestamp: timestamp,
-    modelUsed: params.modelUsed || null,
-    tokensConsumed: tokens,
-    estimatedCost: parseFloat(cost.toFixed(6)),
-    responseTime: params.responseTime || 0,
-    workspaceId: params.workspaceId || null,
-    searchResult: params.searchResult ? params.searchResult.substring(0, 5000) : null,
-    status: finalStatus,
-  };
-
-  try {
-    await db.insert(aiSearchHistory).values(logEntry);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to persist ai_search_history:", err.message || err);
-  }
-}
-
-// ==========================================
-// DEFAULT SEEDED NEWS ARTICLES FOR NIGERIAN CORPORATES
-// ==========================================
-export const defaultNewsArticles: any[] = [];
-
-// Asynchronously check database health at boot to avoid requests blocking
-async function checkDatabaseHealth() {
-  let tempPool;
-  let tempClient;
-  try {
-    tempPool = createPool();
-    tempClient = await tempPool.connect();
-    await tempClient.query("SELECT 1;");
-    
-    isDatabaseHealthy = true;
-    console.log("[SCM DATABASE] Supabase PostgreSQL Database connection verified & healthy.");
-
-    // Attempt table schema verifications if permitted
-    try {
-      await tempClient.query(`
-        CREATE TABLE IF NOT EXISTS "notifications" (
-          "id" text PRIMARY KEY NOT NULL,
-          "user_id" text REFERENCES "users"("id") ON DELETE CASCADE,
-          "type" text NOT NULL,
-          "title" text NOT NULL,
-          "message" text NOT NULL,
-          "timestamp" text NOT NULL,
-          "is_read" boolean DEFAULT false NOT NULL,
-          "category" text,
-          "priority" text,
-          "is_legacy" boolean DEFAULT false,
-          "created_at" text,
-          "read_status" text DEFAULT 'unread'
-        );
-      `);
-      
-      await tempClient.query(`
-        ALTER TABLE "audit_logs" ADD COLUMN IF NOT EXISTS "user_id" text;
-        ALTER TABLE "audit_logs" ADD COLUMN IF NOT EXISTS "user_email" text;
-      `);
-
-      await tempClient.query(`
-        CREATE TABLE IF NOT EXISTS "discovery_sessions" (
-          "id" text PRIMARY KEY NOT NULL,
-          "user_id" text NOT NULL,
-          "user_email" text,
-          "source" text NOT NULL,
-          "industry" text NOT NULL,
-          "location" text NOT NULL,
-          "size_tier" text NOT NULL,
-          "revenue_range" text NOT NULL,
-          "target_product" text NOT NULL,
-          "eval_count" integer DEFAULT 0 NOT NULL,
-          "rec_count" integer DEFAULT 0 NOT NULL,
-          "saved_count" integer DEFAULT 0 NOT NULL,
-          "created_at" text NOT NULL
-        );
-
-        ALTER TABLE "discovered_leads" ADD COLUMN IF NOT EXISTS "confidence_score" integer DEFAULT 85;
-        ALTER TABLE "discovered_leads" ADD COLUMN IF NOT EXISTS "business_fit" text DEFAULT 'High Fit';
-        ALTER TABLE "discovered_leads" ADD COLUMN IF NOT EXISTS "treasury_potential" text;
-        ALTER TABLE "discovered_leads" ADD COLUMN IF NOT EXISTS "estimated_revenue_value" bigint DEFAULT 2500000000;
-        ALTER TABLE "discovered_leads" ADD COLUMN IF NOT EXISTS "recommended_products" jsonb;
-        ALTER TABLE "discovered_leads" ADD COLUMN IF NOT EXISTS "decision_makers" jsonb;
-        ALTER TABLE "discovered_leads" ADD COLUMN IF NOT EXISTS "latest_news" text;
-        ALTER TABLE "discovered_leads" ADD COLUMN IF NOT EXISTS "source" text;
-        ALTER TABLE "discovered_leads" ADD COLUMN IF NOT EXISTS "revenue_range" text;
-        ALTER TABLE "discovered_leads" ADD COLUMN IF NOT EXISTS "created_at" text;
-      `);
-    } catch (schemaErr: any) {
-      console.log("[SCM DATABASE] Note: Boot DDL verification skipped (tables managed via migrations):", schemaErr.message);
-    }
-
-    await seedDefaultAdmins();
-  } catch (err: any) {
-    isDatabaseHealthy = false;
-    console.log("[SCM DATABASE NOTICE] Direct PostgreSQL connection unavailable; CRM data routes remain fail-closed:", err.message);
-  } finally {
-    if (tempClient) tempClient.release();
-    if (tempPool) await tempPool.end();
-  }
-}
-checkDatabaseHealth();
-setInterval(checkDatabaseHealth, 30000);
-
-// AUTHENTICATION
-
-app.get('/api/auth/config', (_req, res) => {
-  return res.json({
-    provider: 'supabase',
-    corporateDomain: 'scmcapitalng.com',
-    demoMode: false
-  });
-});
-
-app.post('/api/auth/logout', async (req, res) => {
-  const { userId } = getRequestUser(req);
-  if (userId) await logSystemEvent('User Logout', userId, 'Success', req);
-  return res.json({ success: true });
-});
-
-const deprecatedAuthHandler = (_req: any, res: any) => res.status(410).json({
-  error: 'This legacy credential endpoint has been disabled. SPIP now uses Supabase Auth.'
-});
-app.post('/api/auth/login', deprecatedAuthHandler);
-app.post('/api/auth/register', deprecatedAuthHandler);
-app.post('/api/auth/verify', deprecatedAuthHandler);
-app.post('/api/auth/forgot-password', deprecatedAuthHandler);
-app.post('/api/auth/reset-password', deprecatedAuthHandler);
-
-// GOOGLE WORKSPACE API INTEGRATIONS
-
-// Send a raw email via Gmail REST API other than in-app simulation
-app.post("/api/gmail/send", async (req, res) => {
-  const { userId, to, subject, body } = req.body;
-  if (!to || !subject || !body) {
-    return res.status(400).json({ error: "recipient (to), subject, and body are required to send emails." });
-  }
-
-  // Check if we have an active Google OAuth token cached on server for this officer UID
-  const token = userId ? activeUserTokens.get(userId) : null;
-  
-  if (token) {
-    try {
-      // Build MIME payload
-      const str = [
-        `To: ${to}`,
-        `Subject: ${subject}`,
-        `Content-Type: text/plain; charset="UTF-8"`,
-        `Content-Transfer-Encoding: 7bit`,
-        "",
-        body
-      ].join("\r\n");
-
-      // Gmail REST API expects base64url encoded MIME raw message
-      const raw = Buffer.from(str)
-        .toString("base64")
-        .replace(/\+/g, "-")
-        .replace(/\//g, "_")
-        .replace(/=+$/, "");
-
-      const response = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${token}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ raw })
-      });
-
-      if (!response.ok) {
-        const errTxt = await response.text();
-        throw new Error(`Gmail API response error: ${errTxt}`);
-      }
-
-      console.log(`[SCM WORKSPACE] Real outreach email sent successfully via Gmail API to ${to}`);
-      return res.json({ success: true, mode: "real_gmail_api", message: "Email transmitted successfully via your connected Google Account." });
-    } catch (err: any) {
-      console.warn(`[SCM WORKSPACE WARNING] Gmail API dispatch failed, cascading down to local simulation:`, err);
-    }
-  }
-
-  // Fallback / standard simulation log of email
-  console.log(`[SCM OUTBOX SIMULATION] (No OAuth token/expired): Email to ${to}, Subject: "${subject}"`);
-  return res.json({ success: true, mode: "simulated", message: "Office email routed via SCM simulated gateway successfully (Google auth disconnected/expired)." });
-});
-
-// Fetch standard recent inbox messages
-app.get("/api/gmail/messages", async (req, res) => {
-  const userId = req.query.userId as string;
-  const token = userId ? activeUserTokens.get(userId) : null;
-
-  if (!token) {
-    return res.json({ connected: false, messages: [] });
-  }
-
-  try {
-    const listRes = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=5", {
-      headers: { "Authorization": `Bearer ${token}` }
-    });
-    if (!listRes.ok) throw new Error("Could not list Google Mail messages.");
-    const listData = await listRes.json();
-    
-    const messages = [];
-    if (listData.messages && Array.isArray(listData.messages)) {
-      for (const msg of listData.messages) {
-        const detailRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}`, {
-          headers: { "Authorization": `Bearer ${token}` }
-        });
-        if (detailRes.ok) {
-          const detail = await detailRes.json();
-          const subjectHeader = detail.payload?.headers?.find((h: any) => h.name.toLowerCase() === "subject");
-          const fromHeader = detail.payload?.headers?.find((h: any) => h.name.toLowerCase() === "from");
-          messages.push({
-            id: msg.id,
-            snippet: detail.snippet,
-            subject: subjectHeader ? subjectHeader.value : "No Subject",
-            from: fromHeader ? fromHeader.value : "Unknown Sender"
-          });
-        }
-      }
-    }
-    return res.json({ connected: true, messages });
-  } catch (err: any) {
-    console.warn("[SCM WORKSPACE WARNING] Failed to retrieve real Google messages:", err);
-    return res.json({ connected: false, messages: [], error: err.message });
-  }
-});
-
-// DASHBOARD METRICS
-app.get("/api/dashboard/metrics", async (req, res) => {
-  const activeStages = ['Lead', 'Contacted', 'Meeting Scheduled', 'Financial Literacy Session Scheduled', 'Proposal Sent', 'Negotiation'];
-  
-  try {
-    const filteredProspects = await getProspectsForUser(req);
-    const filteredMeetings = await getMeetingsForUser(req);
-    const filteredActivities = await getActivitiesForUser(req);
-    const filteredTasks = await getTasksForUser(req);
-
-    const totalProspects = filteredProspects.length;
-    const activeOpportunities = filteredProspects.filter(p => activeStages.includes(p.status)).length;
-    const meetingsScheduled = filteredMeetings.length;
-    
-    // Count follow-ups due or active tasks
-    const followUpsDue = filteredTasks.filter(t => !t.isCompleted).length;
-    const financialLiteracySessions = filteredActivities.filter(a => a.activityType === 'Financial Literacy Session' && a.status === 'Completed').length;
-    
-    // Total AUM potential pipeline value (excluding lost/archived)
-    const totalEstimatedValue = filteredProspects
-      .filter(p => !['Lost', 'Archived'].includes(p.status))
-      .reduce((sum, p) => sum + (p.opportunityValue || 0), 0);
-
-    res.json({
-      totalProspects,
-      activeOpportunities,
-      meetingsScheduled,
-      followUpsDue,
-      financialLiteracySessions,
-      totalEstimatedValue
-    });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Dashboard metrics extraction failed:", err);
-    res.status(500).json({ error: "Failed to compile corporate dashboard metrics." });
-  }
-});
-
-// CRUD PROSPECTS
-app.get("/api/prospects", async (req, res) => {
-  const { userId } = getRequestUser(req);
-  if (!userId) return res.json([]);
-
-  try {
-    const list = await getProspectsForUser(req);
-    res.json(list);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Prospects query failed:", err);
-    res.status(500).json({ error: "Failed to query prospect registry." });
-  }
-});
-
-app.post("/api/prospects", async (req, res) => {
-  const data = req.body;
-  const { userId, email } = getRequestUser(req);
-
-  // Field level validations
-  if (!data.name || !String(data.name).trim()) {
-    return res.status(400).json({ error: "Organization Name is required." });
-  }
-  if (!data.industry || !String(data.industry).trim()) {
-    return res.status(400).json({ error: "Industry sector is required." });
-  }
-  if (!data.location || !String(data.location).trim()) {
-    return res.status(400).json({ error: "HQ location city is required." });
-  }
-  if (data.email && String(data.email).trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(data.email).trim())) {
-    return res.status(400).json({ error: "Official corporate email format is invalid." });
-  }
-  if (data.opportunityValue !== undefined && Number(data.opportunityValue) < 0) {
-    return res.status(400).json({ error: "Estimated capital value cannot be negative." });
-  }
-
-  const trimmedName = String(data.name).trim();
-
-  try {
-    // Ensure officer ID is resolved to a valid user in the users table
-    const validUser = await ensureValidUser(
-      data.assignedOfficerId || userId,
-      data.assignedOfficerEmail || email,
-      data.assignedOfficerName
-    );
-
-    // Duplicate Detection (case-insensitive, scoped to assigned officer / workspace ownership boundary)
-    const duplicate = await db.select().from(prospects).where(
-      and(
-        sql`LOWER(${prospects.name}) = LOWER(${trimmedName})`,
-        eq(prospects.assignedOfficerId, validUser.id)
-      )
-    );
-    if (duplicate.length > 0) {
-      return res.status(400).json({ error: `An organization named "${trimmedName}" already exists under your assigned Prospect Directory.` });
-    }
-
-    const newProspectId = `prospect-${Date.now()}`;
-    const newProspect = {
-      id: newProspectId,
-      name: trimmedName,
-      industry: String(data.industry).trim(),
-      orgType: data.orgType || "Private Corporation",
-      location: String(data.location).trim(),
-      website: data.website ? String(data.website).trim() : "",
-      phone: data.phone ? String(data.phone).trim() : "",
-      email: data.email ? String(data.email).trim() : "",
-      source: data.source || "Direct Prospecting",
-      assignedOfficerId: validUser.id,
-      assignedOfficerName: validUser.fullName,
-      status: data.status || "Lead",
-      priority: data.priority || "Medium",
-      notes: data.notes || "",
-      conversionProbability: Math.min(100, Math.max(0, Number(data.conversionProbability) || 20)),
-      opportunityValue: Math.max(0, Number(data.opportunityValue) || 0),
-      treasuryPotential: data.treasuryPotential || "Awaiting Analysis",
-      mmfPotential: data.mmfPotential || "Awaiting Analysis",
-      wealthPotential: data.wealthPotential || "Awaiting Analysis",
-      literacyPotential: data.literacyPotential || "Awaiting Analysis",
-      opportunityScore: Number(data.opportunityScore) || 50,
-      primaryContactId: null,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
-
-    const workspaceId = `workspace-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    const newWorkspace: any = {
-      id: workspaceId,
-      prospectId: newProspectId,
-      ownerUserId: validUser.id,
-      companyName: trimmedName,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      status: "Active",
-      apolloFindings: `Apollo Search automatic findings:\n- Headcount Tier: Large\n- Registry status: Active\n- Verification Level: Mapped on SCM Capital Portal`,
-      companyProfile: data.notes || "Strategic enterprise portfolio.",
-      industryAnalysis: `Nigerian industry sector: ${data.industry}. Evaluation conducted by SCM.`,
-      executiveInsights: `Corporate treasury officers are awaiting manual CRM assignment.`,
-      investmentOpportunities: `Fixed income placements & Money Market Funds opportunity mapped.`,
-      researchSummaries: `Research workspace initialized for custom advisory dossiers.`
-    };
-
-    await db.insert(prospects).values(newProspect);
-    await db.insert(workspaces).values(newWorkspace);
-
-    // Audit System Event
-    logSystemEvent(
-      "Organization Created",
-      trimmedName,
-      "Success",
-      req,
-      { prospectId: newProspectId, industry: data.industry, officerId: validUser.id }
-    );
-
-    // Trigger automated notifications
-    if (newProspect.assignedOfficerId) {
-      createNotification(
-        "New prospect assigned to user",
-        `New Prospect Assigned: ${newProspect.name}`,
-        `The high-yield prospect "${newProspect.name}" has been assigned to you for corporate wealth advisory and AUM acquisition.`,
-        undefined,
-        newProspect.assignedOfficerId
-      );
-
-      createNotification(
-        "Prospect Assigned",
-        `Prospect Assigned: ${newProspect.name}`,
-        `The prospect "${newProspect.name}" has been assigned to you.`,
-        "Assignment",
-        newProspect.assignedOfficerId
-      );
-    }
-
-    res.status(201).json(newProspect);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Insert prospect failed:", {
-      code: err.code,
-      message: err.message,
-      constraint: err.constraint,
-      table: err.table,
-      column: err.column,
-      detail: err.detail,
-      hint: err.hint
-    });
-    return res.status(500).json({ 
-      error: "Failed to persist organization into directory: " + (err.detail || err.message),
-      code: err.code,
-      constraint: err.constraint,
-      table: err.table,
-      detail: err.detail,
-      hint: err.hint
-    });
-  }
-});
-
-// Support both PUT and PATCH for seamless cross-client consumption
-app.patch("/api/prospects/:id", async (req, res) => {
-  const { id } = req.params;
-  const data = req.body;
-
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  try {
-    const fetched = await db.select().from(prospects).where(eq(prospects.id, id));
-    const targetProspect = fetched[0];
-    if (!targetProspect) {
-      return res.status(404).json({ error: "Prospect not found." });
-    }
-
-    if (!isAdmin && targetProspect.assignedOfficerId !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only modify your own prospects." });
-    }
-
-    if (data.name && String(data.name).trim() && String(data.name).trim().toLowerCase() !== targetProspect.name.toLowerCase()) {
-      const newTrimmedName = String(data.name).trim();
-      const targetOfficerId = data.assignedOfficerId || targetProspect.assignedOfficerId;
-      const duplicate = await db.select().from(prospects).where(
-        and(
-          sql`LOWER(${prospects.name}) = LOWER(${newTrimmedName})`,
-          eq(prospects.assignedOfficerId, targetOfficerId),
-          sql`${prospects.id} != ${id}`
-        )
-      );
-      if (duplicate.length > 0) {
-        return res.status(400).json({ error: `An organization named "${newTrimmedName}" already exists under your assigned Prospect Directory.` });
-      }
-    }
-
-    let officerName = undefined;
-    if (data.assignedOfficerId) {
-      const u = await db.select().from(users).where(eq(users.id, data.assignedOfficerId));
-      if (u.length > 0) officerName = u[0].fullName;
-    }
-
-    const oldStatus = targetProspect.status;
-    const oldOfficer = targetProspect.assignedOfficerId;
-
-    const updates: any = {
-      ...data,
-      updatedAt: new Date().toISOString()
-    };
-    if (officerName) {
-      updates.assignedOfficerName = officerName;
-    }
-
-    // Auto-populate pipeline tracking fields when status changes
-    if (data.status && data.status !== oldStatus) {
-      updates.stageUpdatedDate = new Date().toISOString();
-      updates.stageEnteredDate = new Date().toISOString();
-      updates.lastActivityDate = new Date().toISOString();
-      if (data.status === 'Won' || data.status === 'Converted') {
-        updates.actualRevenue = Number(data.opportunityValue || targetProspect.opportunityValue || 0);
-      } else if (data.status === 'Lost') {
-        updates.actualRevenue = 0;
-      }
-    }
-
-    delete updates.id;
-
-    await db.update(prospects).set(updates).where(eq(prospects.id, id));
-
-    const updatedFetched = await db.select().from(prospects).where(eq(prospects.id, id));
-    const newP = updatedFetched[0];
-
-    // Trigger Notification for stage movement or officer reassignment
-    if (updates.status && updates.status !== oldStatus) {
-      createNotification(
-        "Deal moved stage",
-        `Deal Moved Stage: ${newP.name}`,
-        `The deal "${newP.name}" has progressed from stage "${oldStatus}" to "${updates.status}".`,
-        undefined,
-        newP.assignedOfficerId
-      );
-
-      // Audit pipeline transitions
-      logSystemEvent(
-        "Pipeline Stage Transition",
-        newP.name,
-        "Success",
-        req,
-        {
-          prospectId: id,
-          prospectName: newP.name,
-          oldStage: oldStatus,
-          newStage: updates.status,
-          expectedRevenue: newP.opportunityValue,
-          actualRevenue: newP.actualRevenue || 0,
-          assignedOfficer: newP.assignedOfficerName
-        }
-      );
-    }
-    // Event: Prospect Updated
-    createNotification(
-      "Prospect Updated",
-      `Prospect Updated: ${newP.name}`,
-      `The details of prospect "${newP.name}" have been updated.`,
-      "Assignment",
-      newP.assignedOfficerId
-    );
-
-    if (updates.assignedOfficerId && updates.assignedOfficerId !== oldOfficer) {
-      createNotification(
-        "New prospect assigned to user",
-        `Prospect Assigned: ${newP.name}`,
-        `The prospect "${newP.name}" has been assigned to relationship officer ${newP.assignedOfficerName || "you"}.`,
-        undefined,
-        updates.assignedOfficerId
-      );
-
-      createNotification(
-        "Prospect Assigned",
-        `Prospect Assigned: ${newP.name}`,
-        `The prospect "${newP.name}" has been assigned to relationship officer ${newP.assignedOfficerName || "you"}.`,
-        "Assignment",
-        updates.assignedOfficerId
-      );
-    }
-
-    return res.json(newP);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Update prospect failed:", err);
-    return res.status(500).json({ error: "Failed to update prospect: " + err.message });
-  }
-});
-
-app.put("/api/prospects/:id", async (req, res) => {
-  const { id } = req.params;
-  const data = req.body;
-
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  try {
-    const fetched = await db.select().from(prospects).where(eq(prospects.id, id));
-    const targetProspect = fetched[0];
-    if (!targetProspect) {
-      return res.status(404).json({ error: "Prospect not found." });
-    }
-
-    if (!isAdmin && targetProspect.assignedOfficerId !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only modify your own prospects." });
-    }
-
-    if (data.name && String(data.name).trim() && String(data.name).trim().toLowerCase() !== targetProspect.name.toLowerCase()) {
-      const newTrimmedName = String(data.name).trim();
-      const targetOfficerId = data.assignedOfficerId || targetProspect.assignedOfficerId;
-      const duplicate = await db.select().from(prospects).where(
-        and(
-          sql`LOWER(${prospects.name}) = LOWER(${newTrimmedName})`,
-          eq(prospects.assignedOfficerId, targetOfficerId),
-          sql`${prospects.id} != ${id}`
-        )
-      );
-      if (duplicate.length > 0) {
-        return res.status(400).json({ error: `An organization named "${newTrimmedName}" already exists under your assigned Prospect Directory.` });
-      }
-    }
-
-    let officerName = undefined;
-    if (data.assignedOfficerId) {
-      const u = await db.select().from(users).where(eq(users.id, data.assignedOfficerId));
-      if (u.length > 0) officerName = u[0].fullName;
-    }
-
-    const updates: any = {
-      ...data,
-      updatedAt: new Date().toISOString()
-    };
-    if (officerName) {
-      updates.assignedOfficerName = officerName;
-    }
-
-    delete updates.id;
-
-    await db.update(prospects).set(updates).where(eq(prospects.id, id));
-
-    const updatedFetched = await db.select().from(prospects).where(eq(prospects.id, id));
-    const newP = updatedFetched[0];
-
-    return res.json(newP);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Put prospect failed:", err);
-    return res.status(500).json({ error: "Failed to put prospect: " + err.message });
-  }
-});
-
-app.delete("/api/prospects/:id", async (req, res) => {
-  const { id } = req.params;
-  
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  try {
-    const fetched = await db.select().from(prospects).where(eq(prospects.id, id));
-    const targetProspect = fetched[0];
-    if (!targetProspect) {
-      return res.status(404).json({ error: "Prospect not found." });
-    }
-
-    if (!isAdmin && targetProspect.assignedOfficerId !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only delete your own prospects." });
-    }
-
-    // Clean up associated workspace and prospect
-    await db.delete(workspaces).where(eq(workspaces.prospectId, id));
-    await db.delete(prospects).where(eq(prospects.id, id));
-
-    await logSystemEvent("Prospect Deleted", targetProspect.name, "Success", req, { prospectId: id, companyName: targetProspect.name });
-    return res.json({ success: true, message: `Prospect "${targetProspect.name}" successfully deleted.` });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Delete prospect failed:", err);
-    return res.status(500).json({ error: "Failed to delete prospect: " + err.message });
-  }
-});
-
-// CRUD CONTACTS
-app.get("/api/contacts", async (req, res) => {
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.json([]);
-
-  if (isDatabaseHealthy) {
-    try {
-      let list;
-      if (isAdmin) {
-        list = await db.select({
-          id: contacts.id,
-          prospectId: contacts.prospectId,
-          prospectName: prospects.name,
-          fullName: contacts.fullName,
-          position: contacts.position,
-          department: contacts.department,
-          email: contacts.email,
-          phone: contacts.phone,
-          linkedin: contacts.linkedin,
-          influenceLevel: contacts.influenceLevel,
-          isDecisionMaker: contacts.isDecisionMaker,
-          notes: contacts.notes,
-          validationLevel: contacts.validationLevel,
-          createdAt: contacts.createdAt
-        }).from(contacts)
-          .leftJoin(prospects, eq(contacts.prospectId, prospects.id));
-      } else {
-        list = await db.select({
-          id: contacts.id,
-          prospectId: contacts.prospectId,
-          prospectName: prospects.name,
-          fullName: contacts.fullName,
-          position: contacts.position,
-          department: contacts.department,
-          email: contacts.email,
-          phone: contacts.phone,
-          linkedin: contacts.linkedin,
-          influenceLevel: contacts.influenceLevel,
-          isDecisionMaker: contacts.isDecisionMaker,
-          notes: contacts.notes,
-          validationLevel: contacts.validationLevel,
-          createdAt: contacts.createdAt
-        }).from(contacts)
-          .leftJoin(prospects, eq(contacts.prospectId, prospects.id))
-          .where(eq(prospects.assignedOfficerId, userId));
-      }
-      return res.json(list);
-    } catch (err: any) {
-      isDatabaseHealthy = false;
-      console.warn("[SCM DATABASE] Contacts lookup notice: Operating in local memory fallback mode.", err.message || err);
-    }
-  }
-
-  // Fallback to in-memory dbContacts
-  const fallbackList = (dbContacts || []).filter(c => {
-    if (isAdmin) return true;
-    const p = (dbProspects || []).find(pr => pr.id === c.prospectId);
-    return p && p.assignedOfficerId === userId;
-  });
-  return res.json(fallbackList);
-});
-
-app.post("/api/contacts", async (req, res) => {
-  const data = req.body;
-  if (!data.prospectId || !data.fullName || !data.position) {
-    return res.status(400).json({ error: "Prospect, name, and position are required." });
-  }
-
-  try {
-    const pFetched = await db.select().from(prospects).where(eq(prospects.id, data.prospectId));
-    const p = pFetched[0];
-    if (!p) {
-      return res.status(404).json({ error: "Prospect organization not found." });
-    }
-
-    const newContactId = `contact-${Date.now()}`;
-    const newContact = {
-      id: newContactId,
-      prospectId: data.prospectId,
-      fullName: data.fullName,
-      position: data.position,
-      department: data.department || "Executive Board",
-      email: data.email || "",
-      phone: data.phone || "",
-      linkedin: data.linkedin || "",
-      influenceLevel: data.influenceLevel || "Medium",
-      isDecisionMaker: !!data.isDecisionMaker,
-      validationLevel: data.validationLevel || "Verified",
-      notes: data.notes || "",
-      createdAt: new Date().toISOString()
-    };
-
-    await db.insert(contacts).values(newContact);
-    
-    // Auto update primary contact if prospect doesn't have one
-    if (!p.primaryContactId) {
-      await db.update(prospects).set({ primaryContactId: newContactId }).where(eq(prospects.id, data.prospectId));
-    }
-
-    return res.status(201).json({
-      ...newContact,
-      prospectName: p.name
-    });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Contacts POST failed:", err);
-    return res.status(500).json({ error: "Failed to create contact: " + err.message });
-  }
-});
-
-app.post("/api/contacts/:id/invite", async (req, res) => {
-  const { id } = req.params;
-  const { inviterName, inviterRole } = req.body;
-
-  try {
-    const contactFetched = await db.select().from(contacts).where(eq(contacts.id, id));
-    const contact = contactFetched[0];
-    if (!contact) {
-      return res.status(404).json({ error: "Contact person not found." });
-    }
-
-    if (!contact.email) {
-      return res.status(400).json({ error: "Contact does not have a registered email address." });
-    }
-
-    const pFetched = await db.select().from(prospects).where(eq(prospects.id, contact.prospectId));
-    const p = pFetched[0];
-    const orgName = p ? p.name : "their organization";
-
-    const result = await sendProspectInvitationEmail(
-      contact.email,
-      contact.fullName,
-      orgName,
-      inviterName || "SCM Wealth Advisor",
-      inviterRole || "Relationship Manager"
-    );
-
-    return res.json({ 
-      success: true, 
-      message: `Corporate VIP portal invitation successfully sent to ${contact.email} (${contact.fullName}).`,
-      result 
-    });
-  } catch (err: any) {
-    return res.status(500).json({ error: `SMTP server transmission failure: ${err.message || err}` });
-  }
-});
-
-app.put("/api/contacts/:id", async (req, res) => {
-  const { id } = req.params;
-  const data = req.body;
-
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  try {
-    const contactFetched = await db.select().from(contacts).where(eq(contacts.id, id));
-    const contactObj = contactFetched[0];
-    if (!contactObj) {
-      return res.status(404).json({ error: "Contact not found." });
-    }
-
-    const assocProspectFetched = await db.select().from(prospects).where(eq(prospects.id, contactObj.prospectId));
-    const assocProspect = assocProspectFetched[0];
-    if (!isAdmin && assocProspect && assocProspect.assignedOfficerId !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only modify contacts for your own prospects." });
-    }
-
-    const updates = { ...data };
-    delete updates.id;
-
-    await db.update(contacts).set(updates).where(eq(contacts.id, id));
-
-    const updatedContactFetched = await db.select().from(contacts).where(eq(contacts.id, id));
-    const updatedContact = updatedContactFetched[0];
-
-    const pName = assocProspect ? assocProspect.name : "Unknown Enterprise";
-
-    return res.json({
-      ...updatedContact,
-      prospectName: pName
-    });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Update contact failed:", err);
-    return res.status(500).json({ error: "Failed to update contact: " + err.message });
-  }
-});
-
-app.patch("/api/contacts/:id", async (req, res) => {
-  const { id } = req.params;
-  const data = req.body;
-
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  try {
-    const contactFetched = await db.select().from(contacts).where(eq(contacts.id, id));
-    const contactObj = contactFetched[0];
-    if (!contactObj) {
-      return res.status(404).json({ error: "Contact not found." });
-    }
-
-    const assocProspectFetched = await db.select().from(prospects).where(eq(prospects.id, contactObj.prospectId));
-    const assocProspect = assocProspectFetched[0];
-    if (!isAdmin && assocProspect && assocProspect.assignedOfficerId !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only modify contacts for your own prospects." });
-    }
-
-    const updates = { ...data };
-    delete updates.id;
-
-    await db.update(contacts).set(updates).where(eq(contacts.id, id));
-
-    const updatedContactFetched = await db.select().from(contacts).where(eq(contacts.id, id));
-    const updatedContact = updatedContactFetched[0];
-
-    const pName = assocProspect ? assocProspect.name : "Unknown Enterprise";
-
-    return res.json({
-      ...updatedContact,
-      prospectName: pName
-    });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Patch contact failed:", err);
-    return res.status(500).json({ error: "Failed to update contact: " + err.message });
-  }
-});
-
-app.delete("/api/contacts/:id", async (req, res) => {
-  const { id } = req.params;
-
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  try {
-    const contactFetched = await db.select().from(contacts).where(eq(contacts.id, id));
-    const contactObj = contactFetched[0];
-    if (!contactObj) {
-      return res.status(404).json({ error: "Contact not found." });
-    }
-
-    const assocProspectFetched = await db.select().from(prospects).where(eq(prospects.id, contactObj.prospectId));
-    const assocProspect = assocProspectFetched[0];
-    if (!isAdmin && assocProspect && assocProspect.assignedOfficerId !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only delete contacts for your own prospects." });
-    }
-
-    await db.delete(contacts).where(eq(contacts.id, id));
-
-    // Clear primary reference on prospects if matching
-    await db.update(prospects)
-      .set({ primaryContactId: null })
-      .where(eq(prospects.primaryContactId, id));
-
-    return res.json({ success: true });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Delete contact failed:", err);
-    return res.status(500).json({ error: "Failed to delete contact: " + err.message });
-  }
-});
-
-// CRUD ACTIVITIES
-app.get("/api/activities", async (req, res) => {
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.json([]);
-
-  try {
-    let list;
-    if (isAdmin) {
-      list = await db.select({
-        id: activities.id,
-        prospectId: activities.prospectId,
-        prospectName: prospects.name,
-        date: activities.date,
-        time: activities.time,
-        officerId: activities.officerId,
-        officerName: activities.officerName,
-        activityType: activities.activityType,
-        outcome: activities.outcome,
-        notes: activities.notes,
-        status: activities.status,
-        createdAt: activities.createdAt
-      }).from(activities)
-        .leftJoin(prospects, eq(activities.prospectId, prospects.id));
-    } else {
-      list = await db.select({
-        id: activities.id,
-        prospectId: activities.prospectId,
-        prospectName: prospects.name,
-        date: activities.date,
-        time: activities.time,
-        officerId: activities.officerId,
-        officerName: activities.officerName,
-        activityType: activities.activityType,
-        outcome: activities.outcome,
-        notes: activities.notes,
-        status: activities.status,
-        createdAt: activities.createdAt
-      }).from(activities)
-        .leftJoin(prospects, eq(activities.prospectId, prospects.id))
-        .where(eq(activities.officerId, userId));
-    }
-    return res.json(list);
-  } catch (err: any) {
-    const userActivities = isAdmin ? dbActivities : dbActivities.filter(a => a.officerId === userId);
-    const list = userActivities.map(a => {
-      const p = dbProspects.find(pr => pr.id === a.prospectId);
-      return {
-        ...a,
-        prospectName: p ? p.name : "Unknown Organization"
-      };
-    });
-    return res.json(list);
-  }
-});
-
-app.post("/api/activities", async (req, res) => {
-  const data = req.body;
-  if (!data.prospectId || !data.activityType) {
-    return res.status(400).json({ error: "Prospect and activity type are required." });
-  }
-
-  try {
-    const pFetched = await db.select().from(prospects).where(eq(prospects.id, data.prospectId));
-    const p = pFetched[0];
-    if (!p) {
-      return res.status(404).json({ error: "Prospect organization not found." });
-    }
-
-    const newActivityId = `activity-${Date.now()}`;
-    const newActivity = {
-      id: newActivityId,
-      prospectId: data.prospectId,
-      date: data.date || new Date().toISOString().split('T')[0],
-      time: data.time || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      officerId: data.officerId || "user-1",
-      officerName: data.officerName || "Julian Draxler",
-      activityType: data.activityType,
-      outcome: data.outcome || "",
-      notes: data.notes || "",
-      status: data.status || "Completed",
-      createdAt: new Date().toISOString()
-    };
-
-    await db.insert(activities).values(newActivity);
-
-    // Event: Follow-up Created & Due
-    if (newActivity.activityType === 'Follow-up' || data.activityType?.includes('Follow-up')) {
-      createNotification(
-        "Follow-up Created",
-        `Follow-up Scheduled: ${p.name}`,
-        `A follow-up activity has been scheduled with "${p.name}" on ${newActivity.date} at ${newActivity.time}.`,
-        "Task",
-        newActivity.officerId
-      );
-
-      if (newActivity.status === 'Scheduled') {
-        createNotification(
-          "Follow-up Due",
-          `Follow-up Due: ${p.name}`,
-          `The follow-up with "${p.name}" scheduled for ${newActivity.date} at ${newActivity.time} is now due.`,
-          "Task",
-          newActivity.officerId
-        );
-      }
-    }
-
-    // Update prospect stages automatically if appropriate and requested
-    if (data.updateProspectStage && data.updateProspectStage !== "") {
-      await db.update(prospects).set({ status: data.updateProspectStage }).where(eq(prospects.id, data.prospectId));
-    }
-
-    // Auto-generate Scheduled Activity Reminders (Phase 6)
-    if (newActivity.status === 'Scheduled') {
-      await createAutoReminders('activity', newActivity.id, newActivity.prospectId, p.name, `Activity: ${newActivity.activityType}`, newActivity.date, newActivity.time);
-    }
-
-    res.status(201).json({
-      ...newActivity,
-      prospectName: p.name
-    });
-
-    // Send real-time notification email if officer exists
-    const officerId = newActivity.officerId;
-    const uFetched = await db.select().from(users).where(eq(users.id, officerId));
-    const targetOfficer = uFetched[0];
-    if (targetOfficer && targetOfficer.email) {
-      sendNotificationEmail(
-        targetOfficer.email,
-        targetOfficer.fullName,
-        `SCM Activity Notification: ${newActivity.activityType}`,
-        `Corporate Advisory Work Registered`,
-        `The pipeline has registered a new activity of type "${newActivity.activityType}" with prospect organization "${p.name}" scheduled/logged for ${newActivity.date} at ${newActivity.time || "10:00 AM"}. Status: ${newActivity.status}.`
-      ).catch(err => console.error("[SCM NOTIFICATION ERROR] Failed on activity email send:", err));
-    }
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Activities POST failed:", err);
-    return res.status(500).json({ error: "Failed to persist activity: " + err.message });
-  }
-});
-
-const handleActivityUpdate = async (req: any, res: any) => {
-  const { id } = req.params;
-  const data = req.body;
-
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  try {
-    const actFetched = await db.select().from(activities).where(eq(activities.id, id));
-    const actObj = actFetched[0];
-    if (!actObj) {
-      return res.status(404).json({ error: "Activity not found." });
-    }
-
-    if (!isAdmin && actObj.officerId !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only modify your own activities." });
-    }
-
-    const updates = { ...data };
-    delete updates.id;
-
-    await db.update(activities).set(updates).where(eq(activities.id, id));
-
-    const updatedActFetched = await db.select().from(activities).where(eq(activities.id, id));
-    const updatedAct = updatedActFetched[0];
-
-    const pFetched = await db.select().from(prospects).where(eq(prospects.id, updatedAct.prospectId));
-    const p = pFetched[0];
-    const pName = p ? p.name : "Unknown Enterprise";
-
-    return res.json({
-      ...updatedAct,
-      prospectName: pName
-    });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Update activity failed:", err);
-    return res.status(500).json({ error: "Failed to update activity: " + err.message });
-  }
-};
-
-app.put("/api/activities/:id", handleActivityUpdate);
-app.patch("/api/activities/:id", handleActivityUpdate);
-
-app.delete("/api/activities/:id", async (req, res) => {
-  const { id } = req.params;
-
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  try {
-    const actFetched = await db.select().from(activities).where(eq(activities.id, id));
-    const actObj = actFetched[0];
-    if (!actObj) {
-      return res.status(404).json({ error: "Activity not found." });
-    }
-
-    if (!isAdmin && actObj.officerId !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only delete your own activities." });
-    }
-
-    await db.delete(activities).where(eq(activities.id, id));
-    return res.json({ success: true });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Delete activity failed:", err);
-    return res.status(500).json({ error: "Failed to delete activity: " + err.message });
-  }
-});
-
-// CRUD MEETINGS
-app.get("/api/meetings", async (req, res) => {
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.json([]);
-
-  if (isDatabaseHealthy) {
-    try {
-      let list;
-      if (isAdmin) {
-        list = await db.select({
-          id: meetings.id,
-          prospectId: meetings.prospectId,
-          prospectName: prospects.name,
-          officerId: meetings.officerId,
-          officerName: meetings.officerName,
-          date: meetings.date,
-          time: meetings.time,
-          durationMinutes: meetings.durationMinutes,
-          purpose: meetings.purpose,
-          outcome: meetings.outcome,
-          nextAction: meetings.nextAction,
-          createdAt: meetings.createdAt
-        }).from(meetings)
-          .leftJoin(prospects, eq(meetings.prospectId, prospects.id));
-      } else {
-        list = await db.select({
-          id: meetings.id,
-          prospectId: meetings.prospectId,
-          prospectName: prospects.name,
-          officerId: meetings.officerId,
-          officerName: meetings.officerName,
-          date: meetings.date,
-          time: meetings.time,
-          durationMinutes: meetings.durationMinutes,
-          purpose: meetings.purpose,
-          outcome: meetings.outcome,
-          nextAction: meetings.nextAction,
-          createdAt: meetings.createdAt
-        }).from(meetings)
-          .leftJoin(prospects, eq(meetings.prospectId, prospects.id))
-          .where(eq(meetings.officerId, userId));
-      }
-      return res.json(list);
-    } catch (err: any) {
-      isDatabaseHealthy = false;
-      console.warn("[SCM DATABASE] Meetings query notice: Operating in local memory fallback mode.", err.message || err);
-    }
-  }
-
-  const fallbackList = (dbMeetings || []).filter(m => isAdmin || m.officerId === userId);
-  return res.json(fallbackList);
-});
-
-app.post("/api/meetings", async (req, res) => {
-  const data = req.body;
-  if (!data.prospectId || !data.purpose || !data.date) {
-    return res.status(400).json({ error: "Prospect, purpose, and date are required." });
-  }
-
-  try {
-    const pFetched = await db.select().from(prospects).where(eq(prospects.id, data.prospectId));
-    const p = pFetched[0];
-    if (!p) {
-      return res.status(404).json({ error: "Prospect organization not found." });
-    }
-
-    const officerId = data.officerId || "user-1";
-    const officerName = data.officerName || "Julian Draxler";
-
-    const newMeetingId = `meeting-${Date.now()}`;
-    const newMeeting = {
-      id: newMeetingId,
-      prospectId: data.prospectId,
-      officerId: officerId,
-      officerName: officerName,
-      date: data.date,
-      time: data.time || "10:00 AM",
-      durationMinutes: Number(data.durationMinutes) || 45,
-      purpose: data.purpose,
-      outcome: data.outcome || "",
-      nextAction: data.nextAction || "",
-      createdAt: new Date().toISOString()
-    };
-
-    // Auto push a corresponding Scheduled Activity
-    const newActivityId = `activity-m-${Date.now()}`;
-    const autoAct = {
-      id: newActivityId,
-      prospectId: data.prospectId,
-      date: data.date,
-      time: data.time || "10:00 AM",
-      officerId: officerId,
-      officerName: officerName,
-      activityType: 'Meeting',
-      outcome: 'Scheduled: ' + data.purpose,
-      notes: 'Next action priority: ' + (data.nextAction || 'Unassigned'),
-      status: 'Scheduled',
-      createdAt: new Date().toISOString()
-    };
-
-    await db.insert(meetings).values(newMeeting);
-    await db.insert(activities).values(autoAct);
-
-    // Event: Meeting Scheduled
-    createNotification(
-      "Meeting Scheduled",
-      `Meeting Scheduled: ${data.purpose}`,
-      `A strategic advisory meeting with "${p.name}" has been scheduled for ${newMeeting.date} at ${newMeeting.time}.`,
-      "Meeting",
-      newMeeting.officerId
-    );
-
-    // Promote prospect stage to Meeting Scheduled if currently Lead/Contacted/Qualified
-    if (['Lead', 'Contacted', 'Qualified'].includes(p.status)) {
-      await db.update(prospects).set({ status: 'Meeting Scheduled' }).where(eq(prospects.id, data.prospectId));
-    }
-
-    // Auto-generate Scheduled Meeting Reminders (Phase 6)
-    await createAutoReminders('meeting', newMeeting.id, newMeeting.prospectId, p.name, `Meeting: ${newMeeting.purpose}`, newMeeting.date, newMeeting.time || "10:00 AM");
-
-    // REAL GOOGLE CALENDAR SYNCHRONIZATION INTEGRATION!
-    const token = activeUserTokens.get(officerId);
-    if (token) {
-      try {
-        const startTime = new Date(`${data.date}T${data.time || '10:00'}:00`);
-        const durationMin = Number(data.durationMinutes) || 45;
-        const endTime = new Date(startTime.getTime() + durationMin * 60000);
-        
-        const body = {
-          summary: `SCM Prospect Meeting: ${data.purpose}`,
-          description: `Strategic Advisory Session. Next actions list: ${data.nextAction || 'Awaiting logging'}`,
-          start: { dateTime: startTime.toISOString() },
-          end: { dateTime: endTime.toISOString() }
-        };
-
-        const calRes = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events`, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(body)
-        });
-
-        if (calRes.ok) {
-          console.log(`[SCM CALENDAR SYNC] Successfully auto-scheduled Google Calendar event for officer ${officerName}`);
-        } else {
-          console.warn(`[SCM CALENDAR SYNC] Google Calendar API returned failure status.`);
-        }
-      } catch (calErr) {
-        console.error("[SCM CALENDAR SYNC ERR]", calErr);
-      }
-    }
-
-    res.status(201).json({
-      ...newMeeting,
-      prospectName: p.name
-    });
-
-    // Send real-time notification email if officer exists
-    const uFetched = await db.select().from(users).where(eq(users.id, officerId));
-    const targetOfficer = uFetched[0];
-    if (targetOfficer && targetOfficer.email) {
-      sendNotificationEmail(
-        targetOfficer.email,
-        targetOfficer.fullName,
-        `Scheduled Advisory Meeting: ${newMeeting.purpose}`,
-        `Strategic Client Session Confirmed`,
-        `The executive planner has successfully added an investor advisory session with "${p.name}" on ${newMeeting.date} at ${newMeeting.time}. Agenda: ${newMeeting.purpose}.`
-      ).catch(err => console.error("[SCM NOTIFICATION ERROR] Failed on meeting email send:", err));
-    }
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Create meeting failed:", err);
-    return res.status(500).json({ error: "Failed to create meeting: " + err.message });
-  }
-});
-
-const handleMeetingUpdate = async (req: any, res: any) => {
-  const { id } = req.params;
-  const data = req.body;
-
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  try {
-    const meetingFetched = await db.select().from(meetings).where(eq(meetings.id, id));
-    const meetingObj = meetingFetched[0];
-    if (!meetingObj) {
-      return res.status(404).json({ error: "Meeting not found." });
-    }
-
-    if (!isAdmin && meetingObj.officerId !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only modify your own meetings." });
-    }
-
-    const updates = { ...data };
-    delete updates.id;
-
-    await db.update(meetings).set(updates).where(eq(meetings.id, id));
-
-    const updatedMeetingFetched = await db.select().from(meetings).where(eq(meetings.id, id));
-    const newMeeting = updatedMeetingFetched[0];
-
-    // Find prospect details
-    const pFetched = await db.select().from(prospects).where(eq(prospects.id, newMeeting.prospectId));
-    const p = pFetched[0];
-    const pName = p ? p.name : "Unknown Enterprise";
-
-    // Trigger Meeting rescheduled notification if date/time changed
-    if (updates.date && (updates.date !== meetingObj.date || updates.time !== meetingObj.time)) {
-      createNotification(
-        "Meeting rescheduled",
-        `Meeting Rescheduled: ${pName}`,
-        `The strategic advisory meeting with "${pName}" has been rescheduled to ${updates.date} at ${updates.time || meetingObj.time}.`,
-        undefined,
-        newMeeting.officerId
-      );
-    } else {
-      createNotification(
-        "Meeting Updated",
-        `Meeting Updated: ${pName}`,
-        `The advisory session details with "${pName}" have been updated.`,
-        "Meeting",
-        newMeeting.officerId
-      );
-    }
-
-    return res.json({
-      ...newMeeting,
-      prospectName: pName
-    });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Update meeting failed:", err);
-    return res.status(500).json({ error: "Failed to update meeting: " + err.message });
-  }
-};
-
-app.put("/api/meetings/:id", handleMeetingUpdate);
-app.patch("/api/meetings/:id", handleMeetingUpdate);
-
-app.delete("/api/meetings/:id", async (req, res) => {
-  const { id } = req.params;
-
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  try {
-    const meetingFetched = await db.select().from(meetings).where(eq(meetings.id, id));
-    const meetingObj = meetingFetched[0];
-    if (!meetingObj) {
-      return res.status(404).json({ error: "Meeting not found." });
-    }
-
-    if (!isAdmin && meetingObj.officerId !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only delete your own meetings." });
-    }
-
-    // Event: Meeting Cancelled
-    createNotification(
-      "Meeting Cancelled",
-      `Meeting Cancelled: ${meetingObj.purpose}`,
-      `The scheduled meeting "${meetingObj.purpose}" has been cancelled.`,
-      "Meeting",
-      meetingObj.officerId
-    );
-
-    await db.delete(meetings).where(eq(meetings.id, id));
-    return res.json({ success: true });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Delete meeting failed:", err);
-    return res.status(500).json({ error: "Failed to delete meeting: " + err.message });
-  }
-});
-
-// ==========================================
-// REMINDERS SYSTEM (Phase 6)
-// ==========================================
-
-async function createAutoReminders(
-  type: 'meeting' | 'activity' | 'task',
-  sourceId: string,
-  prospectId: string | undefined,
-  prospectName: string | undefined,
-  title: string,
-  eventDate: string,
-  eventTime: string
-) {
-  const intervals: ('1 Hour Before' | '24 Hours Before' | '7 Days Before')[] = [
-    '1 Hour Before',
-    '24 Hours Before',
-    '7 Days Before'
-  ];
-
-  for (const interval of intervals) {
-    const id = `rem-${type}-${sourceId}-${interval.replace(/\s+/g, '-').toLowerCase()}`;
-    const triggerText = `${interval} event on ${eventDate} at ${eventTime}`;
-
-    try {
-      await db.insert(reminders).values({
-        id,
-        type,
-        sourceId,
-        prospectId,
-        prospectName: prospectName || "General Operations",
-        title,
-        reminderTimeText: interval,
-        reminderDateTime: triggerText,
-        sent: false,
-        createdAt: new Date().toISOString()
-      });
-    } catch (err) {
-      console.warn("[SCM DATABASE WARNING] Failed to persist reminder to Postgres:", err);
-    }
-  }
-}
-
-app.get("/api/reminders", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  const { userId } = getRequestUser(req);
-  if (!userId) return res.json([]);
-
-  try {
-    const list = await getRemindersForUser(req);
-    return res.json(list);
-  } catch (err: any) {
-    console.error("GET /api/reminders error:", err);
-    return res.status(500).json({ error: "Failed to retrieve reminders", details: err.message });
-  }
-});
-
-app.post("/api/reminders", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  const { userId } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  try {
-    const { type, sourceId, prospectId, prospectName, title, reminderTimeText, reminderDateTime } = req.body;
-    
-    if (!type || !title || !reminderTimeText || !reminderDateTime) {
-      return res.status(400).json({ error: "Type, Title, Interval, and Trigger DateTime of reminder are required." });
-    }
-
-    const id = `rem-${Date.now()}`;
-    const newReminder: Reminder = {
-      id,
-      type,
-      sourceId: sourceId || "manual",
-      prospectId,
-      prospectName: prospectName || "General Operations",
-      title,
-      reminderTimeText,
-      reminderDateTime,
-      sent: false,
-      userId: userId,
-      createdAt: new Date().toISOString()
-    };
-
-    await db.insert(reminders).values(newReminder);
-    return res.status(201).json(newReminder);
-  } catch (err: any) {
-    console.error("POST /api/reminders error:", err);
-    return res.status(500).json({ error: "Failed to post reminder", details: err.message });
-  }
-});
-
-app.delete("/api/reminders/:id", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  try {
-    const { id } = req.params;
-    const reminderFetched = await db.select().from(reminders).where(eq(reminders.id, id));
-    const reminderObj = reminderFetched[0];
-    if (!reminderObj) {
-      return res.status(404).json({ error: "Reminder not found." });
-    }
-
-    if (!isAdmin && reminderObj.userId !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only delete your own reminders." });
-    }
-
-    await db.delete(reminders).where(eq(reminders.id, id));
-    return res.json({ success: true });
-  } catch (err: any) {
-    console.error("DELETE /api/reminders error:", err);
-    return res.status(500).json({ error: "Failed to delete reminder", details: err.message });
-  }
-});
-
-// NEW: Search Organizations endpoint returning exact matches instantly without premature blocking
-app.get("/api/apollo/search", async (req, res) => {
-  const query = (req.query.q || "").toString().trim();
-  if (!query) {
-    return res.json([]);
-  }
-  try {
-    const matchedCompanies = await searchOrganizations(query);
-    return res.json(matchedCompanies);
-  } catch (err) {
-    console.error("Search error in SCM proxy:", err);
-    return res.status(500).json({ error: "Failed to query Apollo database." });
-  }
-});
-
-// Helper to generate unverified predicted business emails
-function generatePredictedEmail(firstName: string, lastName: string, domain: string): string {
-  const f = (firstName || "").toLowerCase().trim().replace(/[^a-z0-9]/g, "");
-  const l = (lastName || "").toLowerCase().trim().replace(/[^a-z0-9]/g, "");
-  const d = (domain || "").toLowerCase().trim();
-  
-  if (!f) return `info@${d || "scmcapital.com.ng"}`;
-  if (!l) return `${f}@${d || "scmcapital.com.ng"}`;
-  
-  // Predict typical business email format: first.last@domain
-  return `${f}.${l}@${d || "scmcapital.com.ng"}`;
-}
-
-// NEW: Direct Executive Search Route targeting individual professionals immediately (Phase 4, 5, 6)
-app.get("/api/apollo/executive-search", async (req, res) => {
-  const query = (req.query.q || "").toString().trim();
-  if (!query) {
-    return res.json({ error: "Search query is required." });
-  }
-
-  console.log(`[EXECUTIVE SEARCH] Direct executive lookup requested: "${query}"`);
-
-  // Parse titles
-  const titles = [
-    "CFO", "Chief Financial Officer", "Chief Finance Officer",
-    "Treasurer", "Head of Treasury", "Treasury Manager", "Treasury Officer",
-    "CEO", "Chief Executive Officer", "President",
-    "Finance Director", "Director of Finance", "Finance Manager", "Head of Finance", "Head, Corporate Finance", "Corporate Finance",
-    "Managing Director", "MD",
-    "Executive Director", "General Manager", "GM"
-  ];
-
-  let detectedTitle: string | null = null;
-  let cleanOrgName = query;
-
-  for (const title of titles) {
-    const regex = new RegExp(`\\b${title}\\b`, "i");
-    if (regex.test(query)) {
-      detectedTitle = title;
-      cleanOrgName = query.replace(regex, "").replace(/\s+for\s+/gi, " ").trim();
-      break;
-    }
-  }
-
-  const searchTitles = detectedTitle ? [detectedTitle] : [
-    "CFO", "Treasurer", "Finance Director", "Head of Finance", "Head of Treasury", "Head, Corporate Finance", "Corporate Finance",
-    "HR Director", "Managing Director", "CEO", "Chief Financial Officer"
-  ];
-
-  try {
-    let companyId = "";
-    let companyDomain = "scmcapital.com.ng";
-    let matchedCoName = cleanOrgName;
-    let companyInfo: any = null;
-
-    // First search organizations matching company name keyword
-    const matchedCompanies = await searchOrganizations(cleanOrgName);
-    if (matchedCompanies.length > 0) {
-      const co = matchedCompanies[0];
-      companyId = co.id;
-      companyDomain = co.domain || "scmcapital.com.ng";
-      matchedCoName = co.name;
-
-      try {
-        companyInfo = await enrichOrganization(co.domain, co.name, co.id);
-      } catch (err) {
-        console.warn("[EXECUTIVE SEARCH] Org enrichment skipped:", err);
-      }
-    }
-
-    const mappedPeople = await discoverDecisionMakers(companyId, companyDomain, matchedCoName);
-
-    const verificationReport = {
-      status: companyInfo ? "Verified" : "Partially Verified",
-      dnsResolved: true,
-      lastChecked: new Date().toISOString().split('T')[0],
-      scrapedAt: new Date().toISOString().split('T')[0],
-      confidenceScore: companyInfo ? 90 : 70,
-      trustedRegistries: ["Apollo Global Registrar Directory"],
-      dnsStatus: "Domain points to active DNS server",
-      reasons: ["Apollo index verified matching registry records."],
-      failures: []
-    };
-
-    let overview = {
-      id: companyId || `co-${Date.now()}`,
-      name: companyInfo?.name || matchedCoName,
-      industry: companyInfo?.industry || "Energy & Services",
-      website: companyInfo?.domain || companyDomain,
-      headquarters: companyInfo?.headquarters || "Lagos, Nigeria",
-      description: companyInfo?.description || `${matchedCoName} profiled dossier generated from Apollo index registry matching query "${query}".`,
-      employeeCount: companyInfo?.employeeCount || "Information Not Found",
-      revenueValue: companyInfo?.revenueValue || "Information Not Found"
-    };
-
-    let finalResult: any = {
-      unverified: false,
-      overview,
-      validationDetails: verificationReport,
-      fieldAttributions: {
-        name: { value: overview.name, source: "Apollo Organization Search", confidence: "High" },
-        industry: { value: overview.industry, source: "Apollo Sector Classification", confidence: "High" },
-        website: { value: overview.website, source: "Whois Domain Registrar Probe", confidence: "High" },
-        headquarters: { value: overview.headquarters, source: "Corporate Headquarters Registry Log", confidence: "High" }
-      }
-    };
-
-    let usedGemini = false;
-    if (aiClient) {
-      try {
-        console.log(`[EXECUTIVE SEARCH] Running Serena AI Synthesizer...`);
-        const prompt = `You are "Serena", elite financial analyst at SCM Capital Ltd.
-Analyze the executives found matching query "${query}" for ${overview.name}.
-VERIFIED COMPANY: ${JSON.stringify(overview)}
-FOUND EXECUTIVES: ${JSON.stringify(mappedPeople, null, 2)}
-
-Provide high-quality analytics matched strictly to this required JSON format:
-{
-  "metrics": {
-    "treasuryPotential": "cash flow optimization suitabilities, CP yield, or seasonal operating buffers based on scale.",
-    "mmfOpportunity": "Analytical suitability breakdown for the SCM Corporate Money Market Fund.",
-    "wealthManagementFit": "Fit analysis for SCM Private Trust discretionary advisory addressing C-suite leaders.",
-    "literacyAdoptionScore": "Briefing or seminar fit assessment.",
-    "overallOpportunityScore": 85
-  },
-  "contactDiscovery": [
-     {
-       "fullName": "Exact full name of person",
-       "position": "Exact position",
-       "priorityRank": "Priority 1 or Priority 2 or Priority 3",
-       "priorityReason": "C-suite strategic relationship rationale match",
-       "recommendedPitch": "SCM product category pitch recommendation",
-       "pitchReason": "Detailed match reason explaining why they should be pitched this product."
-     }
-  ],
-  "meetingPrep": {
-    "beforeMeetingFacts": [
-      "Factual operational dimension 1",
-      "Factual operational dimension 2"
-    ],
-    "talkingPoints": [
-      "Bespoke liquidity optimizations...",
-      "T+1 settlement..."
-    ],
-    "objections": [
-      {
-        "objection": "Commercial banks are lower risk.",
-        "scmResponse": "SCM is SEC-regulated..."
-      }
-    ],
-    "followUpActions": [
-      "Deliver tailored briefs...",
-      "Schedule introduction."
-    ]
-  },
-  "growthIndicators": {
-    "companyGrowth": "Growth analysis",
-    "treasuryOpportunity": "Short term options description."
-  }
-}
-Return ONLY valid JSON.`;
-
-        const gResponse = await robustGenerateContent({
-          model: "gemini-3.5-flash",
-          contents: prompt,
-          config: { responseMimeType: "application/json" }
-        });
-
-        const text = gResponse.text;
-        if (text) {
-          const parsed = JSON.parse(text.trim());
-          const geminiDiscovery = parsed.contactDiscovery || [];
-          const alignedContacts = mappedPeople.map(p => {
-            const geminiMatch = geminiDiscovery.find((gd: any) => 
-              gd.fullName?.toLowerCase() === p.fullName.toLowerCase() ||
-              gd.position?.toLowerCase() === p.position.toLowerCase()
-            );
-            return {
-              ...p,
-              priorityRank: geminiMatch?.priorityRank || "Priority 1",
-              priorityReason: geminiMatch?.priorityReason || "Direct relationship lead.",
-              recommendedPitch: geminiMatch?.recommendedPitch || "Treasury Management",
-              pitchReason: geminiMatch?.pitchReason || "Liquidity buffer optimization."
-            };
-          });
-
-          finalResult = {
-            ...finalResult,
-            metrics: parsed.metrics,
-            contactDiscovery: alignedContacts,
-            publicDirectory: {
-              switchboard: overview.website !== "Not Found" ? "01-" + Math.floor(1000000 + Math.random() * 9000000) : "Not Found",
-              switchboardSource: "Telecom Public Switchboard",
-              switchboardLevel: "Public"
-            },
-            meetingPrep: parsed.meetingPrep,
-            growthIndicators: parsed.growthIndicators
-          };
-          usedGemini = true;
-        }
-      } catch (geminiError) {
-        console.warn("[EXECUTIVE SEARCH] Gemini model call failed, falling back to heuristics:", geminiError);
-      }
-    }
-
-    if (!usedGemini) {
-      const alignedContacts = mappedPeople.map(p => ({
-        ...p,
-        priorityRank: "Priority 1",
-        priorityReason: "Direct relationship lead identified via executive direct search mode.",
-        recommendedPitch: "Treasury Management and CP placement notes",
-        pitchReason: "Fiduciary alignment and cash deployment optimization."
-      }));
-
-      finalResult = {
-        ...finalResult,
-        metrics: {
-          treasuryPotential: `Calculated as highly suited for short-term placements given direct executive indexing.`,
-          mmfOpportunity: "Highly recommended for SCM Corporate Money Market Fund to optimize yield.",
-          wealthManagementFit: "Discretionary Trust Mandated for C-suite alignment.",
-          literacyAdoptionScore: "Corporate money-market fit.",
-          overallOpportunityScore: 85
-        },
-        contactDiscovery: alignedContacts,
-        publicDirectory: {
-          switchboard: "01-" + Math.floor(1000000 + Math.random() * 9000000),
-          switchboardSource: "Telecom Public Switchboard",
-          switchboardLevel: "Public"
-        },
-        meetingPrep: {
-          beforeMeetingFacts: ["Direct executive mapping completed."],
-          talkingPoints: ["Custom capital placements offering premium liquidity buffers and yields."],
-          objections: [{ objection: "Commercial banks safety", scmResponse: "SEC regulated diversification" }],
-          followUpActions: ["Submit introductory proposal"]
-        },
-        growthIndicators: {
-          companyGrowth: "High potential sector fit",
-          treasuryOpportunity: "Commercial Papers and MMF"
-        }
-      };
-    }
-
-    const contactsToSendSearch = finalResult.contactDiscovery || [];
-    console.log(
-      "[CONTACT TRACE] Contacts Sent To Client:",
-      contactsToSendSearch.length
-    );
-    console.log(
-      "[CONTACT TRACE] First 3 Contacts Sent To Client (executive-search):",
-      JSON.stringify(contactsToSendSearch.slice(0, 32), null, 2).substring(0, 2000)
-    );
-
-    finalResult.contacts = contactsToSendSearch;
-    finalResult.apolloRawCount = (apolloDiagnostics as any).apolloRawCount || 0;
-    finalResult.verifiedCompanyCount = (apolloDiagnostics as any).verifiedCompanyCount || 0;
-    finalResult.rejectedCount = (apolloDiagnostics as any).rejectedCount || 0;
-    res.json(finalResult);
-  } catch (err) {
-    console.error("Executive Search error:", err);
-    res.status(500).json({ error: "Failed to perform executive search." });
-  }
-});
-
-// NEW: Server-Side Apollo Diagnostic Endpoint
-app.get("/api/apollo/diagnostics", (req, res) => {
-  return res.json(apolloDiagnostics);
-});
-
-// AUDIT PROXY ENDPOINT FOR PHASE 1: POST /api/v1/mixed_people/api_search
-app.post("/api/v1/mixed_people/api_search", async (req, res) => {
-  const payload = req.body || {};
-  console.log("[APOLLO PROXY AUDIT] Incoming Request Payload:", JSON.stringify(payload, null, 2));
-
-  const start = Date.now();
-  const apolloApiKey = process.env.APOLLO_API_KEY;
-    if (!apolloApiKey) {
-      return res.status(503).json({ error: 'Apollo integration is not configured.' });
-    }
-  
-  try {
-    const apolloRes = await fetch("https://api.apollo.io/api/v1/mixed_people/api_search", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-cache",
-        "X-Api-Key": apolloApiKey
-      },
-      body: JSON.stringify(payload)
-    });
-
-    const elapsed = Date.now() - start;
-    const responseHeaders: any = {};
-    apolloRes.headers.forEach((val, key) => {
-      responseHeaders[key] = val;
-    });
-
-    const data = await apolloRes.json().catch(() => ({}));
-    const entries = data.total_entries ?? 0;
-    const pages = data.total_pages ?? 0;
-    const people = data.people || [];
-
-    console.log(`[APOLLO PROXY AUDIT] Response Metadata: Status ${apolloRes.status}, Latency ${elapsed}ms`);
-    console.log(`[APOLLO PROXY AUDIT] Total Entries: ${entries}, Total Pages: ${pages}, People Length: ${people.length}`);
-
-    const first5 = people.slice(0, 5).map((p: any) => ({
-      id: p.id || "N/A",
-      name: p.name || `${p.first_name || ""} ${p.last_name || ""}`.trim() || "N/A",
-      title: p.title || "N/A",
-      organization_name: p.organization?.name || "N/A",
-      linkedin_url: p.linkedin_url || "N/A",
-      email_status: p.email_status || "not found",
-      phone_status: (p.phone_numbers && p.phone_numbers.length > 0) ? "found" : "not found"
-    }));
-
-    console.log("[APOLLO PROXY AUDIT] First 5 Records:");
-    console.table(first5);
-
-    const report = {
-      timestamp: new Date().toISOString(),
-      requestUrl: "POST https://api.apollo.io/api/v1/mixed_people/api_search",
-      requestPayload: payload,
-      responseMetadata: {
-        status: apolloRes.status,
-        statusText: apolloRes.statusText,
-        latencyMs: elapsed,
-        headers: responseHeaders,
-        total_entries: entries,
-        total_pages: pages,
-        peopleLength: people.length
-      },
-      first5Records: first5
-    };
-
-    // Store audit output to ./apollo_evidence_report.json
-    fs.writeFileSync("./apollo_evidence_report.json", JSON.stringify(report, null, 2));
-    console.log("[APOLLO PROXY AUDIT] Apollo Evidence Report updated successfully at ./apollo_evidence_report.json");
-
-    // Automatically log Apollo Search interaction
-    const queryText = payload.q_organization_names || payload.q_organization_domains || payload.person_titles || JSON.stringify(payload);
-    await logAiInteraction(req, {
-      searchQuery: String(queryText),
-      searchType: "Apollo Search",
-      companyName: payload.q_organization_names ? String(payload.q_organization_names) : null,
-      tokensConsumed: 0,
-      responseTime: elapsed,
-      status: apolloRes.status < 400 ? "Success" : "Failed",
-      searchResult: `Found ${people.length} contacts. Top: ${first5.slice(0, 3).map(f => `${f.name} (${f.title} at ${f.organization_name})`).join(", ")}`
-    });
-
-    res.status(apolloRes.status).json(data);
-  } catch (err: any) {
-    console.error("[APOLLO PROXY AUDIT ERROR]", err);
-    res.status(500).json({ error: "APOLLO_PROXY_ERR", message: err.message || String(err) });
-  }
-});
-
-// INTELLIGENCE ENGINE (PROSPECT RESEARCH) WITH TRUST GUARDRAILS
-app.post("/api/gemini/intelligence", async (req, res) => {
-  const { companyName } = req.body;
-  if (!companyName) {
-    return res.status(400).json({ error: "Company name is required for Prospect Intelligence research." });
-  }
-
-  const { userId, email } = getRequestUser(req);
-  if (!userId) {
-    return res.status(401).json({ error: "Access denied. Sign-in required." });
-  }
-
-  let userName = "Julian Draxler";
-  try {
-    const condition = userId ? eq(users.id, userId) : eq(users.email, email.toLowerCase());
-    const pgUsers = await db.select().from(users).where(condition);
-    if (pgUsers.length > 0) {
-      userName = pgUsers[0].fullName;
-    } else if (email) {
-      userName = email.split('@')[0];
-    }
-  } catch (err) {}
-
-  const queryClean = companyName.trim();
-  console.log(`[APOLLO INTEL] Commencing live dossier synthesis for matching query: [${queryClean}]`);
-
-  const auditId = `audit-${Date.now()}`;
-  const timestamp = new Date().toISOString();
-
-  let attempts = 3;
-  let success = false;
-  let lastError: any = null;
-  let finalResult: any = null;
-
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    try {
-      console.log(`[SCM DOSSIER ATTEMPT] Commencing compilation (Attempt ${attempt}/${attempts}) for ${queryClean}`);
-      // 1. Live Apollo organization search
-    const matchedCompanies = await searchOrganizations(queryClean);
-    
-    if (matchedCompanies.length === 0) {
-      console.warn(`[APOLLO INTEL] Zero matching corporate records found in Apollo search on query: "${queryClean}"`);
-      const failures = [
-        "Empty match response returned from Apollo Registrar",
-        "Could not verify registered corporate domain on active DNS records",
-        "No verified executives found"
-      ];
-
-      // Log unverified search
-      try {
-        await db.insert(systemAuditLogs).values({
-          id: auditId,
-          timestamp,
-          userId: userId || null,
-          userEmail: email || null,
-          userName: userName || null,
-          action: "Search Blocked: Entity unverified/fabricated",
-          target: companyName || null,
-          status: "Verification Failed",
-          metadata: {
-            searchTerm: companyName,
-            sourcesUsed: ["Apollo Global Registrar Directory"],
-            confidenceScore: 0,
-            failures
-          }
-        });
-      } catch (logErr: any) {
-        console.error("[SCM DATABASE] Failed to save search verification failure log:", logErr);
-      }
-
-      return res.status(200).json({
-        unverified: true,
-        companyName,
-        error: "Information not found from trusted public sources.",
-        details: `We could not verify any registered records, active commercial operations, or resolving DNS records matching the term "${companyName}" from the Apollo API.`,
-        validationDetails: {
-          status: "Unverified",
-          dnsResolved: false,
-          lastChecked: new Date().toISOString().split('T')[0],
-          confidenceScore: 0,
-          dnsStatus: "Unknown domain lookups",
-          failures
-        }
-      });
-    }
-
-    // 2. Select first matched organization and perform enrichment (Phase 4)
-    const initialCompany = matchedCompanies[0];
-    console.log(`[APOLLO INTEL] Matching target found: ${initialCompany.name} (${initialCompany.domain})`);
-    
-    // Phase 6 â€” Dossier Generation Validation
-    const doesMatchIntent = (companyName: string, query: string): boolean => {
-      const normName = companyName.toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
-      const normQuery = query.toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
-
-      if (normName.includes(normQuery) || normQuery.includes(normName)) {
-        return true;
-      }
-
-      const queryWords = normQuery.split(/\s+/).filter(w => w.length > 2 && w !== "ltd" && w !== "plc" && w !== "inc" && w !== "limited" && w !== "capital");
-      for (const word of queryWords) {
-        if (normName.includes(word)) {
-          return true;
-        }
-      }
-      return false;
-    };
-
-    if (!doesMatchIntent(initialCompany.name, queryClean)) {
-      console.warn(`[APOLLO INTEL] Relevance check failed: "${initialCompany.name}" does not match search intent "${queryClean}"`);
-      return res.status(400).json({
-        error: "No sufficiently relevant Apollo match found.",
-        details: `We searched Apollo for "${queryClean}" but the closest match returned was "${initialCompany.name}". Under SCM Capital's strict relevance requirements, this transaction is blocked to prevent compiling irrelevant corporate records.`
-      });
-    }
-
-    // Update diagnostic values for clicked / selected company (Phase 5)
-    apolloDiagnostics.selectedOrganization = initialCompany.name;
-    apolloDiagnostics.selectedOrganizationId = initialCompany.id;
-    
-    const company = await enrichOrganization(initialCompany.domain, initialCompany.name, initialCompany.id) || initialCompany;
-
-    // 3. Discover Decision Makers (Phase 5) via specialized C-suite and finance list
-    const people = await discoverDecisionMakers(company.id, company.domain, company.name);
-    console.log(`[APOLLO INTEL] Decision-makers discovered on Apollo: ${people.length} contacts`);
-
-    // 4. Run Data Verification Engine (Phase 7)
-    // No blocking verification checks are enforced - we always return results and display profile analyses.
-    const isPreset = false; 
-    const verificationReport = verifyData(company, people, isPreset);
-
-    // Let's formulate the base response layout
-    finalResult = {
-      unverified: false,
-      overview: {
-        name: company.name,
-        industry: company.industry,
-        website: company.domain,
-        headquarters: company.headquarters,
-        description: company.description,
-        employeeCount: company.employeeCount,
-        revenueValue: company.revenueValue,
-        linkedinUrl: company.linkedinUrl,
-        companyType: company.companyType,
-        yearFounded: company.yearFounded,
-        techStack: company.techStack,
-        keywords: (company as any).keywords,
-        total_funding: (company as any).total_funding,
-        funding_rounds: (company as any).funding_rounds,
-        hiring_trends: (company as any).hiring_trends,
-        employee_growth: (company as any).employee_growth,
-        locations: (company as any).locations,
-        departments: (company as any).departments,
-        similar_companies: (company as any).similar_companies,
-        signals: (company as any).signals,
-        metadata: (company as any).metadata
-      },
-      validationDetails: {
-        status: verificationReport.status,
-        dnsResolved: verificationReport.dnsResolved,
-        lastChecked: verificationReport.lastChecked,
-        scrapedAt: verificationReport.scrapedAt,
-        confidenceScore: verificationReport.confidenceScore,
-        trustedRegistries: verificationReport.trustedRegistries,
-        dnsStatus: verificationReport.dnsStatus,
-        reasons: verificationReport.reasons,
-        failures: verificationReport.failures
-      },
-      fieldAttributions: {
-        name: { value: company.name, source: "Apollo Organization Search", confidence: "High" },
-        industry: { value: company.industry, source: "Apollo Sector Classification", confidence: company.industry !== "Information Not Found" ? "High" : "None" },
-        website: { value: company.domain, source: "Whois Domain Registrar Probe", confidence: "High" },
-        headquarters: { value: company.headquarters, source: "Corporate Headquarters Registry Log", confidence: company.headquarters !== "Information Not Found" ? "High" : "None" },
-        description: { value: company.description, source: "Apollo General Index", confidence: "Medium" },
-        employeeCount: { value: company.employeeCount, source: "Enterprise filings", confidence: company.employeeCount !== "Information Not Found" ? "High" : "None" },
-        revenueValue: { value: company.revenueValue, source: "SEC Quarterly Returns", confidence: company.revenueValue !== "Information Not Found" ? "High" : "None" }
-      }
-    };
-
-    // 5. Pre-calculate Product Recommendations (Phase 9 V1 Recs)
-    const recEngine = calculateProductRecommendations(company, people, verificationReport.confidenceScore);
-
-    // Run SCM Analysis with Gemini (Phase 9) using strict anti-hallucination guardrails (Phase 8)
-    let usedGemini = false;
-    if (aiClient) {
-      try {
-        console.log(`[APOLLO INTEL] Dispatching verified facts to Serena Institutional Analyst model...`);
-        const prompt = `You are "Serena", the elite, certified Institutional Financial Analyst at SCM Capital Ltd, Nigeria.
-Your role is to strictly analyze the verified corporate prospect data provided below.
-
-SCM ZERO-HALLUCINATION DIRECTIVES (PHASE 8):
-1. You are strictly forbidden from inventing, guessing, or fabricating any company details, domains, logos, phone numbers, headquarters, employee headcounts, investor relations directories, or executive details.
-2. If any verified attribute is "Not Found" or "Information Not Found", you must leave it exactly as-is. Never guess or try to fill it.
-3. Every analytical section you construct MUST be strictly grounded in the provided verified data and logical corporate scales (e.g. analyzing high-yield cash flow suitabilities for SCM Corporate MMF based on employee size of ${company.employeeCount} and revenue of ${company.revenueValue}).
-4. You are strictly forbidden from altering or making up Contact Names, Email Addresses, Phone Numbers, Websites, and Revenue numbers. All analysis must be strictly qualitative.
-5. SCM Opportunity Score must be calculated organically as a number between 0 to 100 based on the verified metrics scale.
-
-SCM LIGHTWEIGHT RULES-BASED RECOMMENDATION MATRIX (VERSION 1) DIRECTIVE:
-Our rules engine has calculated the following precise SCM product recommendation scores for ${company.name}:
-${recEngine.matrix.map(e => `- ${e.product}: Score = ${e.score}`).join("\n")}
-
-You MUST return a "recommendationMatrix" array field in your JSON containing all 8 SCM products exactly matching the pre-calculated scores and descending order above. For each product, you must write a custom, brilliant 1-2 sentence professional explanation ("reason") as the elite SCM advisor "Serena", explaining why this product makes strategic sense or does not fit ${company.name} based on its operating industry sector (${company.industry}), scale, and found executives.
-
-VERIFIED COMPANY DATA:
-Company Name: ${company.name}
-Domain: ${company.domain}
-Industry: ${company.industry}
-Headquarters: ${company.headquarters}
-Employee Size: ${company.employeeCount}
-Representative Revenue Scale: ${company.revenueValue}
-Description: ${company.description}
-LinkedIn: ${company.linkedinUrl}
-
-VERIFIED DECISION MAKERS LIST:
-${JSON.stringify(people, null, 2)}
-
-Map your analysis strictly to this required JSON output format:
-{
-  "metrics": {
-    "treasuryPotential": "A detailed 1-2 sentence analytical brief on their cash flow optimization suitabilities, CP yield, or seasonal operating buffers based on scale.",
-    "mmfOpportunity": "Analytical suitability breakdown for the SCM Corporate Money Market Fund.",
-    "wealthManagementFit": "Fit analysis for SCM Private Trust discretionary advisory addressing C-suite leaders.",
-    "literacyAdoptionScore": "Detailed description of whether a staff financial literacy briefing / pension planning seminar makes sense.",
-    "overallOpportunityScore": ${verificationReport.confidenceScore}
-  },
-  "contactDiscovery": [
-     // For each person in the verified list, construct the pitch attributes exactly mapping to this structure:
-     {
-       "fullName": "Exact full name of person in verified list",
-       "position": "Exact position of person in verified list",
-       "priorityRank": "Priority 1 or Priority 2 or Priority 3",
-       "priorityReason": "C-suite strategic relationship rationale match for SCM",
-       "recommendedPitch": "SCM product category pitch recommendation",
-       "pitchReason": "Detailed match reason explaining why they should be pitched this product."
-     }
-  ],
-  "recommendationMatrix": [
-     // List ALL 8 products exactly matching the pre-calculated scores and descending list provided above:
-     {
-       "product": "Product name exactly",
-       "score": number,
-       "reason": "Serena's custom 1-2 sentence qualitative analysis of why this fits ${company.name}."
-     }
-  ],
-  "meetingPrep": {
-    "beforeMeetingFacts": [
-      "Factual operational dimension 1 e.g. based on employee size: ${company.employeeCount}",
-      "Factual operational dimension 2 e.g. based on revenue: ${company.revenueValue}",
-      "Market position in ${company.industry}"
-    ],
-    "talkingPoints": [
-      "Bespoke liquidity optimizations delivering superior risk-adjusted yields compared to commercial savings accounts.",
-      "T+1 cash settlement advantages supporting operational workspace flexibilities.",
-      "Branded pension literacy briefings for employees to improve employee cooperative returns."
-    ],
-    "objections": [
-      {
-        "objection": "Commercial bank placements are considered lower counterparty risk.",
-        "scmResponse": "SCM's funds are fully SEC-regulated and diversified across prime assets, ensuring secure liquidity."
-      }
-    ],
-    "followUpActions": [
-      "Deliver tailored introductory briefs to the CFO outlining CP yields.",
-      "Schedule virtual briefing meeting."
-    ]
-  },
-  "growthIndicators": {
-    "companyGrowth": "A brief analysis of company scale potential based on representative variables.",
-    "treasuryOpportunity": "Short term liquidity placement options description.",
-    "employeeInvestment": "Staff investment briefing viability match.",
-    "institutionalInvestment": "Corporate bond options alignment rating."
-  }
-}
-
-Return ONLY the valid JSON structure matching this schema. Do not enclose it in any markdown backticks.`;
-
-        const gResponse = await robustGenerateContent({
-          model: "gemini-3.5-flash",
-          contents: prompt,
-          config: {
-            responseMimeType: "application/json"
-          }
-        });
-
-        const text = gResponse.text;
-        if (text) {
-          const parsed = JSON.parse(text.trim());
-          
-          // STRICT TASK 6 OVERRIDE ENGINE: Force contact discovery list to use exact Apollo parameters,
-          // simply merging the qualitative pitch analysis and parameters generated by Gemini.
-          const geminiDiscovery = parsed.contactDiscovery || [];
-          const alignedContacts = people.map(p => {
-            const geminiMatch = geminiDiscovery.find((gd: any) => 
-              gd.fullName?.toLowerCase() === p.fullName.toLowerCase() ||
-              gd.position?.toLowerCase() === p.position.toLowerCase()
-            );
-            return {
-              fullName: p.fullName,
-              position: p.position,
-              department: p.department,
-              seniority: p.seniority,
-              email: p.email,
-              phone: p.phone,
-              linkedin: p.linkedin,
-              bio: p.bio,
-              confidenceScore: p.confidenceScore,
-              source: p.source,
-              priorityRank: geminiMatch?.priorityRank || (p.position.toLowerCase().includes("cfo") || p.position.toLowerCase().includes("treasurer") || p.position.toLowerCase().includes("finance") ? "Priority 1" : "Priority 2"),
-              priorityReason: geminiMatch?.priorityReason || "Strategic relationship candidate indexed in the active security registry.",
-              recommendedPitch: geminiMatch?.recommendedPitch || (p.position.toLowerCase().includes("cfo") || p.position.toLowerCase().includes("treasurer") || p.position.toLowerCase().includes("finance") ? "Custom Treasury Management & CP notes" : "Private Trust Portfolio Advisory"),
-              pitchReason: geminiMatch?.pitchReason || "Fiduciary alignment mapping based on executive jurisdiction and cash deployment authority.",
-              validationLevel: "Verified"
-            };
-          });
-
-          // Overlay rules engine scores to guarantee complete compliance
-          let finalRecMatrix = parsed.recommendationMatrix || [];
-          if (finalRecMatrix.length === 0) {
-            finalRecMatrix = recEngine.matrix;
-          } else {
-            finalRecMatrix = recEngine.matrix.map(calc => {
-              const geminiItem = finalRecMatrix.find((g: any) => g.product?.toLowerCase() === calc.product?.toLowerCase());
-              return {
-                product: calc.product,
-                score: calc.score,
-                reason: geminiItem?.reason || calc.reason
-              };
-            });
-          }
-
-          finalResult = {
-            ...finalResult,
-            metrics: parsed.metrics,
-            contactDiscovery: alignedContacts,
-            recommendationMatrix: finalRecMatrix,
-            publicDirectory: {
-              switchboard: company.domain && company.domain !== "Not Found" ? "01-" + Math.floor(1000000 + Math.random() * 9000000) : "Not Found",
-              switchboardSource: "Telecom Public Switchboard",
-              switchboardLevel: "Public",
-              investorRelations: company.domain && company.domain !== "Not Found" ? `investor-relations@${company.domain}` : "Not Found",
-              investorRelationsSource: "Domain Root MX Extract",
-              investorRelationsLevel: "Public",
-              hrContact: company.domain && company.domain !== "Not Found" ? `careers@${company.domain}` : "Not Found",
-              hrContactSource: "Domain Root MX Extract",
-              hrContactLevel: "Public",
-              corporateAffairs: company.domain && company.domain !== "Not Found" ? `corporate-affairs@${company.domain}` : "Not Found",
-              corporateAffairsSource: "Domain Root MX Extract",
-              corporateAffairsLevel: "Public",
-              generalInquiryEmail: company.domain && company.domain !== "Not Found" ? `info@${company.domain}` : "Not Found",
-              generalInquiryEmailSource: "Domain Root MX Extract",
-              generalInquiryEmailLevel: "Public"
-            },
-            meetingPrep: parsed.meetingPrep,
-            growthIndicators: parsed.growthIndicators
-          };
-          usedGemini = true;
-        }
-      } catch (geminiError) {
-        console.warn("[APOLLO INTEL] Gemini service failed or live authentication issue. Falling back to structured pipeline:", geminiError);
-      }
-    }
-
-    if (!usedGemini) {
-      // Direct, clean deterministic mapping of Apollo facts without Gemini, ensuring complete system continuity
-      finalResult = {
-        ...finalResult,
-        metrics: {
-          treasuryPotential: `Calculated as highly suited for short-term corporate liquidity placements given industrial operating revenue of ${company.revenueValue}.`,
-          mmfOpportunity: "Highly recommended for SCM Corporate Money Market Fund to optimize idle funds yield.",
-          wealthManagementFit: "Discretionary Trust Mandates suited for senior directors seeking inflation-shielded advisory models.",
-          literacyAdoptionScore: `Highly viable given headcount scale of ${company.employeeCount} for retirement briefings and employees cooperatives schemes.`,
-          overallOpportunityScore: verificationReport.confidenceScore
-        },
-        contactDiscovery: people.map(p => ({
-          fullName: p.fullName,
-          position: p.position,
-          department: p.department,
-          seniority: p.seniority,
-          email: p.email,
-          phone: p.phone,
-          linkedin: p.linkedin,
-          bio: p.bio,
-          confidenceScore: p.confidenceScore,
-          source: p.source,
-          priorityRank: p.position.toLowerCase().includes("cfo") || p.position.toLowerCase().includes("treasurer") || p.position.toLowerCase().includes("finance") ? "Priority 1" : "Priority 2",
-          priorityReason: "Key financial allocator directing capital deployments and cash management.",
-          recommendedPitch: p.position.toLowerCase().includes("cfo") || p.position.toLowerCase().includes("treasurer") || p.position.toLowerCase().includes("finance") ? "SCM Corporate MMF & Treasury Placements" : "SCM Private trust Advisory Services",
-          pitchReason: "Fiduciary aligning mapped to corporate division and organizational mandate.",
-          validationLevel: "Verified"
-        })),
-        recommendationMatrix: recEngine.matrix,
-        publicDirectory: {
-          switchboard: company.domain && company.domain !== "Not Found" ? "01-" + Math.floor(1000000 + Math.random() * 9000000) : "Not Found",
-          switchboardSource: "Telecom Public Switchboard",
-          switchboardLevel: "Public",
-          investorRelations: company.domain && company.domain !== "Not Found" ? `investor-relations@${company.domain}` : "Not Found",
-          investorRelationsSource: "Domain Root MX Extract",
-          investorRelationsLevel: "Public",
-          hrContact: company.domain && company.domain !== "Not Found" ? `careers@${company.domain}` : "Not Found",
-          hrContactSource: "Domain Root MX Extract",
-          hrContactLevel: "Public",
-          corporateAffairs: company.domain && company.domain !== "Not Found" ? `corporate-affairs@${company.domain}` : "Not Found",
-          corporateAffairsSource: "Domain Root MX Extract",
-          corporateAffairsLevel: "Public",
-          generalInquiryEmail: company.domain && company.domain !== "Not Found" ? `info@${company.domain}` : "Not Found",
-          generalInquiryEmailSource: "Domain Root MX Extract",
-          generalInquiryEmailLevel: "Public"
-        },
-        meetingPrep: {
-          beforeMeetingFacts: [
-            `Verified financial turnover estimated at ${company.revenueValue}.`,
-            `Physical sovereign domain presence is matched to ${company.headquarters}.`,
-            `${people.length} verified board executives indexed on corporate register directories.`
-          ],
-          talkingPoints: [
-            "Asset monetization structures to augment liquidity profiles.",
-            "Cooperative treasury notes with customized maturity dates.",
-            "Fiduciary advisory programs matching the ongoing growth vectors."
-          ],
-          objections: [
-            { objection: "Counterparty risks on non-commercial bank placements.", scmResponse: "SCM funds operate under strict SEC Nigeria fiduciary policies, with multi-layered prime assets." }
-          ],
-          followUpActions: [
-            "Deploy introductory letter detailing SCM yield sheets.",
-            "Coordinate with corporate HR division to establish seminar parameters."
-          ]
-        },
-        growthIndicators: {
-          companyGrowth: "Entity operations scaling efficiently within domestic West African sectors.",
-          treasuryOpportunity: "Surplus cash accumulation represents prime placement opportunity in high-yield mutual funds.",
-          employeeInvestment: "Human resources division represents excellent partner for financial literacy modules.",
-          institutionalInvestment: "Direct co-investment pipelines are strongly matchable."
-        }
-      };
-    }
-
-    // Log the successful analysis in audit logs
-    try {
-      await db.insert(systemAuditLogs).values({
-        id: auditId,
-        timestamp,
-        userId: userId || null,
-        userEmail: email || null,
-        userName: userName || null,
-        action: "Dossier Synthesized Successfully",
-        target: companyName || null,
-        status: "Verified",
-        metadata: {
-          searchTerm: companyName,
-          sourcesUsed: ["Apollo Organization Search", "Apollo People Directory", ...verificationReport.trustedRegistries],
-          confidenceScore: verificationReport.confidenceScore,
-          failures: []
-        }
-      });
-    } catch (logErr: any) {
-      console.error("[SCM DATABASE] Failed to save successful dossier synthesis log:", logErr);
-    }
-
-    const contactsToSendIntel = finalResult.contactDiscovery || [];
-    console.log(
-      "[CONTACT TRACE] Contacts Sent To Client:",
-      contactsToSendIntel.length
-    );
-    console.log(
-      "[CONTACT TRACE] First 3 Contacts Sent To Client (gemini-intelligence):",
-      JSON.stringify(contactsToSendIntel.slice(0, 32), null, 2).substring(0, 2000)
-    );
-
-    finalResult.contacts = contactsToSendIntel;
-    finalResult.apolloRawCount = (apolloDiagnostics as any).apolloRawCount || 0;
-    finalResult.verifiedCompanyCount = (apolloDiagnostics as any).verifiedCompanyCount || 0;
-    finalResult.rejectedCount = (apolloDiagnostics as any).rejectedCount || 0;
-
-    // Log this AI Intelligence Research
-    const elapsedMs = Date.now() - parseInt(auditId.split('-')[1]);
-    await logAiInteraction(req, {
-      searchQuery: queryClean,
-      searchType: "Company Research",
-      companyName: company.name || companyName,
-      modelUsed: usedGemini ? "gemini-3.5-flash" : "Deterministic Rules Engine",
-      tokensConsumed: usedGemini ? 2500 : 0, // typical dossier has about 2500 tokens
-      responseTime: elapsedMs,
-      status: "Success",
-      searchResult: `Synthesized corporate dossier with ${contactsToSendIntel.length} contacts and product suitabilities.`
-    });
-
-    success = true;
-    break;
-  } catch (err: any) {
-    lastError = err;
-    console.error(`[SCM DOSSIER SYSTEM] Error on compile attempt ${attempt}/3:`, err);
-    if (attempt < attempts) {
-      await new Promise(resolve => setTimeout(resolve, 800));
-    }
-  }
-}
-
-if (!success) {
-  console.warn("Dossier compilation failed. Returning error as local fallback synthesis is disabled.");
-  return res.status(404).json({
-    error: "Failed to compile dossier.",
-    details: lastError?.message || "No sufficiently relevant Apollo match found or compilation failed. Under strict enterprise data integrity rules, fallback syntheses are disabled."
-  });
-}
-
-return res.json(finalResult);
-});
-
-app.get("/api/admin/users", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId || !isAdmin) {
-    return res.status(403).json({ error: "Access denied. Administrator privileges required." });
-  }
-  if (isDatabaseHealthy) {
-    try {
-      const allUsers = await db.select().from(users);
-      return res.json(allUsers);
-    } catch (err: any) {
-      isDatabaseHealthy = false;
-    }
-  }
-  return res.json(dbUsers);
-});
-
-app.put("/api/admin/users/:id", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  const { userId, isAdmin, isSuperAdmin } = getRequestUser(req);
-  if (!userId || !isAdmin) {
-    return res.status(403).json({ error: "Access denied. Administrator privileges required." });
-  }
-
-  const { id } = req.params;
-  const { fullName, role, department, status, password } = req.body || {};
-
-  if (password !== undefined) {
-    return res.status(400).json({
-      error: "Administrators cannot set user passwords. Use the secure Supabase password recovery flow."
-    });
-  }
-
-  try {
-    const { data: targetProfile, error: profileError } = await supabaseServer
-      .from('profiles')
-      .select('id, full_name, email, permission_level, department, status')
-      .eq('id', id)
-      .single();
-
-    if (profileError || !targetProfile) {
-      return res.status(404).json({ error: "User profile not found." });
-    }
-
-    const profileUpdates: any = { updated_at: new Date().toISOString() };
-    if (fullName !== undefined) profileUpdates.full_name = String(fullName).trim();
-    if (department !== undefined) profileUpdates.department = String(department).trim() || 'Asset Management';
-
-    if (status !== undefined) {
-      const statusMap: Record<string, string> = {
-        Approved: 'ACTIVE', Active: 'ACTIVE', ACTIVE: 'ACTIVE',
-        Pending: 'PENDING', PENDING: 'PENDING',
-        Suspended: 'SUSPENDED', SUSPENDED: 'SUSPENDED',
-        Rejected: 'REJECTED', REJECTED: 'REJECTED'
-      };
-      const mappedStatus = statusMap[String(status)];
-      if (!mappedStatus) return res.status(400).json({ error: 'Invalid account status.' });
-      profileUpdates.status = mappedStatus;
-      if (mappedStatus === 'ACTIVE') {
-        profileUpdates.approved_at = new Date().toISOString();
-        profileUpdates.approved_by = userId;
-      }
-    }
-
-    if (role !== undefined) {
-      if (!isSuperAdmin) {
-        return res.status(403).json({ error: 'Only the Super Admin can change permission levels.' });
-      }
-      const roleMap: Record<string, string> = {
-        SUPER_ADMIN: 'SUPER_ADMIN', HOD_ADMIN: 'HOD_ADMIN', Admin: 'HOD_ADMIN', STAFF: 'STAFF',
-        'Business Development Officer': 'STAFF', 'Relationship Manager': 'STAFF',
-        'Asset Management Officer': 'STAFF', 'Team Lead': 'STAFF', Director: 'STAFF'
-      };
-      const mappedPermission = roleMap[String(role)];
-      if (!mappedPermission) return res.status(400).json({ error: 'Invalid permission level.' });
-      profileUpdates.permission_level = mappedPermission;
-    }
-
-    const { data: updatedProfile, error: updateError } = await supabaseServer
-      .from('profiles')
-      .update(profileUpdates)
-      .eq('id', id)
-      .select('id, full_name, email, permission_level, department, status, avatar_url')
-      .single();
-
-    if (updateError || !updatedProfile) throw updateError || new Error('Profile update failed');
-
-    await logSystemEvent('Administrative Action', id, 'Success', req, {
-      targetEmail: targetProfile.email,
-      status: profileUpdates.status || targetProfile.status,
-      permissionLevel: profileUpdates.permission_level || targetProfile.permission_level
-    });
-
-    const legacyRole = updatedProfile.permission_level === 'SUPER_ADMIN'
-      ? 'SUPER_ADMIN'
-      : updatedProfile.permission_level === 'HOD_ADMIN' ? 'Admin' : 'Business Development Officer';
-
-    return res.json({
-      id: updatedProfile.id,
-      fullName: updatedProfile.full_name,
-      email: updatedProfile.email,
-      role: legacyRole,
-      permissionLevel: updatedProfile.permission_level,
-      department: updatedProfile.department,
-      avatarUrl: updatedProfile.avatar_url || '',
-      status: updatedProfile.status === 'ACTIVE' ? 'Active' : updatedProfile.status
-    });
-  } catch (err: any) {
-    console.error('[SPIP ADMIN] Failed to update user profile:', err?.message || err);
-    return res.status(500).json({ error: 'Unable to update this user profile.' });
-  }
-});
-
-app.delete("/api/admin/users/:id", async (req, res) => {
-  const { userId, isSuperAdmin } = getRequestUser(req);
-  if (!userId || !isSuperAdmin) {
-    return res.status(403).json({ error: 'Only the Super Admin can remove an account.' });
-  }
-  return res.status(405).json({
-    error: 'Permanent account deletion is disabled in Phase 1. Suspend the account instead to preserve the audit trail.'
-  });
-});
-
-// Admin system statistics/overview endpoint
-app.get("/api/admin/system-summary", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId || !isAdmin) {
-    return res.status(403).json({ error: "Access denied. Administrator privileges required." });
-  }
-
-  let totalUsers = dbUsers.length;
-  let pendingUsers = dbUsers.filter(u => u.status === "Pending" && u.role !== "Admin" && u.role !== "SUPER_ADMIN").length;
-  let approvedUsers = dbUsers.filter(u => u.status === "Approved" || u.status === "Active").length;
-  let rejectedUsers = dbUsers.filter(u => u.status === "Rejected").length;
-  let suspendedUsers = dbUsers.filter(u => u.status === "Suspended").length;
-  let totalProspects = dbProspects.length;
-  let totalMeetings = dbMeetings.length;
-  let totalTasks = dbTasks.length;
-  let totalNotifications = 0;
-  let totalWorkspaces = (dbWorkspaces || []).length;
-  let totalSearches = (dbAiSearchHistory || []).length;
-  let totalSerenaSessions = 0;
-
-  if (isDatabaseHealthy) {
-    try {
-      const pgUsers = await db.select().from(users);
-      totalUsers = pgUsers.length;
-      pendingUsers = pgUsers.filter(u => u.status === "Pending" && u.role !== "Admin" && u.role !== "SUPER_ADMIN").length;
-      approvedUsers = pgUsers.filter(u => u.status === "Approved" || u.status === "Active").length;
-      rejectedUsers = pgUsers.filter(u => u.status === "Rejected").length;
-      suspendedUsers = pgUsers.filter(u => u.status === "Suspended").length;
-
-      const prospectsFetched = await db.select().from(prospects);
-      totalProspects = prospectsFetched.length;
-
-      const meetingsFetched = await db.select().from(meetings);
-      totalMeetings = meetingsFetched.length;
-
-      const tasksFetched = await db.select().from(tasks);
-      totalTasks = tasksFetched.length;
-
-      const notificationsFetched = await db.select().from(notifications);
-      totalNotifications = notificationsFetched.length;
-
-      const workspacesFetched = await db.select().from(workspaces);
-      totalWorkspaces = workspacesFetched.length;
-
-      const totalSearchesFetched = await db.select().from(systemAuditLogs);
-      totalSearches = totalSearchesFetched.length;
-
-      const totalSerenaFetched = await db.select().from(serenaAuditLogs);
-      totalSerenaSessions = totalSerenaFetched.length;
-    } catch (err: any) {
-      isDatabaseHealthy = false;
-    }
-  }
-
-  const systemHealth = {
-    databaseConnected: isDatabaseHealthy,
-    redisCacheStatus: "Stable (Local Memory Fallback Active)",
-    apiStatus: "Fully Operational",
-    environment: process.env.NODE_ENV || "production"
-  };
-
-  return res.json({
-    users: {
-      total: totalUsers,
-      pending: pendingUsers,
-      approved: approvedUsers,
-      rejected: rejectedUsers,
-      suspended: suspendedUsers
-    },
-    prospects: totalProspects,
-    meetings: totalMeetings,
-    tasks: totalTasks,
-    notifications: totalNotifications,
-    workspaces: totalWorkspaces,
-    searches: totalSearches,
-    serena: totalSerenaSessions,
-    systemHealth
-  });
-});
-
-// Phase 14: API endpoint to fetch Admin Search and Data Verification Audit Logs
-app.get("/api/admin/audit-logs", async (req, res) => {
-  const { userId, email, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  let logs: any[] = [];
-  if (isDatabaseHealthy) {
-    try {
-      logs = await db.select().from(systemAuditLogs);
-    } catch (err: any) {
-      isDatabaseHealthy = false;
-    }
-  }
-
-  if (isAdmin) {
-    return res.json(logs);
-  }
-
-  const matchedUser = dbUsers.find(u => u.id === userId || (email && u.email.toLowerCase() === email.toLowerCase()));
-  const userName = matchedUser ? matchedUser.fullName : "Julian Draxler";
-
-  const filtered = logs.filter(log => {
-    return log.userId === userId || 
-           (log.userEmail && email && log.userEmail.toLowerCase() === email.toLowerCase()) || 
-           (log.userName && log.userName.toLowerCase() === userName.toLowerCase());
-  });
-  return res.json(filtered);
-});
-
-
-// ==========================================
-// WEEKLY PERFORMANCE REPORTS SYSTEM
-// ==========================================
-
-// 0. Auto-generate a weekly report from user's CRM activities
-app.get("/api/weekly-reports/auto-generate", async (req, res) => {
-  const { userId, email } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  const { weekStartDate, weekEndDate } = req.query;
-  if (!weekStartDate || !weekEndDate) {
-    return res.status(400).json({ error: "weekStartDate and weekEndDate are required." });
-  }
-
-  const startStr = String(weekStartDate);
-  const endStr = String(weekEndDate);
-
-  try {
-    // 1. Prospects created this week and assigned to user
-    const userProspects = await db.select().from(prospects).where(eq(prospects.assignedOfficerId, userId));
-    const prospectsCreatedThisWeek = userProspects.filter(p => p.createdAt && p.createdAt.substring(0, 10) >= startStr && p.createdAt.substring(0, 10) <= endStr);
-    const prospectsAddedCount = prospectsCreatedThisWeek.length;
-
-    // 2. Meetings held/scheduled
-    const userMeetings = await db.select().from(meetings).where(eq(meetings.officerId, userId));
-    const meetingsHeldThisWeek = userMeetings.filter(m => m.date >= startStr && m.date <= endStr);
-    const meetingsHeldCount = meetingsHeldThisWeek.length;
-
-    // 3. Completed CRM Activities (Calls/Visits/Follow-ups)
-    const userActivities = await db.select().from(activities).where(eq(activities.officerId, userId));
-    const completedActivitiesThisWeek = userActivities.filter(a => a.status === "Completed" && a.date >= startStr && a.date <= endStr);
-    const completedActivitiesCount = completedActivitiesThisWeek.length;
-
-    // 4. Tasks completed
-    const userTasks = await db.select().from(tasks).where(eq(tasks.officerId, userId));
-    const completedTasksThisWeek = userTasks.filter(t => t.isCompleted);
-    const completedTasksCount = completedTasksThisWeek.length;
-
-    // 5. Notes added
-    const userNotes = await db.select().from(workspaceNotes).where(eq(workspaceNotes.createdBy, userId));
-    const notesThisWeek = userNotes.filter(n => n.createdAt && n.createdAt.substring(0, 10) >= startStr && n.createdAt.substring(0, 10) <= endStr);
-    const notesCount = notesThisWeek.length;
-
-    const totalCount = prospectsAddedCount + meetingsHeldCount + completedActivitiesCount + completedTasksCount + notesCount;
-
-    if (totalCount === 0) {
-      return res.json({
-        summary: "No client interactions or business development tasks were logged in SCM platforms for this period.",
-        prospectsAdded: 0,
-        meetingsHeld: 0,
-        followUpsCompleted: 0,
-        fundsSecured: 0,
-        productsSold: "None",
-        challenges: "No significant challenges recorded.",
-        nextWeekPlan: "Plan to initiate contact with target prospects and coordinate active client outreach.",
-        isEmptyState: true
-      });
-    }
-
-    // Compose professional business performance summary
-    let summaryText = `During the week ending ${endStr}, business development efforts focused on expanding SCM Capital's corporate network and deepening institutional engagements.\n\n`;
-    if (prospectsAddedCount > 0) {
-      const names = prospectsCreatedThisWeek.map(p => p.name).join(", ");
-      summaryText += `â€¢ Pipeline Expansion: Initiated corporate coverage and created coverage workspaces for ${prospectsAddedCount} new institutional prospect(s): ${names}.\n`;
-    }
-    if (meetingsHeldCount > 0) {
-      const meetDetails = meetingsHeldThisWeek.map(m => `${m.purpose} with ${m.prospectName}`).join("; ");
-      summaryText += `â€¢ Client Advisory & Meetings: Conducted ${meetingsHeldCount} key meetings/discovery sessions including: ${meetDetails}.\n`;
-    }
-    if (completedActivitiesCount > 0) {
-      summaryText += `â€¢ Engagement Execution: Executed ${completedActivitiesCount} corporate interaction(s) (calls, emails, follow-ups) to progress opportunities through the SCM business development funnel.\n`;
-    }
-    if (completedTasksCount > 0) {
-      summaryText += `â€¢ Task Execution: Completed ${completedTasksCount} critical action items and follow-up tasks to maintain pipeline velocity.\n`;
-    }
-    if (notesCount > 0) {
-      summaryText += `â€¢ Intelligence Synthesis: Authored ${notesCount} proprietary research note(s) inside prospect workspaces to preserve institutional intelligence.\n`;
-    }
-
-    // Determine products sold/recommended based on actual prospects Potential
-    const productsSet = new Set<string>();
-    prospectsCreatedThisWeek.forEach(p => {
-      if (p.treasuryPotential && p.treasuryPotential !== 'None') productsSet.add("Treasury Potential");
-      if (p.mmfPotential && p.mmfPotential !== 'None') productsSet.add("MMF Potential");
-      if (p.wealthPotential && p.wealthPotential !== 'None') productsSet.add("Wealth Potential");
-      if (p.literacyPotential && p.literacyPotential !== 'None') productsSet.add("Literacy Potential");
-    });
-    const productsSold = productsSet.size > 0 ? Array.from(productsSet).join(", ") : "Treasury Bills, Money Market Fund (MMF)";
-
-    const fundsSecuredSum = prospectsCreatedThisWeek.reduce((sum, p) => sum + (p.actualRevenue || 0), 0);
-
-    const challengesText = "Standard market and procurement lifecycle challenges. Navigating administrative processes within target organizations to obtain mandate approvals.";
-    
-    const nextWeekPlanText = `1. Follow up on all meetings held this week to secure mandate documents.\n2. Progress newly onboarded targets (${prospectsCreatedThisWeek.map(p => p.name).slice(0, 3).join(", ") || "leads"}) to active engagement phase.\n3. Complete pending advisory tasks and log outcomes in SCM CRM.`;
-
-    return res.json({
-      summary: summaryText,
-      prospectsAdded: prospectsAddedCount,
-      meetingsHeld: meetingsHeldCount,
-      followUpsCompleted: completedActivitiesCount,
-      fundsSecured: fundsSecuredSum,
-      productsSold,
-      challenges: challengesText,
-      nextWeekPlan: nextWeekPlanText,
-      isEmptyState: false
-    });
-  } catch (err: any) {
-    console.error("[SCM AUTO-GENERATE ERROR]", err);
-    return res.status(500).json({ error: "Failed to auto-generate report metrics: " + err.message });
-  }
-});
-
-// 1. Get own reports (Relationship Officers only)
-app.get("/api/weekly-reports", async (req, res) => {
-  const { userId } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  try {
-    const list = await db.select().from(weeklyReports).where(eq(weeklyReports.userId, userId));
-    return res.json(list);
-  } catch (err: any) {
-    console.error("Failed to fetch reports from Postgres:", err);
-    return res.status(500).json({ error: "Failed to fetch reports", details: err.message });
-  }
-});
-
-// 2. Create or Update a weekly report
-app.post("/api/weekly-reports", async (req, res) => {
-  const { userId, email } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  let matchedUser: any = null;
-  try {
-    const condition = userId ? eq(users.id, userId) : eq(users.email, email.toLowerCase());
-    const pgUsers = await db.select().from(users).where(condition);
-    if (pgUsers.length > 0) {
-      matchedUser = pgUsers[0];
-    }
-  } catch (err) {}
-  if (!matchedUser) return res.status(404).json({ error: "User profile not found." });
-
-  // Verify reporting period is active (Wednesday 09:00 AM to Friday 04:20 PM)
-  const isWithinEditWindow = () => {
-    const now = new Date();
-    const day = now.getDay(); // 0 = Sunday, ..., 5 = Friday
-    const hour = now.getHours();
-    const minute = now.getMinutes();
-    
-    // Super Admin / Admin override
-    const lowerEmail = email ? email.toLowerCase() : "";
-    if (lowerEmail === "wisdom.okoh@scmcapitalng.com" || lowerEmail === "omololu.ajediran@scmcapitalng.com" || matchedUser.role === 'Admin') {
-      return true;
-    }
-    
-    if (day < 3 || day > 5) return false;
-    if (day === 3) return hour > 9 || (hour === 9 && minute >= 0);
-    if (day === 4) return true;
-    if (day === 5) return hour < 16 || (hour === 16 && minute <= 20);
-    return false;
-  };
-
-  if (!isWithinEditWindow()) {
-    return res.status(403).json({ error: "SCM Security Rule: The Weekly Report edit period is closed. Reports can only be saved or modified between Wednesday 09:00 AM and Friday 04:20 PM." });
-  }
-
-  const {
-    id,
-    weekStartDate,
-    weekEndDate,
-    summary,
-    prospectsAdded,
-    meetingsHeld,
-    followUpsCompleted,
-    fundsSecured,
-    productsSold,
-    challenges,
-    nextWeekPlan,
-    status
-  } = req.body;
-
-  if (!weekStartDate || !weekEndDate) {
-    return res.status(400).json({ error: "Week start and end dates are required." });
-  }
-
-  // Check if a report for this user and this week already exists
-  let existingReport: any = null;
-  try {
-    const results = await db.select().from(weeklyReports).where(
-      and(
-        eq(weeklyReports.userId, userId),
-        eq(weeklyReports.weekStartDate, weekStartDate)
-      )
-    );
-    if (results.length > 0) {
-      existingReport = results[0];
-    }
-  } catch (err) {
-    console.error("DB error checking existing report:", err);
-  }
-
-  if (existingReport && existingReport.status !== 'Draft') {
-    return res.status(400).json({ error: "This report has already been submitted and is locked for editing." });
-  }
-
-  const reportId = existingReport ? existingReport.id : (id || `report-${Date.now()}-${Math.floor(Math.random() * 1000)}`);
-  const isUpdate = !!existingReport;
-
-  const reportData = {
-    id: reportId,
-    userId: userId,
-    userName: matchedUser.fullName,
-    userEmail: matchedUser.email,
-    weekStartDate,
-    weekEndDate,
-    summary: summary || "",
-    prospectsAdded: Number(prospectsAdded) || 0,
-    meetingsHeld: Number(meetingsHeld) || 0,
-    followUpsCompleted: Number(followUpsCompleted) || 0,
-    fundsSecured: Number(fundsSecured) || 0,
-    productsSold: productsSold || "",
-    challenges: challenges || "",
-    nextWeekPlan: nextWeekPlan || "",
-    status: status || 'Draft',
-    submittedAt: status === 'Submitted' ? new Date().toISOString() : (existingReport?.submittedAt || null),
-    updatedAt: new Date().toISOString()
-  };
-
-  try {
-    if (isUpdate) {
-      await db.update(weeklyReports).set(reportData).where(eq(weeklyReports.id, reportId));
-    } else {
-      await db.insert(weeklyReports).values(reportData);
-    }
-  } catch (err: any) {
-    console.error("Failed to write report to Postgres:", err);
-    return res.status(500).json({ error: "Database operation failed: " + err.message });
-  }
-
-  const actionName = status === 'Submitted' ? "Report Submitted" : (isUpdate ? "Draft Updated" : "Draft Created");
-  await logSystemEvent(actionName, `report-${reportId}`, "Success", req, { reportId });
-
-  return res.json({ success: true, report: reportData });
-});
-
-// 3. Submit draft
-app.post("/api/weekly-reports/submit/:id", async (req, res) => {
-  const { userId, email } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  // Verify reporting period is active (Wednesday 09:00 AM to Friday 04:20 PM)
-  const isWithinEditWindow = () => {
-    const now = new Date();
-    const day = now.getDay();
-    const hour = now.getHours();
-    const minute = now.getMinutes();
-    
-    const lowerEmail = email ? email.toLowerCase() : "";
-    if (lowerEmail === "wisdom.okoh@scmcapitalng.com" || lowerEmail === "omololu.ajediran@scmcapitalng.com") {
-      return true;
-    }
-    
-    if (day < 3 || day > 5) return false;
-    if (day === 3) return hour > 9 || (hour === 9 && minute >= 0);
-    if (day === 4) return true;
-    if (day === 5) return hour < 16 || (hour === 16 && minute <= 20);
-    return false;
-  };
-
-  if (!isWithinEditWindow()) {
-    return res.status(403).json({ error: "SCM Security Rule: The Weekly Report edit period is closed. Reports can only be submitted between Wednesday 09:00 AM and Friday 04:20 PM." });
-  }
-
-  const { id } = req.params;
-
-  let report: any = null;
-  try {
-    const results = await db.select().from(weeklyReports).where(eq(weeklyReports.id, id));
-    if (results.length > 0) report = results[0];
-  } catch (err) {
-    console.error("DB error fetching report to submit:", err);
-  }
-
-  if (!report) {
-    return res.status(404).json({ error: "Report not found" });
-  }
-
-  if (report.userId !== userId) {
-    return res.status(403).json({ error: "Access denied. This is not your report." });
-  }
-
-  if (report.status !== 'Draft') {
-    return res.status(400).json({ error: "Report is already submitted" });
-  }
-
-  const updatedReport = {
-    ...report,
-    status: 'Submitted',
-    submittedAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
-  };
-
-  try {
-    await db.update(weeklyReports).set(updatedReport).where(eq(weeklyReports.id, id));
-  } catch (err: any) {
-    console.error("DB error updating report to submitted:", err);
-    return res.status(500).json({ error: "Failed to update report status in database: " + err.message });
-  }
-
-  await logSystemEvent("Report Submitted", `report-${id}`, "Success", req, { reportId: id });
-
-  // Event: Weekly Report Submitted
-  createNotification(
-    "Weekly Report Submitted",
-    `Weekly Report Submitted`,
-    `Your weekly performance report for week ending ${updatedReport.weekEndDate || ''} has been successfully submitted for review.`,
-    "Approval",
-    userId
-  );
-
-  try {
-    const admins = await db.select().from(users).where(inArray(users.role, ['Admin', 'SUPER_ADMIN', 'Administrator']));
-    for (const admin of admins) {
-      if (admin && admin.id) {
-        createNotification(
-          "Weekly Report Submitted",
-          `New Weekly Report: ${updatedReport.authorName}`,
-          `A new weekly report has been submitted by ${updatedReport.authorName} and is awaiting your review.`,
-          "Approval",
-          admin.id
-        );
-      }
-    }
-  } catch (admErr) {
-    console.warn("Failed to notify admins of weekly report submittal:", admErr);
-  }
-
-  return res.json({ success: true, report: updatedReport });
-});
-
-// 4. Admin fetch all reports (wisdom.okoh@scmcapitalng.com or omololu.ajediran@scmcapitalng.com only)
-app.get("/api/admin/weekly-reports", async (req, res) => {
-  const { userId, email } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  const lowerEmail = email ? email.toLowerCase() : "";
-  if (lowerEmail !== "wisdom.okoh@scmcapitalng.com" && lowerEmail !== "omololu.ajediran@scmcapitalng.com") {
-    return res.status(403).json({ error: "Access denied. Restricted to authorised Super Admins." });
-  }
-
-  if (isDatabaseHealthy) {
-    try {
-      const list = await db.select().from(weeklyReports);
-      return res.json(list);
-    } catch (err: any) {
-      isDatabaseHealthy = false;
-    }
-  }
-  return res.json(dbWeeklyReports);
-});
-
-// 4b. Admin fetch Executive Summary Dashboard Data (wisdom.okoh@scmcapitalng.com, omololu.ajediran@scmcapitalng.com, and Admins only)
-app.get("/api/admin/executive-dashboard-summary", async (req, res) => {
-  const { userId, email, isAdmin } = getRequestUser(req);
-  const lowerEmail = email ? email.toLowerCase() : "";
-  const isAuthorized = isAdmin || lowerEmail === "wisdom.okoh@scmcapitalng.com" || lowerEmail === "omololu.ajediran@scmcapitalng.com";
-
-  if (!userId || !isAuthorized) {
-    return res.status(403).json({ error: "Access denied. Restricted to authorised administrators." });
-  }
-
-  let allUsers: any[] = dbUsers;
-  let allProspects: any[] = dbProspects;
-  let allMeetings: any[] = dbMeetings;
-  let allReports: any[] = dbWeeklyReports;
-  let allWorkspaces: any[] = dbWorkspaces || [];
-  let allProposals: any[] = dbWorkspaceProposals || [];
-  let allPresentations: any[] = dbWorkspacePresentations || [];
-  let allAIConversations: any[] = dbWorkspaceAiConversations || [];
-
-  if (isDatabaseHealthy) {
-    try {
-      allUsers = await db.select().from(users) as any[];
-      allProspects = await db.select().from(prospects) as any[];
-      allMeetings = await db.select().from(meetings) as any[];
-      allReports = await db.select().from(weeklyReports) as any[];
-      allWorkspaces = await db.select().from(workspaces) as any[];
-      allProposals = await db.select().from(workspaceProposals) as any[];
-      allPresentations = await db.select().from(workspacePresentations) as any[];
-      allAIConversations = await db.select().from(workspaceAiConversations) as any[];
-    } catch (e) {
-      isDatabaseHealthy = false;
-      allUsers = dbUsers;
-      allProspects = dbProspects;
-      allMeetings = dbMeetings;
-      allReports = dbWeeklyReports;
-      allWorkspaces = dbWorkspaces || [];
-      allProposals = dbWorkspaceProposals || [];
-      allPresentations = dbWorkspacePresentations || [];
-      allAIConversations = dbWorkspaceAiConversations || [];
-    }
-  }
-
-  // 1. Executive Overview Calculation
-  const officers = allUsers.filter(u => u.role === 'Relationship Manager' || u.role === 'Business Development Officer');
-  const totalOfficers = officers.length;
-
-  const activeProspects = allProspects.filter(p => p.status !== 'Archived');
-  const totalActiveProspects = activeProspects.length;
-
-  const totalMeetingsHeld = allMeetings.length;
-
-  const closedProspects = allProspects.filter(p => p.status === 'Converted' || p.status === 'Won');
-  const totalInvestmentsClosed = closedProspects.length;
-
-  const totalFundsSecured = closedProspects.reduce((sum, p) => sum + (p.opportunityValue || 0), 0);
-
-  const totalReportsSubmitted = allReports.filter(r => r.status === 'Submitted' || r.status === 'Reviewed').length;
-
-  // 2. Officer Performance Cards
-  const officerPerformance = officers.map(u => {
-    const oProspects = allProspects.filter(p => p.assignedOfficerId === u.id && p.status !== 'Archived');
-    const oMeetings = allMeetings.filter(m => m.officerId === u.id);
-    const oClosed = allProspects.filter(p => p.assignedOfficerId === u.id && (p.status === 'Converted' || p.status === 'Won'));
-    const oAmountSecured = oClosed.reduce((sum, p) => sum + (p.opportunityValue || 0), 0);
-
-    const pSet = new Set<string>();
-    oClosed.forEach(p => {
-      const notesLower = (p.notes || "").toLowerCase();
-      if (notesLower.includes('money market') || notesLower.includes('mmf') || (p.mmfPotential && parseFloat(p.mmfPotential) > 0)) pSet.add("Money Market Fund");
-      if (notesLower.includes('skip') || (p.wealthPotential && parseFloat(p.wealthPotential) > 0)) pSet.add("SKIP");
-      if (notesLower.includes('nesf') || (p.literacyPotential && parseFloat(p.literacyPotential) > 0)) pSet.add("NESF");
-      if (notesLower.includes('scgf') || (p.treasuryPotential && parseFloat(p.treasuryPotential) > 0)) pSet.add("SCGF");
-      if (notesLower.includes('frontier')) pSet.add("Frontier Fund");
-    });
-
-    const oReports = allReports.filter(r => r.userId === u.id);
-    oReports.forEach(r => {
-      if (r.productsSold) {
-        r.productsSold.split(',').forEach((pStr: string) => {
-          const pClean = pStr.trim();
-          if (pClean) pSet.add(pClean);
-        });
-      }
-    });
-
-    const lastRep = oReports
-      .filter(r => r.status === 'Submitted' || r.status === 'Reviewed')
-      .sort((a, b) => new Date(b.submittedAt || b.updatedAt).getTime() - new Date(a.submittedAt || a.updatedAt).getTime())[0];
-
-    return {
-      id: u.id,
-      fullName: u.fullName,
-      role: u.role,
-      prospects: oProspects.length,
-      meetings: oMeetings.length,
-      investmentsClosed: oClosed.length,
-      amountSecured: oAmountSecured,
-      productsSold: Array.from(pSet),
-      lastReportSubmitted: lastRep ? (lastRep.submittedAt || lastRep.updatedAt || "").substring(0, 10) : "None",
-      status: u.status || 'Active'
-    };
-  });
-
-  // 3. Team Leaderboard
-  const leaderboard = officers.map(u => {
-    const oProspects = allProspects.filter(p => p.assignedOfficerId === u.id && p.status !== 'Archived');
-    const oClosed = allProspects.filter(p => p.assignedOfficerId === u.id && (p.status === 'Converted' || p.status === 'Won'));
-    const oAmountSecured = oClosed.reduce((sum, p) => sum + (p.opportunityValue || 0), 0);
-    const conversionRate = oProspects.length > 0 ? parseFloat(((oClosed.length / oProspects.length) * 100).toFixed(1)) : 0;
-
-    return {
-      id: u.id,
-      fullName: u.fullName,
-      amountSecured: oAmountSecured,
-      dealsClosed: oClosed.length,
-      conversionRate
-    };
-  }).sort((a, b) => b.amountSecured - a.amountSecured || b.dealsClosed - a.dealsClosed);
-
-  // 4. Product Performance Breakdown
-  const productMetrics = {
-    "Money Market Fund": { count: 0, amount: 0 },
-    "SKIP": { count: 0, amount: 0 },
-    "NESF": { count: 0, amount: 0 },
-    "SCGF": { count: 0, amount: 0 },
-    "Frontier Fund": { count: 0, amount: 0 }
-  };
-
-  closedProspects.forEach(p => {
-    let matched = false;
-    const notesLower = (p.notes || "").toLowerCase();
-    const val = p.opportunityValue || 0;
-
-    if (notesLower.includes('money market') || notesLower.includes('mmf') || notesLower.includes('mutual fund')) {
-      productMetrics["Money Market Fund"].count += 1;
-      productMetrics["Money Market Fund"].amount += val;
-      matched = true;
-    }
-    if (notesLower.includes('skip') || notesLower.includes('structured key')) {
-      productMetrics["SKIP"].count += 1;
-      productMetrics["SKIP"].amount += val;
-      matched = true;
-    }
-    if (notesLower.includes('nesf') || notesLower.includes('equity structured')) {
-      productMetrics["NESF"].count += 1;
-      productMetrics["NESF"].amount += val;
-      matched = true;
-    }
-    if (notesLower.includes('scgf') || notesLower.includes('guaranteed')) {
-      productMetrics["SCGF"].count += 1;
-      productMetrics["SCGF"].amount += val;
-      matched = true;
-    }
-    if (notesLower.includes('frontier') || notesLower.includes('frontier fund')) {
-      productMetrics["Frontier Fund"].count += 1;
-      productMetrics["Frontier Fund"].amount += val;
-      matched = true;
-    }
-
-    if (!matched) {
-      if (p.mmfPotential && parseFloat(p.mmfPotential) > 0) {
-        productMetrics["Money Market Fund"].count += 1;
-        productMetrics["Money Market Fund"].amount += val;
-      } else if (p.wealthPotential && parseFloat(p.wealthPotential) > 0) {
-        productMetrics["SKIP"].count += 1;
-        productMetrics["SKIP"].amount += val;
-      } else if (p.literacyPotential && parseFloat(p.literacyPotential) > 0) {
-        productMetrics["NESF"].count += 1;
-        productMetrics["NESF"].amount += val;
-      } else if (p.treasuryPotential && parseFloat(p.treasuryPotential) > 0) {
-        productMetrics["SCGF"].count += 1;
-        productMetrics["SCGF"].amount += val;
-      } else {
-        productMetrics["Money Market Fund"].count += 1;
-        productMetrics["Money Market Fund"].amount += val;
-      }
-    }
-  });
-
-  allReports.forEach(r => {
-    if ((r.status === 'Submitted' || r.status === 'Reviewed') && r.fundsSecured > 0) {
-      const productsSoldStr = r.productsSold || "";
-      const matchedProds: string[] = [];
-      if (productsSoldStr.toLowerCase().includes('money market') || productsSoldStr.toLowerCase().includes('mmf')) matchedProds.push("Money Market Fund");
-      if (productsSoldStr.toUpperCase().includes('SKIP')) matchedProds.push("SKIP");
-      if (productsSoldStr.toUpperCase().includes('NESF')) matchedProds.push("NESF");
-      if (productsSoldStr.toUpperCase().includes('SCGF')) matchedProds.push("SCGF");
-      if (productsSoldStr.toLowerCase().includes('frontier')) matchedProds.push("Frontier Fund");
-
-      if (matchedProds.length > 0) {
-        const splitAmount = r.fundsSecured / matchedProds.length;
-        matchedProds.forEach(pName => {
-          productMetrics[pName as keyof typeof productMetrics].amount += splitAmount;
-        });
-      }
-    }
-  });
-
-  // Convert to array
-  const productPerformance = Object.entries(productMetrics).map(([name, data]) => ({
-    productName: name,
-    investmentsCount: data.count,
-    totalAmount: data.amount
-  }));
-
-  // 5. Weekly Report Monitor List
-  const reportMonitor = allReports.map(r => ({
-    id: r.id,
-    officerName: r.userName,
-    officerEmail: r.userEmail,
-    weekStartDate: r.weekStartDate,
-    weekEndDate: r.weekEndDate,
-    submissionDate: r.submittedAt ? r.submittedAt.substring(0, 10) : "N/A",
-    status: r.status,
-    fundsSecured: r.fundsSecured,
-    prospectsAdded: r.prospectsAdded,
-    meetingsHeld: r.meetingsHeld
-  })).sort((a, b) => new Date(b.weekEndDate).getTime() - new Date(a.weekEndDate).getTime());
-
-  // 6. Management Insights Generator
-  const insights: string[] = [];
-  let highestProd = "";
-  let highestAmt = 0;
-  productPerformance.forEach(prod => {
-    if (prod.totalAmount > highestAmt) {
-      highestAmt = prod.totalAmount;
-      highestProd = prod.productName;
-    }
-  });
-
-  if (highestAmt > 0 && highestProd) {
-    insights.push(`SCM ${highestProd} has generated the highest volume of â‚¦${highestAmt.toLocaleString()} across relationship portfolios.`);
-  }
-
-  if (leaderboard.length > 0 && leaderboard[0].amountSecured > 0) {
-    insights.push(`Top Relationship Officer is ${leaderboard[0].fullName}, securing â‚¦${leaderboard[0].amountSecured.toLocaleString()} through active conversions.`);
-  }
-
-  const overallConversion = totalActiveProspects > 0 
-    ? ((totalInvestmentsClosed / totalActiveProspects) * 100).toFixed(1) 
-    : "0";
-  if (parseFloat(overallConversion) > 0) {
-    insights.push(`Average team acquisition rate is performing at a steady ${overallConversion}% conversion index.`);
-  }
-
-  const pendingReviews = allReports.filter(r => r.status === 'Submitted').length;
-  if (pendingReviews > 0) {
-    insights.push(`Operational: ${pendingReviews} weekly performance reports are currently pending administrative sign-off.`);
-  }
-
-  if (insights.length === 0) {
-    insights.push("Insufficient historical data available.");
-  }
-
-  // 7. Dynamic Activity Monitor Feed
-  const pActs = allProspects.map(p => ({
-    type: 'prospect',
-    title: `${p.assignedOfficerName || 'An Officer'} initiated prospect "${p.name}"`,
-    timestamp: p.createdAt,
-    id: p.id,
-    detail: `Industry: ${p.industry} | Opportunity: â‚¦${(p.opportunityValue || 0).toLocaleString()}`
-  }));
-
-  const mActs = allMeetings.map(m => ({
-    type: 'meeting',
-    title: `${m.officerName} held stakeholder review with "${m.prospectName}"`,
-    timestamp: m.createdAt || m.date,
-    id: m.id,
-    detail: `Purpose: ${m.purpose} | Outcome: ${m.outcome || 'Awaiting status update.'}`
-  }));
-
-  const iActs = closedProspects.map(p => ({
-    type: 'investment',
-    title: `Deal Closed: â‚¦${(p.opportunityValue || 0).toLocaleString()} Secured from "${p.name}"`,
-    timestamp: p.updatedAt || p.createdAt,
-    id: p.id,
-    detail: `Secured by Officer ${p.assignedOfficerName || 'Advisor'}.`
-  }));
-
-  const rActs = allReports.filter(r => r.status === 'Submitted' || r.status === 'Reviewed').map(r => ({
-    type: 'report',
-    title: `Weekly Report submitted by ${r.userName}`,
-    timestamp: r.submittedAt || r.updatedAt,
-    id: r.id,
-    detail: `Week ending: ${r.weekEndDate} | Funds: â‚¦${r.fundsSecured.toLocaleString()} | Meetings: ${r.meetingsHeld}`
-  }));
-
-  const uActs = allUsers.filter(u => u.status === 'Approved' || u.status === 'Active').map(u => ({
-    type: 'user_approved',
-    title: `Platform credential approved for ${u.fullName}`,
-    timestamp: (u as any).createdAt || new Date().toISOString(),
-    id: u.id,
-    detail: `Role: ${u.role} | Department: ${u.department || 'Client Advisory'}`
-  }));
-
-  const allActivities = [...pActs, ...mActs, ...iActs, ...rActs, ...uActs]
-    .filter(a => a.timestamp)
-    .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-    .slice(0, 15);
-
-  return res.json({
-    overview: {
-      totalOfficers,
-      totalActiveProspects,
-      totalMeetingsHeld,
-      totalInvestmentsClosed,
-      totalFundsSecured,
-      totalReportsSubmitted
-    },
-    workspaceStatistics: {
-      totalWorkspaces: allWorkspaces.length,
-      activeWorkspaces: allWorkspaces.filter((w: any) => w.status === 'Active').length,
-      archivedWorkspaces: allWorkspaces.filter((w: any) => w.status === 'Archived').length,
-      researchSessions: allAIConversations.length,
-      proposalsGenerated: allProposals.length,
-      presentationsUploaded: allPresentations.length
-    },
-    officers: officerPerformance,
-    leaderboard,
-    products: productPerformance,
-    reports: reportMonitor,
-    insights,
-    activities: allActivities
-  });
-});
-
-// 5. Admin Mark as Reviewed
-app.post("/api/admin/weekly-reports/review/:id", async (req, res) => {
-  const { userId, email } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  const lowerEmail = email ? email.toLowerCase() : "";
-  if (lowerEmail !== "wisdom.okoh@scmcapitalng.com" && lowerEmail !== "omololu.ajediran@scmcapitalng.com") {
-    return res.status(403).json({ error: "Access denied. Restricted to authorised Super Admins." });
-  }
-
-  const { id } = req.params;
-
-  try {
-    const results = await db.select().from(weeklyReports).where(eq(weeklyReports.id, id));
-    const report = results[0];
-    if (!report) return res.status(404).json({ error: "Report not found" });
-
-    const updatedReport = {
-      ...report,
-      status: 'Reviewed',
-      updatedAt: new Date().toISOString()
-    };
-
-    await db.update(weeklyReports).set(updatedReport).where(eq(weeklyReports.id, id));
-
-    await logSystemEvent("Report Reviewed", `report-${id}`, "Success", req, { reportId: id });
-
-    // Event: Weekly Report Approved
-    createNotification(
-      "Weekly Report Approved",
-      "Weekly Report Reviewed & Approved",
-      `Your weekly performance report for week ending ${report.weekEndDate || ''} has been reviewed and approved by management.`,
-      "Approval",
-      report.userId
-    );
-
-    return res.json({ success: true, report: updatedReport });
-  } catch (err: any) {
-    console.error("Weekly report review DB failed:", err);
-    return res.status(500).json({ error: "Database update failed: " + err.message });
-  }
-});
-
-// 6. Admin Unlock report (returns to Draft)
-app.post("/api/admin/weekly-reports/unlock/:id", async (req, res) => {
-  const { userId, email } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  const lowerEmail = email ? email.toLowerCase() : "";
-  if (lowerEmail !== "wisdom.okoh@scmcapitalng.com" && lowerEmail !== "omololu.ajediran@scmcapitalng.com") {
-    return res.status(403).json({ error: "Access denied. Restricted to authorised Super Admins." });
-  }
-
-  const { id } = req.params;
-
-  try {
-    const results = await db.select().from(weeklyReports).where(eq(weeklyReports.id, id));
-    const report = results[0];
-    if (!report) return res.status(404).json({ error: "Report not found" });
-
-    const updatedReport = {
-      ...report,
-      status: 'Draft',
-      submittedAt: null,
-      updatedAt: new Date().toISOString()
-    };
-
-    await db.update(weeklyReports).set(updatedReport).where(eq(weeklyReports.id, id));
-
-    await logSystemEvent("Report Unlocked", `report-${id}`, "Success", req, { reportId: id });
-
-    return res.json({ success: true, report: updatedReport });
-  } catch (err: any) {
-    console.error("Weekly report unlock DB failed:", err);
-    return res.status(500).json({ error: "Database update failed: " + err.message });
-  }
-});
-
-// 7. Admin Log Export action
-app.post("/api/admin/weekly-reports/log-export/:id", async (req, res) => {
-  const { userId, email } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  const { id } = req.params;
-  const { format } = req.body;
-
-  await logSystemEvent("Report Exported", `report-${id}`, "Success", req, { reportId: id, format });
-
-  return res.json({ success: true });
-});
-
-// 8. Admin manual reminder trigger for testing & production checks
-app.post("/api/admin/weekly-reports/trigger-reminders", async (req, res) => {
-  const { userId, email } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  const lowerEmail = email ? email.toLowerCase() : "";
-  if (lowerEmail !== "wisdom.okoh@scmcapitalng.com" && lowerEmail !== "omololu.ajediran@scmcapitalng.com") {
-    return res.status(403).json({ error: "Access denied. Restricted to authorised Super Admins." });
-  }
-
-  const { slot } = req.body;
-  let message = "";
-  if (slot === '9AM') {
-    message = "Weekly report is due today.";
-  } else if (slot === '2PM') {
-    message = "Please submit your weekly report before close of business.";
-  } else if (slot === '4PM') {
-    message = "Final reminder: Weekly report submission closes today.";
-  } else {
-    return res.status(400).json({ error: "Invalid slot parameter. Must be 9AM, 2PM, or 4PM." });
-  }
-
-  triggerRemindersForActiveUsers(message);
-  return res.json({ success: true, message: `Reminders triggered for ${slot} slot.` });
-});
-
-// ==========================================
-// AUTOMATED REPORT REMINDERS SCHEDULER
-// ==========================================
-const sentRemindersThisWeek = new Set<string>();
-
-async function triggerRemindersForActiveUsers(message: string) {
-  try {
-    const activeOfficers = await db.select().from(users).where(
-      and(
-        inArray(users.role, ['Relationship Manager', 'Business Development Officer']),
-        inArray(users.status, ['Approved', 'Active', 'Pending'])
-      )
-    );
-    
-    console.log(`[REPORTS REMINDER SYSTEM] Triggering reminder to ${activeOfficers.length} officers: "${message}"`);
-    
-    for (const officer of activeOfficers) {
-      await createNotification(
-        'Weekly report due',
-        'Weekly Performance Report due',
-        message,
-        'Task',
-        officer.id
-      );
-    }
-  } catch (err: any) {
-    console.error("[REPORTS REMINDER SYSTEM ERROR] Failed to trigger reminders:", err);
-  }
-}
-
-function checkAndTriggerWeeklyReportReminders() {
-  const now = new Date();
-  const day = now.getDay(); // 5 = Friday
-  const hour = now.getHours();
-  const minute = now.getMinutes();
-  
-  const getWeekYear = (d: Date) => {
-    const temp = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
-    const dayNum = temp.getUTCDay() || 7;
-    temp.setUTCDate(temp.getUTCDate() + 4 - dayNum);
-    const yearStart = new Date(Date.UTC(temp.getUTCFullYear(), 0, 1));
-    return `${temp.getUTCFullYear()}-W${Math.ceil((((temp.getTime() - yearStart.getTime()) / 86400000) + 1) / 7)}`;
-  };
-  
-  const weekKey = getWeekYear(now);
-
-  if (day === 5) {
-    let slot: string | null = null;
-    let message = "";
-    
-    if (hour === 9 && minute === 0) {
-      slot = "9AM";
-      message = "Weekly report is due today.";
-    } else if (hour === 14 && minute === 0) {
-      slot = "2PM";
-      message = "Please submit your weekly report before close of business.";
-    } else if (hour === 16 && minute === 0) {
-      slot = "4PM";
-      message = "Final reminder: Weekly report submission closes today.";
-    }
-    
-    if (slot) {
-      const reminderKey = `${weekKey}-${slot}`;
-      if (!sentRemindersThisWeek.has(reminderKey)) {
-        sentRemindersThisWeek.add(reminderKey);
-        triggerRemindersForActiveUsers(message);
-      }
-    }
-  } else {
-    if (sentRemindersThisWeek.size > 0) {
-      sentRemindersThisWeek.clear();
-    }
-  }
-}
-
-// Tick every 30 seconds
-setInterval(checkAndTriggerWeeklyReportReminders, 30000);
-
-
-
-// ==========================================
-// TASKS OPERATIONS
-// ==========================================
-app.get("/api/tasks", async (req, res) => {
-  const { userId } = getRequestUser(req);
-  if (!userId) return res.json([]);
-
-  try {
-    const list = await getTasksForUser(req);
-    const mapped = list.map(t => ({
-      ...t,
-      status: t.isCompleted ? "Completed" : "Pending"
-    }));
-    return res.json(mapped);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Tasks query failed:", err);
-    return res.status(500).json({ error: "Failed to query tasks database." });
-  }
-});
-
-app.post("/api/tasks", async (req, res) => {
-  const { prospectId, prospectName, title, dueDate, assignedStaff, priority, notes, description, status, taskType } = req.body;
-  if (!title || !dueDate) {
-    return res.status(400).json({ error: "Title and Due Date are required." });
-  }
-
-  const { userId } = getRequestUser(req);
-  const officerId = req.body.officerId || userId || "user-1";
-
-  try {
-    let finalAssignedStaff = assignedStaff;
-    let finalProspectName = prospectName;
-
-    if (prospectId) {
-      const pFetched = await db.select().from(prospects).where(eq(prospects.id, prospectId));
-      const p = pFetched[0];
-      if (p) {
-        if (!finalAssignedStaff && p.assignedOfficerName) {
-          finalAssignedStaff = p.assignedOfficerName;
-        }
-        if (!finalProspectName) {
-          finalProspectName = p.name;
-        }
-      }
-    }
-
-    if (!finalAssignedStaff) {
-      const uFetched = await db.select().from(users).limit(1);
-      finalAssignedStaff = uFetched[0]?.fullName || "Julian Draxler";
-    }
-
-    if (!finalProspectName) {
-      finalProspectName = "General SCM Operations";
-    }
-
-    const determinedStatus = status || "Pending";
-    const determinedType = taskType || "Call";
-    const isCompletedVal = determinedStatus === "Completed";
-
-    const newTask: any = {
-      id: `task-${Date.now()}`,
-      prospectId,
-      prospectName: finalProspectName,
-      title,
-      description: description || notes || "",
-      dueDate,
-      assignedStaff: finalAssignedStaff,
-      officerId: officerId,
-      priority: priority || "Medium",
-      status: determinedStatus,
-      taskType: determinedType,
-      isCompleted: isCompletedVal,
-      notes: notes || description || ""
-    };
-
-    await db.insert(tasks).values({
-      id: newTask.id,
-      prospectId: newTask.prospectId,
-      prospectName: newTask.prospectName,
-      title: newTask.title,
-      dueDate: newTask.dueDate,
-      assignedStaff: newTask.assignedStaff,
-      officerId: newTask.officerId,
-      priority: newTask.priority,
-      isCompleted: newTask.isCompleted,
-      notes: newTask.notes
-    });
-
-    // Automatically seed as a relationship activity too
-    if (prospectId) {
-      const autoAct = {
-        id: `act-tk-${Date.now()}`,
-        prospectId,
-        date: new Date().toISOString().split('T')[0],
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        officerId: officerId,
-        officerName: finalAssignedStaff,
-        activityType: 'Follow-up',
-        outcome: `Assigned Task: ${title}`,
-        notes: `Due by: ${dueDate}. Staff: ${finalAssignedStaff}. Type: ${determinedType}`,
-        status: 'Scheduled',
-        createdAt: new Date().toISOString()
-      };
-      await db.insert(activities).values(autoAct);
-    }
-
-    // Trigger approved tasks assigned notifications
-    const uAssigned = await db.select().from(users).where(eq(users.fullName, finalAssignedStaff));
-    const matchedUser = uAssigned[0];
-    createNotification(
-      "New task assigned",
-      `New Task Assigned: ${title}`,
-      `You have been assigned a task of type "${determinedType}" due on ${dueDate} related to "${newTask.prospectName}".`,
-      undefined,
-      matchedUser ? matchedUser.id : undefined
-    );
-
-    // Event: Task Created
-    createNotification(
-      "Task Created",
-      `Task Created: ${title}`,
-      `A new task "${title}" of type "${determinedType}" has been created.`,
-      "Task",
-      officerId
-    );
-
-    // Event: Task Assigned
-    if (matchedUser) {
-      createNotification(
-        "Task Assigned",
-        `Task Assigned: ${title}`,
-        `You have been assigned a task of type "${determinedType}" due on ${dueDate} related to "${newTask.prospectName}".`,
-        "Task",
-        matchedUser.id
-      );
-    }
-
-    return res.status(201).json(newTask);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Tasks POST failed:", err);
-    return res.status(500).json({ error: "Failed to create task: " + err.message });
-  }
-});
-
-app.patch("/api/tasks/:id", async (req, res) => {
-  const { id } = req.params;
-
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  try {
-    const taskFetched = await db.select().from(tasks).where(eq(tasks.id, id));
-    const taskObj = taskFetched[0];
-    if (!taskObj) {
-      return res.status(404).json({ error: "Task not found." });
-    }
-
-    if (!isAdmin && taskObj.officerId !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only modify your own tasks." });
-    }
-
-    const merged = { ...taskObj, ...req.body };
-
-    // Handle derived completion state
-    if (req.body.status) {
-      merged.isCompleted = req.body.status === "Completed";
-    } else if (req.body.isCompleted !== undefined) {
-      merged.status = req.body.isCompleted ? "Completed" : "Pending";
-    }
-
-    await db.update(tasks).set({
-      title: merged.title,
-      dueDate: merged.dueDate,
-      assignedStaff: merged.assignedStaff,
-      officerId: merged.officerId,
-      priority: merged.priority,
-      isCompleted: merged.isCompleted,
-      notes: merged.notes
-    }).where(eq(tasks.id, id));
-
-    // Event: Task Completed or Task Updated
-    if (merged.isCompleted && !taskObj.isCompleted) {
-      createNotification(
-        "Task Completed",
-        `Task Completed: ${merged.title}`,
-        `The task "${merged.title}" has been successfully completed by ${merged.assignedStaff}.`,
-        "Task",
-        merged.officerId
-      );
-    } else {
-      createNotification(
-        "Task Updated",
-        `Task Updated: ${merged.title}`,
-        `The task "${merged.title}" details have been updated.`,
-        "Task",
-        merged.officerId
-      );
-    }
-
-    // Trigger approved notifications if task status transitions to Overdue
-    if (req.body.status === "Overdue" && !taskObj.isCompleted) {
-      const uAssigned = await db.select().from(users).where(eq(users.fullName, merged.assignedStaff));
-      const matchedUser = uAssigned[0];
-      createNotification(
-        "Task overdue",
-        `Task Overdue: ${merged.title}`,
-        `The task "${merged.title}" assigned to ${merged.assignedStaff} has breached its deadline and is now marked Overdue.`,
-        undefined,
-        matchedUser ? matchedUser.id : undefined
-      );
-    }
-
-    const responseObj = {
-      ...merged,
-      status: merged.isCompleted ? "Completed" : "Pending"
-    };
-
-    return res.json(responseObj);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Update task failed:", err);
-    return res.status(500).json({ error: "Failed to update task: " + err.message });
-  }
-});
-
-app.delete("/api/tasks/:id", async (req, res) => {
-  const { id } = req.params;
-
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  try {
-    const taskFetched = await db.select().from(tasks).where(eq(tasks.id, id));
-    const taskObj = taskFetched[0];
-    if (!taskObj) {
-      return res.status(404).json({ error: "Task not found." });
-    }
-
-    if (!isAdmin && taskObj.officerId !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only delete your own tasks." });
-    }
-
-    await db.delete(tasks).where(eq(tasks.id, id));
-    return res.json({ success: true });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Delete task failed:", err);
-    return res.status(500).json({ error: "Failed to delete task: " + err.message });
-  }
-});
-
-
-// ==========================================
-// CRM NOTES MODULE & RESEARCH WORKSPACES
-// ==========================================
-
-// NOTES CRUD
-app.get("/api/notes", async (req, res) => {
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  try {
-    let notesList: any[] = [];
-    if (isAdmin) {
-      notesList = await db.select().from(workspaceNotes);
-    } else {
-      notesList = await db.select().from(workspaceNotes).where(eq(workspaceNotes.createdBy, userId));
-    }
-    return res.json(notesList);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Notes query failed:", err);
-    return res.status(500).json({ error: "Failed to load notes: " + err.message });
-  }
-});
-
-app.post("/api/notes", async (req, res) => {
-  const { userId } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  const { prospectId, workspaceId, title, content, visibility } = req.body;
-  if (!title || !content) {
-    return res.status(400).json({ error: "Title and content are required." });
-  }
-
-  const newNote: any = {
-    id: `note-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-    prospectId: prospectId || null,
-    workspaceId: workspaceId || null,
-    title,
-    content,
-    createdBy: userId,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    visibility: visibility || "private",
-    isPinned: false,
-    isArchived: false,
-  };
-
-  try {
-    await db.insert(workspaceNotes).values(newNote);
-    await logSystemEvent("Note Created", title, "Success", req, { noteId: newNote.id, title });
-    return res.status(201).json(newNote);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to insert note in DB:", err.message);
-    return res.status(500).json({ error: "Failed to create note: " + err.message });
-  }
-});
-
-app.patch("/api/notes/:id", async (req, res) => {
-  const { id } = req.params;
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  try {
-    const fetched = await db.select().from(workspaceNotes).where(eq(workspaceNotes.id, id));
-    const existingNote = fetched[0];
-    if (!existingNote) {
-      return res.status(404).json({ error: "Note not found." });
-    }
-
-    if (!isAdmin && existingNote.createdBy !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only edit your own notes." });
-    }
-
-    const { title, content, visibility } = req.body;
-    const updates: any = {};
-    if (title !== undefined) updates.title = title;
-    if (content !== undefined) updates.content = content;
-    if (visibility !== undefined) updates.visibility = visibility;
-    updates.updatedAt = new Date().toISOString();
-
-    await db.update(workspaceNotes).set(updates).where(eq(workspaceNotes.id, id));
-
-    await logSystemEvent("Note Modified", existingNote.title, "Success", req, { noteId: id });
-    return res.json({ ...existingNote, ...updates });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to update note:", err);
-    return res.status(500).json({ error: "Failed to update note: " + err.message });
-  }
-});
-
-app.delete("/api/notes/:id", async (req, res) => {
-  const { id } = req.params;
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  try {
-    const fetched = await db.select().from(workspaceNotes).where(eq(workspaceNotes.id, id));
-    const existingNote = fetched[0];
-    if (!existingNote) {
-      return res.status(404).json({ error: "Note not found." });
-    }
-
-    if (!isAdmin && existingNote.createdBy !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only delete your own notes." });
-    }
-
-    await db.delete(workspaceNotes).where(eq(workspaceNotes.id, id));
-
-    await logSystemEvent("Note Deleted", existingNote.title, "Success", req, { noteId: id });
-    return res.json({ success: true });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to delete note:", err);
-    return res.status(500).json({ error: "Failed to delete note: " + err.message });
-  }
-});
-
-app.post("/api/notes/:id/pin", async (req, res) => {
-  const { id } = req.params;
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  try {
-    const fetched = await db.select().from(workspaceNotes).where(eq(workspaceNotes.id, id));
-    const existingNote = fetched[0];
-    if (!existingNote) return res.status(404).json({ error: "Note not found." });
-
-    if (!isAdmin && existingNote.createdBy !== userId) {
-      return res.status(403).json({ error: "Access denied." });
-    }
-
-    const nextPinned = !existingNote.isPinned;
-    const updatedAt = new Date().toISOString();
-
-    await db.update(workspaceNotes).set({ isPinned: nextPinned, updatedAt }).where(eq(workspaceNotes.id, id));
-
-    await logSystemEvent("Note Modified", existingNote.title, "Success", req, { noteId: id, pinned: nextPinned });
-    return res.json({ ...existingNote, isPinned: nextPinned, updatedAt });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to pin note:", err);
-    return res.status(500).json({ error: "Failed to pin note: " + err.message });
-  }
-});
-
-app.post("/api/notes/:id/archive", async (req, res) => {
-  const { id } = req.params;
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  try {
-    const fetched = await db.select().from(workspaceNotes).where(eq(workspaceNotes.id, id));
-    const existingNote = fetched[0];
-    if (!existingNote) return res.status(404).json({ error: "Note not found." });
-
-    if (!isAdmin && existingNote.createdBy !== userId) {
-      return res.status(403).json({ error: "Access denied." });
-    }
-
-    const nextArchived = !existingNote.isArchived;
-    const updatedAt = new Date().toISOString();
-
-    await db.update(workspaceNotes).set({ isArchived: nextArchived, updatedAt }).where(eq(workspaceNotes.id, id));
-
-    await logSystemEvent("Note Modified", existingNote.title, "Success", req, { noteId: id, archived: nextArchived });
-    return res.json({ ...existingNote, isArchived: nextArchived, updatedAt });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to archive note:", err);
-    return res.status(500).json({ error: "Failed to archive note: " + err.message });
-  }
-});
-
-
-// WORKSPACES CRUD
-app.get("/api/workspaces", async (req, res) => {
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  if (isDatabaseHealthy) {
-    try {
-      let list: any[] = [];
-      if (isAdmin) {
-        list = await db.select().from(workspaces);
-      } else {
-        list = await db.select().from(workspaces).where(eq(workspaces.ownerUserId, userId));
-      }
-      return res.json(list);
-    } catch (err: any) {
-      isDatabaseHealthy = false;
-    }
-  }
-
-  const list = isAdmin ? dbWorkspaces : dbWorkspaces.filter(w => w.ownerUserId === userId);
-  return res.json(list);
-});
-
-app.post("/api/workspaces", async (req, res) => {
-  const { userId } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  const { prospectId, companyName } = req.body;
-  if (!prospectId || !companyName) {
-    return res.status(400).json({ error: "Prospect ID and Company Name are required." });
-  }
-
-  try {
-    // Prevent duplicate workspaces for the same prospect
-    const duplicate = await db.select().from(workspaces).where(eq(workspaces.prospectId, prospectId));
-    if (duplicate.length > 0) {
-      return res.status(400).json({ error: "A workspace already exists for this prospect." });
-    }
-
-    // Look up prospect to resolve assigned Relationship Officer
-    let targetOwnerId = userId;
-    const prospectObjFetched = await db.select().from(prospects).where(eq(prospects.id, prospectId));
-    const prospectObj = prospectObjFetched[0];
-    if (prospectObj && prospectObj.assignedOfficerId) {
-      targetOwnerId = prospectObj.assignedOfficerId;
-    }
-
-    const newWorkspace: any = {
-      id: `workspace-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      prospectId,
-      ownerUserId: targetOwnerId,
-      companyName,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      status: "Active",
-      apolloFindings: null,
-      companyProfile: null,
-      industryAnalysis: null,
-      executiveInsights: null,
-      investmentOpportunities: null,
-      researchSummaries: null,
-    };
-
-    await db.insert(workspaces).values(newWorkspace);
-
-    await logSystemEvent("Workspace Created", companyName, "Success", req, { workspaceId: newWorkspace.id, companyName });
-    return res.status(201).json(newWorkspace);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Workspace POST failed:", err);
-    return res.status(500).json({ error: "Failed to create workspace: " + err.message });
-  }
-});
-
-app.patch("/api/workspaces/:id", async (req, res) => {
-  const { id } = req.params;
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  try {
-    const wsFetched = await db.select().from(workspaces).where(eq(workspaces.id, id));
-    const workspaceObj = wsFetched[0];
-    if (!workspaceObj) {
-      return res.status(404).json({ error: "Workspace not found." });
-    }
-
-    if (!isAdmin && workspaceObj.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Access denied. Strict Security Rule: This workspace belongs to another Relationship Officer." });
-    }
-
-    const {
-      status,
-      apolloFindings,
-      companyProfile,
-      industryAnalysis,
-      executiveInsights,
-      investmentOpportunities,
-      researchSummaries
-    } = req.body;
-
-    const updates: any = {};
-    if (status !== undefined) updates.status = status;
-    if (apolloFindings !== undefined) updates.apolloFindings = apolloFindings;
-    if (companyProfile !== undefined) updates.companyProfile = companyProfile;
-    if (industryAnalysis !== undefined) updates.industryAnalysis = industryAnalysis;
-    if (executiveInsights !== undefined) updates.executiveInsights = executiveInsights;
-    if (investmentOpportunities !== undefined) updates.investmentOpportunities = investmentOpportunities;
-    if (researchSummaries !== undefined) updates.researchSummaries = researchSummaries;
-    updates.updatedAt = new Date().toISOString();
-
-    await db.update(workspaces).set(updates).where(eq(workspaces.id, id));
-
-    await logSystemEvent("Workspace Updated", workspaceObj.companyName, "Success", req, { workspaceId: id });
-    return res.json({ ...workspaceObj, ...updates });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Workspace PATCH failed:", err);
-    return res.status(500).json({ error: "Failed to update workspace: " + err.message });
-  }
-});
-
-app.delete("/api/workspaces/:id", async (req, res) => {
-  const { id } = req.params;
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  try {
-    const wsFetched = await db.select().from(workspaces).where(eq(workspaces.id, id));
-    const workspaceObj = wsFetched[0];
-    if (!workspaceObj) {
-      return res.status(404).json({ error: "Workspace not found." });
-    }
-
-    if (!isAdmin && workspaceObj.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Access denied. Strict Security Rule: This workspace belongs to another Relationship Officer." });
-    }
-
-    await db.delete(workspaces).where(eq(workspaces.id, id));
-
-    await logSystemEvent("Workspace Deleted", workspaceObj.companyName, "Success", req, { workspaceId: id });
-    return res.json({ success: true });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Workspace DELETE failed:", err);
-    return res.status(500).json({ error: "Failed to delete workspace: " + err.message });
-  }
-});
-
-// Single Workspace Detail with Sub-Entities and Activity Timeline
-app.get("/api/workspaces/:id", async (req, res) => {
-  const { id } = req.params;
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  try {
-    const wsFetched = await db.select().from(workspaces).where(eq(workspaces.id, id));
-    const workspaceObj = wsFetched[0];
-    if (!workspaceObj) {
-      return res.status(404).json({ error: "Workspace not found." });
-    }
-
-    if (!isAdmin && workspaceObj.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Access denied. Strict Security Rule: This workspace belongs to another Relationship Officer." });
-    }
-
-    const prospectId = workspaceObj.prospectId;
-
-    // Gather children from CRM databases directly
-    const contactsList = prospectId ? await db.select().from(contacts).where(eq(contacts.prospectId, prospectId)) : [];
-    const meetingsList = prospectId ? await db.select().from(meetings).where(eq(meetings.prospectId, prospectId)) : [];
-    const tasksList = prospectId ? await db.select().from(tasks).where(eq(tasks.prospectId, prospectId)) : [];
-    
-    // For notes, load matching workspaceId OR prospectId
-    let notesList = [];
-    if (prospectId) {
-      notesList = await db.select().from(workspaceNotes).where(
-        or(
-          eq(workspaceNotes.workspaceId, id),
-          eq(workspaceNotes.prospectId, prospectId)
-        )
-      );
-    } else {
-      notesList = await db.select().from(workspaceNotes).where(eq(workspaceNotes.workspaceId, id));
-    }
-
-    const proposalsList = await db.select().from(workspaceProposals).where(eq(workspaceProposals.workspaceId, id));
-    const presentationsList = await db.select().from(workspacePresentations).where(eq(workspacePresentations.workspaceId, id));
-    const aiConversationsList = await db.select().from(workspaceAiConversations).where(eq(workspaceAiConversations.workspaceId, id));
-    const searchHistoryList = await db.select().from(workspaceSearchHistory).where(eq(workspaceSearchHistory.workspaceId, id));
-
-    // Generate Activity Timeline
-    const timeline: any[] = [];
-
-    // 1. Research Created/Updated
-    timeline.push({
-      id: `t-research-created-${workspaceObj.id}`,
-      type: "Research Created",
-      title: "Research Workspace Established",
-      description: `SCM research workspace established for ${workspaceObj.companyName}.`,
-      timestamp: workspaceObj.createdAt,
-      user: "System"
-    });
-
-    if (workspaceObj.updatedAt && workspaceObj.updatedAt !== workspaceObj.createdAt) {
-      timeline.push({
-        id: `t-research-updated-${workspaceObj.id}`,
-        type: "Research Updated",
-        title: "Workspace Profile Synchronized",
-        description: "Company profile, Apollo intelligence, or market dynamics updated.",
-        timestamp: workspaceObj.updatedAt,
-        user: "System"
-      });
-    }
-
-    // 2. Contacts added
-    for (const c of contactsList) {
-      timeline.push({
-        id: `t-contact-${c.id}`,
-        type: "Contact Added",
-        title: "Executive Contact Logged",
-        description: `Added decision maker: ${c.fullName} (${c.position})`,
-        timestamp: c.createdAt || workspaceObj.createdAt,
-        user: "System"
-      });
-    }
-
-    // 3. Meetings held
-    for (const m of meetingsList) {
-      timeline.push({
-        id: `t-meeting-${m.id}`,
-        type: "Meeting Held",
-        title: "Executive Meeting Conducted",
-        description: `Purpose: ${m.purpose || "Institutional Relationship Review"}`,
-        timestamp: m.createdAt || `${m.date}T${m.time}:00.000Z`,
-        user: m.officerName || "Relationship Officer"
-      });
-    }
-
-    // 4. Proposals Generated
-    for (const p of proposalsList) {
-      timeline.push({
-        id: `t-proposal-${p.id}`,
-        type: "Proposal Generated",
-        title: "Investment Proposal Drafted",
-        description: `Generated proposal: "${p.title}" (Version ${p.version})`,
-        timestamp: p.createdAt,
-        user: "System"
-      });
-    }
-
-    // 5. Presentations Uploaded
-    for (const pr of presentationsList) {
-      timeline.push({
-        id: `t-presentation-${pr.id}`,
-        type: "Presentation Uploaded",
-        title: "Presentation Collateral Added",
-        description: `Uploaded ${pr.type || "Client Pitch Deck"}: "${pr.title}"`,
-        timestamp: pr.createdAt,
-        user: "System"
-      });
-    }
-
-    // 6. Tasks completed
-    for (const t of tasksList) {
-      if (t.isCompleted) {
-        timeline.push({
-          id: `t-task-${t.id}`,
-          type: "Task Completed",
-          title: "CRM Action Item Completed",
-          description: `Completed task: "${t.title}"`,
-          timestamp: workspaceObj.createdAt, // fallback to avoid errors
-          user: t.assignedStaff || "Relationship Officer"
-        });
-      }
-    }
-
-    // 7. Notes added
-    for (const n of notesList) {
-      timeline.push({
-        id: `t-note-${n.id}`,
-        type: "Note Added",
-        title: "Strategic Note Saved",
-        description: `Logged note: "${n.title}"`,
-        timestamp: n.createdAt,
-        user: "System"
-      });
-    }
-
-    // 8. AI Sessions Generated
-    for (const c of aiConversationsList) {
-      timeline.push({
-        id: `t-ai-${c.id}`,
-        type: "AI Session Generated",
-        title: "Serena Intelligence Inquiry",
-        description: `Consulted Serena with prompt: "${c.userPrompt.substring(0, 60)}..."`,
-        timestamp: c.createdAt,
-        user: "System"
-      });
-    }
-
-    // Sort timeline newest first
-    timeline.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-
-    return res.json({
-      workspace: workspaceObj,
-      contacts: contactsList,
-      meetings: meetingsList,
-      tasks: tasksList,
-      notes: notesList,
-      proposals: proposalsList,
-      presentations: presentationsList,
-      aiConversations: aiConversationsList,
-      searchHistory: searchHistoryList,
-      timeline
-    });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Workspace Detail failed:", err);
-    return res.status(500).json({ error: "Failed to load workspace details: " + err.message });
-  }
-});
-
-// Workspace Proposals Creation
-app.post("/api/workspaces/:id/proposals", async (req, res) => {
-  const { id } = req.params;
-  const { userId } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  try {
-    const wsFetched = await db.select().from(workspaces).where(eq(workspaces.id, id));
-    const workspaceObj = wsFetched[0];
-    if (!workspaceObj) return res.status(404).json({ error: "Workspace not found." });
-
-    const { title, content, version, approvalStatus } = req.body;
-    if (!title || !content) {
-      return res.status(400).json({ error: "Title and Content are required." });
-    }
-
-    const newProposal: any = {
-      id: `proposal-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      workspaceId: id,
-      title,
-      content,
-      version: version || "1.0",
-      approvalStatus: approvalStatus || "Draft",
-      createdBy: userId,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-
-    await db.insert(workspaceProposals).values(newProposal);
-
-    await logSystemEvent("Proposal Created", title, "Success", req, { workspaceId: id, proposalId: newProposal.id });
-    return res.status(201).json(newProposal);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to create workspace proposal:", err);
-    return res.status(500).json({ error: "Failed to save proposal: " + err.message });
-  }
-});
-
-// Workspace Presentations Upload
-app.post("/api/workspaces/:id/presentations", async (req, res) => {
-  const { id } = req.params;
-  const { userId } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  try {
-    const wsFetched = await db.select().from(workspaces).where(eq(workspaces.id, id));
-    const workspaceObj = wsFetched[0];
-    if (!workspaceObj) return res.status(404).json({ error: "Workspace not found." });
-
-    const { title, type, content } = req.body;
-    if (!title || !type) {
-      return res.status(400).json({ error: "Title and Type are required." });
-    }
-
-    const newPresentation: any = {
-      id: `presentation-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      workspaceId: id,
-      title,
-      type,
-      content: content || `Pitch materials for ${workspaceObj.companyName}`,
-      createdBy: userId,
-      createdAt: new Date().toISOString(),
-    };
-
-    await db.insert(workspacePresentations).values(newPresentation);
-
-    await logSystemEvent("Presentation Uploaded", title, "Success", req, { workspaceId: id, presentationId: newPresentation.id });
-    return res.status(201).json(newPresentation);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to create presentation:", err);
-    return res.status(500).json({ error: "Failed to upload presentation: " + err.message });
-  }
-});
-
-// Workspace AI Conversations (Serena interactions)
-app.post("/api/workspaces/:id/ai-conversations", async (req, res) => {
-  const { id } = req.params;
-  const { userId } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  const { userPrompt, responseText, modelUsed, tokens } = req.body;
-  if (!userPrompt || !responseText) {
-    return res.status(400).json({ error: "Prompt and response text are required." });
-  }
-
-  const newAIConv: any = {
-    id: `aiconv-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-    workspaceId: id,
-    userId,
-    userPrompt,
-    responseText,
-    modelUsed: modelUsed || "gemini-2.5-flash",
-    tokens: tokens || 0,
-    createdAt: new Date().toISOString(),
-  };
-
-  try {
-    await db.insert(workspaceAiConversations).values(newAIConv);
-    await logSystemEvent("AI Session Saved", `AI interaction stored for workspace`, "Success", req, { workspaceId: id });
-    return res.status(201).json(newAIConv);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to save AI session:", err);
-    return res.status(500).json({ error: "Failed to save AI session: " + err.message });
-  }
-});
-
-// Workspace Search History Save
-app.post("/api/workspaces/:id/search-history", async (req, res) => {
-  const { id } = req.params;
-  const { userId } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied." });
-
-  const { searchTerm, source, response, tokens } = req.body;
-  if (!searchTerm) {
-    return res.status(400).json({ error: "Search term is required." });
-  }
-
-  const newHistory: any = {
-    id: `history-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-    workspaceId: id,
-    userId,
-    searchTerm,
-    source: source || "Apollo",
-    response: response || "",
-    tokens: tokens || 0,
-    createdAt: new Date().toISOString(),
-  };
-
-  try {
-    await db.insert(workspaceSearchHistory).values(newHistory);
-    return res.status(201).json(newHistory);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to save search history:", err);
-    return res.status(500).json({ error: "Failed to save search history: " + err.message });
-  }
-});
-
-
-// ==========================================
-// NEWS SIGNAL PIPELINES
-// ==========================================
-app.get("/api/news", async (req, res) => {
-  if (isDatabaseHealthy) {
-    try {
-      const list = await db.select().from(newsArticles);
-      return res.json(list);
-    } catch (err: any) {
-      isDatabaseHealthy = false;
-      console.warn("[SCM DATABASE] News select notice: Operating in local memory fallback mode.", err.message || err);
-    }
-  }
-  return res.json(dbNewsArticles && dbNewsArticles.length > 0 ? dbNewsArticles : defaultNewsArticles);
-});
-
-app.post("/api/news", async (req, res) => {
-  const { companyName, title, content, description, category, severity } = req.body;
-  const actualContent = content || description;
-  if (!companyName || !title || !actualContent) {
-    return res.status(400).json({ error: "Company name, title, and content/description are required." });
-  }
-  const newArticle: NewsArticle = {
-    id: `news-${Date.now()}`,
-    companyName,
-    title,
-    content: actualContent,
-    category: category || "Signals",
-    date: new Date().toISOString().split('T')[0],
-    severity: severity || "Medium"
-  };
-
-  try {
-    await db.insert(newsArticles).values({
-      id: newArticle.id,
-      companyName: newArticle.companyName,
-      title: newArticle.title,
-      content: newArticle.content,
-      category: newArticle.category,
-      date: newArticle.date,
-      severity: newArticle.severity
-    });
-    return res.status(201).json(newArticle);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to persist new signal to Postgres:", err.message);
-    return res.status(500).json({ error: "Failed to persist new signal: " + err.message });
-  }
-});
-
-
-// ==========================================
-// PROACTIVE DISCOVERY AUTOMATION & AI DISCOVERY ENGINE
-// ==========================================
-
-// Endpoint: Fetch active discovery leads for logged-in user with strict ownership & duplicate intelligence
-app.get("/api/discovery/leads", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  const startTime = Date.now();
-  const { userId, role } = getRequestUser(req);
-
-  try {
-    if (!userId) {
-      return res.json([]);
-    }
-
-    let pgLeads: any[] = [];
-    let allProspects: any[] = [];
-
-    if (isDatabaseHealthy) {
-      try {
-        pgLeads = await db.select().from(discoveredLeads).where(eq(discoveredLeads.userId, userId)).orderBy(desc(discoveredLeads.createdAt));
-        allProspects = await db.select().from(prospects);
-      } catch (dbErr: any) {
-        isDatabaseHealthy = false;
-        console.log("[SCM DISCOVERY DATABASE NOTICE] Operating discovery leads in local memory fallback mode.");
-        pgLeads = (dbDiscoveredLeads || []).filter((l: any) => l.userId === userId || !l.userId);
-        allProspects = dbProspects || [];
-      }
-    } else {
-      pgLeads = (dbDiscoveredLeads || []).filter((l: any) => l.userId === userId || !l.userId);
-      allProspects = dbProspects || [];
-    }
-
-    const mapped = (pgLeads || []).map((r: any) => {
-      if (!r) return null;
-      
-      const matchedProspect = allProspects.find(p => p.name && p.name.trim().toLowerCase() === r.name.trim().toLowerCase());
-      
-      return {
-        id: r.id || '',
-        userId: r.userId || userId,
-        name: r.name || 'Unknown Corporation',
-        industry: r.industry || 'B2B Enterprise',
-        size: r.size || 'Not Specified',
-        website: r.website || '',
-        location: r.location || 'Lagos, Nigeria',
-        opportunityScore: typeof r.opportunityScore === 'number' ? r.opportunityScore : 85,
-        confidenceScore: typeof r.confidenceScore === 'number' ? r.confidenceScore : 90,
-        businessFit: r.businessFit || (r.opportunityScore >= 90 ? 'Exceptional Fit' : 'High Fit'),
-        treasuryPotential: r.treasuryPotential || 'â‚¦10B+ Liquidity Pool',
-        estimatedRevenueValue: typeof r.estimatedRevenueValue === 'number' ? r.estimatedRevenueValue : 2500000000,
-        reason: r.reason || '',
-        alreadyimported: !!(r.alreadyimported || r.already_imported || false),
-        recommendedProducts: Array.isArray(r.recommendedProducts) ? r.recommendedProducts : ['SCM Corporate Money Market Fund', 'Fixed Income & CP Placements'],
-        decisionMakers: Array.isArray(r.decisionMakers) ? r.decisionMakers : [{ name: "Chief Financial Officer", title: "CFO / Finance Director" }],
-        latestNews: r.latestNews || "Corporate liquidity optimization signal detected.",
-        source: r.source || "NGX Listed Corporations",
-        revenueRange: r.revenueRange || "â‚¦10B - â‚¦100B High Liquidity",
-        createdAt: r.createdAt || new Date().toISOString(),
-        existingProspect: matchedProspect ? {
-          id: matchedProspect.id,
-          name: matchedProspect.name,
-          assignedOfficerId: matchedProspect.assignedOfficerId,
-          assignedOfficerName: matchedProspect.assignedOfficerName || "Assigned Relationship Manager",
-          status: matchedProspect.status || "Lead",
-          stage: matchedProspect.status
-        } : null
-      };
-    }).filter(Boolean);
-
-    return res.json(mapped);
-  } catch (err: any) {
-    console.error(`[SCM DISCOVERY ERROR] route=/api/discovery/leads error:`, err.message || err);
-    return res.status(200).json([]);
-  }
-});
-
-// Endpoint: Multi-Parameter AI Discovery Scan Trigger (Dynamic Next-3 Queue Batching)
-app.post("/api/discovery/scan", async (req, res) => {
-  try {
-    const { userId, email } = getRequestUser(req);
-    const validUser = await ensureValidUser(userId, email);
-
-    const { 
-      source = "All", 
-      industry = "All", 
-      location = "All", 
-      sizeTier = "All", 
-      revenueRange = "All", 
-      targetProduct = "All" 
-    } = req.body || {};
-
-    console.log(`[SCM AI DISCOVERY ENGINE] Executing Discovery Scan for user=${validUser.email} filters: source=${source}, industry=${industry}, location=${location}`);
-
-    // Build DB Context for Discovery Queue Engine
-    const ctx: DBClientContext = {
-      db,
-      isDatabaseHealthy,
-      discoveredLeadsTable: discoveredLeads,
-      discoveryQueuesTable: discoveryQueues,
-      prospectsTable: prospects,
-      apolloEnrichmentCacheTable: apolloEnrichmentCache,
-      eqFn: eq,
-      inArrayFn: inArray,
-      orFn: or,
-      dbDiscoveredLeadsFallback: dbDiscoveredLeads,
-      dbProspectsFallback: dbProspects
-    };
-
-    // Execute scan batch via Discovery Queue Engine (Batch of 3)
-    const scanResult = await discoveryQueueEngine.executeScanBatch(
-      validUser.id,
-      { source, industry, location, sizeTier, revenueRange, targetProduct },
-      ctx,
-      3
-    );
-
-    // Clear previous unimported discovered leads for this user to present the fresh queue scan
-    if (isDatabaseHealthy) {
-      try {
-        await db.delete(discoveredLeads).where(
-          and(
-            eq(discoveredLeads.userId, validUser.id),
-            eq(discoveredLeads.alreadyimported, false)
-          )
-        );
-      } catch (delErr: any) {
-        console.warn("[SCM DISCOVERY] Non-critical warning clearing previous scan leads:", delErr?.message || delErr);
-      }
-    } else {
-      dbDiscoveredLeads = (dbDiscoveredLeads || []).filter(l => l.userId !== validUser.id || l.alreadyimported);
-    }
-
-    const insertedLeads: any[] = [];
-
-    for (const lead of scanResult.batch) {
-      const leadData: any = {
-        id: lead.id,
-        userId: validUser.id,
-        name: lead.name,
-        industry: lead.industry,
-        size: lead.size,
-        website: lead.website,
-        location: lead.location,
-        opportunityScore: lead.opportunityScore,
-        confidenceScore: lead.confidenceScore,
-        businessFit: lead.businessFit,
-        treasuryPotential: lead.treasuryPotential,
-        estimatedRevenueValue: lead.estimatedRevenueValue,
-        reason: lead.reason,
-        alreadyimported: false,
-        recommendedProducts: lead.recommendedProducts,
-        decisionMakers: lead.decisionMakers,
-        latestNews: lead.latestNews,
-        source: lead.source,
-        revenueRange: lead.revenueRange,
-        createdAt: lead.createdAt,
-        enrichmentStatus: lead.enrichmentStatus || "Unavailable",
-        lastSyncedAt: lead.lastSyncedAt || new Date().toISOString(),
-        apolloOrgId: lead.apolloOrgId || null,
-        linkedinUrl: lead.linkedinUrl || "Unavailable"
-      };
-
-      if (isDatabaseHealthy) {
-        try {
-          await db.insert(discoveredLeads).values(leadData);
-        } catch (insErr: any) {
-          isDatabaseHealthy = false;
-          console.warn("[SCM AI DISCOVERY ENGINE] DB insert failed for discovered lead, saving to memory state:", insErr.message || insErr);
-          dbDiscoveredLeads.unshift(leadData);
-        }
-      } else {
-        dbDiscoveredLeads.unshift(leadData);
-      }
-
-      insertedLeads.push({
-        ...leadData,
-        existingProspect: lead.existingProspect
-      });
-    }
-
-    // Record session history
-    const sessionId = `session-${Date.now()}`;
-    const sessionRecord = {
-      id: sessionId,
-      userId: validUser.id,
-      userEmail: validUser.email,
-      source: source || "All Sources",
-      industry: industry || "All Industries",
-      location: location || "All Regions",
-      sizeTier: sizeTier || "All Tiers",
-      revenueRange: revenueRange || "All Ranges",
-      targetProduct: targetProduct || "All SCM Offerings",
-      evalCount: scanResult.totalEvaluated,
-      recCount: insertedLeads.length,
-      savedCount: 0,
-      createdAt: new Date().toISOString()
-    };
-
-    if (isDatabaseHealthy) {
-      try {
-        await db.insert(discoverySessions).values(sessionRecord);
-      } catch (sErr) {
-        console.warn("[SCM DISCOVERY] Session history record insert failed:", sErr);
-      }
-    }
-
-    // Log system audit
-    if (isDatabaseHealthy) {
-      try {
-        await db.insert(auditLogs).values({
-          id: `audit-${Date.now()}`,
-          timestamp: new Date().toISOString(),
-          searchTerm: `SCM Discovery Scan: Source=${source}, Industry=${industry}`,
-          user: validUser.fullName || validUser.email,
-          userId: validUser.id,
-          userEmail: validUser.email,
-          status: "SUCCESS",
-          confidenceScore: 92,
-          actionTaken: `Executed SCM AI Discovery Scan â€” Evaluated ${scanResult.totalEvaluated} corporations, generated ${insertedLeads.length} recommendations.`
-        });
-      } catch (aErr) {
-        console.warn("[SCM DISCOVERY] Audit log write failed:", aErr);
-      }
-    }
-
-    console.log(`[SCM AI DISCOVERY ENGINE] Successfully completed scan for ${validUser.email}. Generated batch of ${insertedLeads.length} leads (queue cycle reset: ${scanResult.queueCycleReset}).`);
-    return res.status(201).json({
-      success: true,
-      session: sessionRecord,
-      leads: insertedLeads,
-      queueCycleReset: scanResult.queueCycleReset
-    });
-
-  } catch (err: any) {
-    console.error("[SCM AI DISCOVERY ENGINE ERROR] Discovery scan failed:", err);
-    return res.status(500).json({ error: "Discovery scan execution failed: " + err.message });
-  }
-});
-
-// Backward compatibility endpoint: Legacy trigger
-app.post("/api/discovery/trigger", async (req, res) => {
-  try {
-    const { userId, email } = getRequestUser(req);
-    const validUser = await ensureValidUser(userId, email);
-
-    // Call scan internally with defaults
-    req.body = { source: "NGX Listed Corporations", industry: "All", location: "All", sizeTier: "All", revenueRange: "All", targetProduct: "All" };
-    
-    const scanResponse = await fetch(`http://localhost:3000/api/discovery/scan`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-user-id": validUser.id, "x-user-email": validUser.email },
-      body: JSON.stringify(req.body)
-    });
-    const scanData = await scanResponse.json();
-
-    if (scanData && scanData.leads && scanData.leads.length > 0) {
-      return res.status(201).json(scanData.leads[0]);
-    }
-
-    return res.status(200).json({ message: "Scan completed successfully." });
-  } catch (err: any) {
-    console.error("[SCM RADAR TRIGGER ERROR]:", err.message);
-    return res.status(500).json({ error: "Failed to trigger discovery lead: " + err.message });
-  }
-});
-
-// Endpoint: Dismiss lead from discovery queue
-app.delete("/api/discovery/lead/:id", async (req, res) => {
-  const { id } = req.params;
-  try {
-    const { userId, email } = getRequestUser(req);
-    const validUser = await ensureValidUser(userId, email);
-
-    const ctx: DBClientContext = {
-      db,
-      isDatabaseHealthy,
-      discoveredLeadsTable: discoveredLeads,
-      discoveryQueuesTable: discoveryQueues,
-      prospectsTable: prospects,
-      apolloEnrichmentCacheTable: apolloEnrichmentCache,
-      eqFn: eq,
-      inArrayFn: inArray,
-      orFn: or,
-      dbDiscoveredLeadsFallback: dbDiscoveredLeads,
-      dbProspectsFallback: dbProspects
-    };
-
-    let leadName = "";
-    if (isDatabaseHealthy) {
-      try {
-        const existing = await db.select().from(discoveredLeads).where(
-          and(eq(discoveredLeads.id, id), eq(discoveredLeads.userId, validUser.id))
-        );
-        if (existing.length > 0) {
-          leadName = existing[0].name;
-          await db.delete(discoveredLeads).where(and(eq(discoveredLeads.id, id), eq(discoveredLeads.userId, validUser.id)));
-        }
-      } catch (dbErr: any) {
-        isDatabaseHealthy = false;
-        const idx = (dbDiscoveredLeads || []).findIndex((l: any) => l.id === id && l.userId === validUser.id);
-        if (idx !== -1) {
-          leadName = dbDiscoveredLeads[idx].name;
-          dbDiscoveredLeads.splice(idx, 1);
-        }
-      }
-    } else {
-      const idx = (dbDiscoveredLeads || []).findIndex((l: any) => l.id === id && l.userId === validUser.id);
-      if (idx !== -1) {
-        leadName = dbDiscoveredLeads[idx].name;
-        dbDiscoveredLeads.splice(idx, 1);
-      }
-    }
-
-    if (leadName) {
-      await discoveryQueueEngine.recordDismissedCompany(validUser.id, leadName, ctx);
-    }
-
-    return res.status(200).json({ success: true, message: "Lead removed from active discovery queue." });
-  } catch (err: any) {
-    console.error("[SCM DISCOVERY DISMISS ERROR]:", err);
-    return res.status(500).json({ error: "Failed to dismiss lead: " + err.message });
-  }
-});
-
-// Endpoint: Open Intelligence (creates Research Workspace and pre-populates deep AI analysis)
-app.post("/api/discovery/open-intelligence/:id", async (req, res) => {
-  const { id } = req.params;
-  try {
-    const { userId, email } = getRequestUser(req);
-    const validUser = await ensureValidUser(userId, email);
-
-    const leadFetched = await db.select().from(discoveredLeads)
-      .where(and(eq(discoveredLeads.id, id), eq(discoveredLeads.userId, validUser.id)));
-    const lead = leadFetched[0];
-
-    if (!lead) {
-      return res.status(404).json({ error: "Discovered lead not found in your discovery queue." });
-    }
-
-    // Check if workspace already exists for this lead or company name
-    const existingWorkspace = await db.select().from(workspaces).where(
-      and(
-        sql`LOWER(${workspaces.companyName}) = LOWER(${lead.name.trim()})`,
-        eq(workspaces.ownerUserId, validUser.id)
-      )
-    );
-
-    if (existingWorkspace.length > 0) {
-      return res.status(200).json({
-        success: true,
-        workspaceId: existingWorkspace[0].id,
-        companyName: lead.name,
-        isExisting: true
-      });
-    }
-
-    // Generate rich research workspace
-    const workspaceId = `workspace-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    const newWorkspace = {
-      id: workspaceId,
-      prospectId: null,
-      ownerUserId: validUser.id,
-      companyName: lead.name,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      status: "Active",
-      apolloFindings: `SCM Active Discovery Radar Intelligence Dossier:\n- Target Industry: ${lead.industry}\n- Headquarters: ${lead.location}\n- Domain: ${lead.website}\n- AI Opportunity Score: ${lead.opportunityScore}%\n- AI Confidence Rating: ${lead.confidenceScore || 90}%\n- Estimated Liquidity Turnover: ${lead.treasuryPotential || 'High'}`,
-      companyProfile: lead.reason,
-      industryAnalysis: `Deep Analysis for West African ${lead.industry} Sector:\n- High growth corporate treasury momentum.\n- Key liquidity requirements aligned with SCM Capital money market mutual funds & high-yield commercial paper placements.`,
-      executiveInsights: `Strategic Executive Outreach Plan:\n- Target Officers: Group Chief Financial Officer, Head of Corporate Treasury.\n- Pitch Angle: High-yield liquid treasury optimization and CP tranche participation.`,
-      investmentOpportunities: `Recommended SCM Capital Products:\n1. SCM Corporate Money Market Mutual Fund (Daily Liquidity)\n2. High-Yield Fixed Income / CP Placements\n3. Customized Corporate Liquidity Management`,
-      researchSummaries: `Auto-generated by SCM Apex Discovery Engine for ${lead.name}. AI Strategic Rationale: ${lead.reason}`
-    };
-
-    await db.insert(workspaces).values(newWorkspace);
-
-    return res.status(201).json({
-      success: true,
-      workspaceId: workspaceId,
-      companyName: lead.name,
-      isExisting: false
-    });
-
-  } catch (err: any) {
-    console.error("[SCM OPEN INTELLIGENCE ERROR]:", err);
-    return res.status(500).json({ error: "Failed to open intelligence dossier: " + err.message });
-  }
-});
-
-// Endpoint: Import discovered lead into SCM CRM (Prospect + Workspace + Primary Contact)
-app.post("/api/discovery/import/:id", async (req, res) => {
-  const { id } = req.params;
-  try {
-    const { userId, email } = getRequestUser(req);
-    const validUser = await ensureValidUser(userId, email);
-
-    const leadFetched = await db.select().from(discoveredLeads)
-      .where(and(eq(discoveredLeads.id, id), eq(discoveredLeads.userId, validUser.id)));
-    const lead = leadFetched[0];
-    if (!lead) {
-      return res.status(404).json({ error: "Discovered lead not found in corporate radar database or belongs to another user." });
-    }
-    if (lead.alreadyimported) {
-      return res.status(400).json({ error: "Lead is already imported as an active Prospect in your CRM." });
-    }
-
-    const duplicate = await db.select().from(prospects).where(
-      and(
-        sql`LOWER(${prospects.name}) = LOWER(${lead.name.trim()})`,
-        eq(prospects.assignedOfficerId, validUser.id)
-      )
-    );
-    if (duplicate.length > 0) {
-      return res.status(400).json({ error: `An organization named "${lead.name}" already exists under your assigned Prospect Directory.` });
-    }
-
-    const prospectId = `prospect-${Date.now()}`;
-    const estimatedValue = lead.estimatedRevenueValue || 2500000000;
-
-    const newProspect: any = {
-      id: prospectId,
-      name: lead.name,
-      industry: lead.industry,
-      orgType: "Public Limited Corporation",
-      location: lead.location,
-      website: lead.website,
-      status: "Lead",
-      priority: lead.opportunityScore >= 90 ? "High" : "Medium",
-      conversionProbability: 35,
-      opportunityValue: estimatedValue, 
-      assignedOfficerId: validUser.id,
-      assignedOfficerName: validUser.fullName,
-      opportunityScore: lead.opportunityScore,
-      notes: `Imported directly from SCM Apex Discovery Engine. Strategic Rationale: ${lead.reason}`,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      primaryContactId: null
-    };
-
-    // Auto-create Primary Contact (Group CFO)
-    const contactId = `contact-${Date.now()}`;
-    const newContact = {
-      id: contactId,
-      prospectId: prospectId,
-      prospectName: lead.name,
-      fullName: "Chief Financial Officer",
-      position: "Group Chief Financial Officer",
-      department: "Finance & Treasury",
-      email: `cfo@${lead.website ? lead.website.replace('https://', '').replace('http://', '').split('/')[0] : 'company.com'}`,
-      phone: "+234 1 234 5678",
-      influenceLevel: "High",
-      isDecisionMaker: true,
-      notes: "Primary executive contact auto-provisioned during SCM Apex Discovery import.",
-      createdAt: new Date().toISOString()
-    };
-
-    newProspect.primaryContactId = contactId;
-
-    // Auto-create Research Workspace
-    const workspaceId = `workspace-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    const newWorkspace: any = {
-      id: workspaceId,
-      prospectId: prospectId,
-      ownerUserId: validUser.id,
-      companyName: lead.name,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      status: "Active",
-      apolloFindings: `SCM Discovery Import Findings:\n- Target Corporation: ${lead.name}\n- Industry: ${lead.industry}\n- Location: ${lead.location}\n- Estimated Treasury Pool: ${lead.treasuryPotential || 'â‚¦10B+'}\n- Verification Level: Mapped on SCM Capital Portal`,
-      companyProfile: lead.reason,
-      industryAnalysis: `Nigerian Industry Sector: ${lead.industry}. Corporate treasury optimization evaluation conducted by SCM Capital.`,
-      executiveInsights: `Corporate treasury officers are awaiting CRM assignment and intro meeting.`,
-      investmentOpportunities: `Recommended SCM Capital Products:\n- SCM Corporate Money Market Mutual Fund\n- High-Yield Commercial Paper Placements\n- Structured Treasury Optimization`,
-      researchSummaries: `Mapped to Prospect Directory. Lead AI Score: ${lead.opportunityScore}%`
-    };
-
-    await db.update(discoveredLeads).set({ alreadyimported: true }).where(eq(discoveredLeads.id, id));
-    await db.insert(prospects).values(newProspect);
-    await db.insert(contacts).values(newContact);
-    await db.insert(workspaces).values(newWorkspace);
-
-    return res.status(201).json({ success: true, prospect: newProspect, workspaceId });
-  } catch (err: any) {
-    console.error("[SCM DISCOVERY IMPORT ERROR] Lead import failed:", err);
-    return res.status(500).json({ error: "Failed to import lead: " + err.message });
-  }
-});
-
-// Endpoint: Fetch User's Discovery Scan Session History
-app.get("/api/discovery/history", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  try {
-    const { userId } = getRequestUser(req);
-    if (!userId) return res.json([]);
-
-    const sessions = await db.select().from(discoverySessions)
-      .where(eq(discoverySessions.userId, userId))
-      .orderBy(desc(discoverySessions.createdAt));
-
-    return res.json(sessions);
-  } catch (err: any) {
-    console.error("[SCM DISCOVERY HISTORY ERROR]:", err);
-    return res.status(200).json([]);
-  }
-});
-
-// Endpoint: Fetch Executive Discovery Analytics
-app.get("/api/discovery/analytics", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  try {
-    const { userId } = getRequestUser(req);
-    if (!userId) return res.status(401).json({ error: "Unauthorized" });
-
-    const leads = await db.select().from(discoveredLeads).where(eq(discoveredLeads.userId, userId));
-    const sessions = await db.select().from(discoverySessions).where(eq(discoverySessions.userId, userId));
-
-    const totalEvaluated = sessions.reduce((acc, s) => acc + (s.evalCount || 0), 0) + (leads.length * 3);
-    const totalQualified = leads.filter(l => l.opportunityScore >= 80).length;
-    const totalSaved = leads.filter(l => l.alreadyimported).length;
-    const conversionRate = totalQualified > 0 ? Math.round((totalSaved / totalQualified) * 100) : 0;
-    
-    const totalTreasuryValue = leads.reduce((acc, l) => acc + (Number(l.estimatedRevenueValue) || 2500000000), 0);
-
-    // Industry breakdown
-    const indMap: Record<string, number> = {};
-    leads.forEach(l => {
-      indMap[l.industry] = (indMap[l.industry] || 0) + 1;
-    });
-    const topIndustries = Object.entries(indMap).map(([name, count]) => ({ name, count })).sort((a,b) => b.count - a.count);
-
-    // Products breakdown
-    const prodMap: Record<string, number> = {};
-    leads.forEach(l => {
-      const prods = Array.isArray(l.recommendedProducts) ? l.recommendedProducts : ["SCM Corporate Money Market Fund"];
-      prods.forEach((p: string) => {
-        prodMap[p] = (prodMap[p] || 0) + 1;
-      });
-    });
-    const topProducts = Object.entries(prodMap).map(([name, count]) => ({ name, count })).sort((a,b) => b.count - a.count);
-
-    // Sources breakdown
-    const srcMap: Record<string, number> = {};
-    leads.forEach(l => {
-      const src = l.source || "NGX Listed Corporations";
-      srcMap[src] = (srcMap[src] || 0) + 1;
-    });
-    const topSources = Object.entries(srcMap).map(([name, count]) => ({ name, count })).sort((a,b) => b.count - a.count);
-
-    return res.json({
-      totalEvaluated,
-      totalQualified,
-      totalSaved,
-      conversionRate,
-      totalTreasuryValue,
-      topIndustries,
-      topProducts,
-      topSources,
-      sessionHistory: sessions
-    });
-
-  } catch (err: any) {
-    console.error("[SCM DISCOVERY ANALYTICS ERROR]:", err);
-    return res.status(500).json({ error: "Failed to generate discovery analytics: " + err.message });
-  }
-});
-
-
-// ==========================================
-// TEAM PERFORMANCE STATS (DYNAMIC CALCULATION)
-// ==========================================
-app.get("/api/team/performance", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  try {
-    const { userId, role, email, isAdmin } = getRequestUser(req);
-    const isSuperAdmin = email === 'wisdom.okoh@scmcapitalng.com' || 
-                         email === 'omololu.ajediran@scmcapitalng.com';
-    const isSystemAdmin = isSuperAdmin || 
-                         role === 'Admin' || 
-                         role === 'SUPER_ADMIN' || 
-                         role === 'Administrator' || 
-                         isAdmin;
-
-    if (!userId || !isSystemAdmin) {
-      return res.status(403).json({ error: "Access denied. Staff performance indicators are restricted to system Administrators." });
-    }
-
-    let pgUsers: any[] = dbUsers || [];
-    let pgProspects: any[] = dbProspects || [];
-    let pgMeetings: any[] = dbMeetings || [];
-    let pgActivities: any[] = dbActivities || [];
-    let pgTasks: any[] = dbTasks || [];
-
-    if (isDatabaseHealthy) {
-      try {
-        pgUsers = await db.select().from(users);
-        pgProspects = await db.select().from(prospects);
-        pgMeetings = await db.select().from(meetings);
-        pgActivities = await db.select().from(activities);
-        pgTasks = await db.select().from(tasks);
-      } catch (err: any) {
-        isDatabaseHealthy = false;
-        console.warn("[SCM PERFORMANCE NOTICE] Operating performance index in local memory fallback mode:", err.message || err);
-        pgUsers = dbUsers || [];
-        pgProspects = dbProspects || [];
-        pgMeetings = dbMeetings || [];
-        pgActivities = dbActivities || [];
-        pgTasks = dbTasks || [];
-      }
-    }
-
-    const performance = pgUsers.map(user => {
-      // Prospects assigned to this Relationship Manager/Officer
-      const userProspects = pgProspects.filter(p => p.assignedOfficerId === user.id);
-      const prospectsCount = userProspects.length;
-      
-      // Converted prospects
-      const userConversions = userProspects.filter(p => p.status === 'Converted');
-      const revenueConverted = userConversions.reduce((sum, p) => sum + (p.opportunityValue || 0), 0);
-      
-      // Meetings led by this officer
-      const meetingsHeldCount = pgMeetings.filter(m => m.officerId === user.id).length;
-      
-      // Completed activities
-      const officerActivities = pgActivities.filter(a => a.officerId === user.id);
-      const literacySessionsCount = officerActivities.filter(a => a.activityType === 'Financial Literacy Session' && a.status === 'Completed').length;
-      
-      // Task completion metrics
-      const completedTasks = pgTasks.filter(t => t.assignedStaff === user.fullName && t.isCompleted).length;
-      const totalTasks = pgTasks.filter(t => t.assignedStaff === user.fullName).length;
-      const taskRatio = totalTasks > 0 ? (completedTasks / totalTasks) : 0;
-      
-      // Organic, dynamic Performance Index out of 100
-      let performanceIndex = 0;
-      if (prospectsCount > 0) {
-        performanceIndex = Math.min(
-          100,
-          Math.round((userConversions.length * 40) + (meetingsHeldCount * 15) + (taskRatio * 30) + (officerActivities.length * 5))
-        );
-      }
-      
-      return {
-        id: user.id,
-        name: user.fullName,
-        role: user.role || "Relationship Manager",
-        prospectsCount,
-        revenueConverted,
-        meetingsHeld: meetingsHeldCount,
-        literacySessionsCount,
-        leadsGenerated: userProspects.filter(p => p.source && p.source !== 'Direct Outreach').length,
-        opportunitiesCreated: prospectsCount,
-        conversions: userConversions.length,
-        pipelineValue: userProspects.reduce((sum, p) => sum + (p.opportunityValue || 0), 0),
-        performanceIndex,
-        avatar: user.fullName.split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase()
-      };
-    });
-    
-    return res.json(performance);
-  } catch (err: any) {
-    console.error("[SCM PERFORMANCE ERROR] Failed to compute performance index:", err);
-    return res.status(500).json({ error: "Failed to compute performance metrics: " + err.message });
-  }
-});
-
-
-// ==========================================
-// AI CRM ADVOCATE ASSISTANT (SERENA)
-// ==========================================
-const scmProductsList = [
-  {
-    name: "SCM Corporate Money Market Fund",
-    description: "Short-term high-yield secure repository for excess cash reserves, offering maximum liquidity and competitive yields.",
-    idealCustomer: "Corporates with idle capital, SMEs needing interest-bearing checking accounts.",
-    benefits: ["Same-day value", "High quality underlying assets", "Sovereign/bank bankroll matching", "Capital preservation"],
-    riskProfile: "Low",
-    liquidityProfile: "Daily (same-day settlement)",
-    typicalUseCases: ["Corporate sweep account", "Payroll buffering", "Short-term treasury parking"],
-    idealIndustries: ["Manufacturing", "Conglomerates", "Energy", "Financial Services", "Retail", "Technology", "Construction"],
-    recommendedPersonas: ["Treasurer", "CFO", "Finance Director", "Finance Manager"]
-  },
-  {
-    name: "SCM Fixed Income Fund",
-    description: "Mid-to-long term investment vehicle targeting sovereign debt, corporate bonds, and credit infrastructure notes.",
-    idealCustomer: "Pension managers, insurance firms, corporates with long-term capital allocation plans.",
-    benefits: ["Term premium returns", "SEC-regulated diversification", "Professional bond oversight"],
-    riskProfile: "Medium",
-    liquidityProfile: "T+3 business days",
-    typicalUseCases: ["Asset-liability matching", "CAPEX reserve hedging", "Strategic long-term asset positioning"],
-    idealIndustries: ["Healthcare", "Agriculture", "Manufacturing", "Telecommunications", "Education"],
-    recommendedPersonas: ["CFO", "Lead Investment Strategist", "Head of Pension", "MD"]
-  },
-  {
-    name: "SCM Treasury Bills Service",
-    description: "Direct access and secondary brokerage of federal government treasury bills, backed by sovereign guarantee.",
-    idealCustomer: "Highly risk-averse corporates, government agencies, family trusts.",
-    benefits: ["100% sovereign guarantee", "Upfront interest discount payouts", "No credit default risk"],
-    riskProfile: "Low",
-    liquidityProfile: "Secondary market trading / hold to maturity",
-    typicalUseCases: ["Sovereign-grade regulatory backing", "Collateral reserve optimization"],
-    idealIndustries: ["Banking", "Government Agencies", "Logistics", "Aviation"],
-    recommendedPersonas: ["Treasurer", "Auditor General", "Head of Risk"]
-  },
-  {
-    name: "SCM Commercial Paper Placements",
-    description: "Direct investments in high-quality corporate short-term debt instruments yielding superior premium returns over public notes.",
-    idealCustomer: "Asset managers, institutional treasurers seeking maximum short-term yields.",
-    benefits: ["Premium yield boost of 150-300bps over Treasury bills", "Direct backing by highly-rated corporates", "Standard yields matching customized horizons"],
-    riskProfile: "Medium",
-    liquidityProfile: "Hold to maturity (15 to 270 days)",
-    typicalUseCases: ["Corporate cash yield amplification", "Milestone-backed treasury planning"],
-    idealIndustries: ["Oil & Gas", "Telecommunications", "Conglomerates", "Technology"],
-    recommendedPersonas: ["CFO", "Finance Director", "Treasurer", "Corporate Controller"]
-  },
-  {
-    name: "SCM Private Trust",
-    description: "Bespoke fiduciary and protective structures holding estate planning, keyman risk shielding, and family assets transition boards.",
-    idealCustomer: "Founder-led enterprises, family conglomerates, High-Net-Worth Individuals.",
-    benefits: ["Rigid asset protection layout", "Keyman continuity planning", "Tax-efficient succession structures"],
-    riskProfile: "Low",
-    liquidityProfile: "Structured term distributions",
-    typicalUseCases: ["Succession mapping", "Governance preservation for multi-generational operations", "Discretionary asset locking"],
-    idealIndustries: ["Family Businesses", "Agriculture", "Real Estate", "Professional Services"],
-    recommendedPersonas: ["Chairman", "Founder", "Managing Director", "Chief Legal Counsel"]
-  },
-  {
-    name: "SCM Portfolio Management (Discretionary)",
-    description: "Bespoke dynamically managed multi-asset investment portfolios matching unique corporate mandate criteria.",
-    idealCustomer: "Insurance providers, foundations, large cooperatives seeking custom investment mandates.",
-    benefits: ["Bespoke investment guidelines matching corporate regulations", "Active risk hedging", "Global asset allocation coverage"],
-    riskProfile: "Medium",
-    liquidityProfile: "Bespoke exit rules",
-    typicalUseCases: ["Long-term corporate treasury reserve appreciation", "Strategic endowment growth"],
-    idealIndustries: ["Insurance", "Foundations", "Large Corporates", "Pensions"],
-    recommendedPersonas: ["Treasury Committee", "Investment Coordinator", "Finance Trustee"]
-  },
-  {
-    name: "SCM Wealth Advisory Services",
-    description: "Global standard multi-currency advisory aligning high-performance portfolios with executive wealth targets.",
-    idealCustomer: "Executives, board members, key seed investors.",
-    benefits: ["Inflation hedging via multi-currency baskets", "Integrated tax mapping", "Premium private placement deals Access"],
-    riskProfile: "Medium",
-    liquidityProfile: "Variable (liquid cash vs private equity lockups)",
-    typicalUseCases: ["C-suite compensation preservation", "Personal treasury hedge development"],
-    idealIndustries: ["Financial Services", "Oil & Gas", "Technology", "Aviation"],
-    recommendedPersonas: ["Managing Director", "Executive Director", "CFO", "CEO"]
-  },
-  {
-    name: "SCM Institutional Mandates",
-    description: "Bespoke public-private asset frameworks organizing capital financing, municipal bonds issuance, and specialized project vehicles.",
-    idealCustomer: "State cooperatives, municipalities, large-scale industrial developers.",
-    benefits: ["Elite structured corporate finance backing", "Cooperative capital matching", "Expert project oversight structures"],
-    riskProfile: "Medium",
-    liquidityProfile: "Long term structured timeline",
-    typicalUseCases: ["Public infrastructure funding setup", "Regional development asset pooling"],
-    idealIndustries: ["Power", "Construction", "Real Estate", "Government", "Infrastructure"],
-    recommendedPersonas: ["Director General", "Managing Director", "Chairman of the Board"]
-  },
-  {
-    name: "SCM Liquidity Management Solutions",
-    description: "Automated business unit sweep frameworks concentrating multi-subsidiary balances to harvest systematic cash value.",
-    idealCustomer: "Multi-subsidiary retail operators, conglomerates, fast-moving consumer packaging giants.",
-    benefits: ["Zero cash-drag automation", "Unified yield concentration on pooled accounts", "Complete dashboard cash tracking"],
-    riskProfile: "Low",
-    liquidityProfile: "Daily sweep accessibility",
-    typicalUseCases: ["Pooling fragmented regional retail deposits", "Inter-company liquidity sweeping"],
-    idealIndustries: ["Retail", "FMCG", "Conglomerates", "Logistics"],
-    recommendedPersonas: ["Group Controller", "Treasurer", "Global CFO"]
-  },
-  {
-    name: "SCM Treasury Solutions",
-    description: "A complete framework providing corporate foreign trade financing, derivative swaps hedging, and mid-term capital matching.",
-    idealCustomer: "Import-export manufacturers, raw materials suppliers with active forex exposure.",
-    benefits: ["Unmatched foreign exchange exposure hedging", "Flexible commercial credit support", "Custom structured interest swaps"],
-    riskProfile: "High",
-    liquidityProfile: "Bespoke term matching",
-    typicalUseCases: ["Currency oscillation hedging", "Global trade credit processing", "Structural working capital enhancement"],
-    idealIndustries: ["Oil & Gas", "Agriculture", "Logistics", "Aviation", "Manufacturing"],
-    recommendedPersonas: ["CFO", "Treasurer", "VP Finance", "Currency Manager"]
-  }
-];
-
-function calculateProductFitScores(company: { name: string; industry?: string; revenueValue?: number; employeeCount?: number; opportunityValue?: number; priority?: string }) {
-  const scoreResults = scmProductsList.map(prod => {
-    let score = 60; // Base score
-    const matchesIndustry = prod.idealIndustries.some(ind => company.industry && ind.toLowerCase() === company.industry.toLowerCase());
-    if (matchesIndustry) {
-      score += 15;
-    }
-    
-    const oppValue = company.opportunityValue || 0;
-    const empCount = company.employeeCount || 0;
-    
-    // Custom logic per product to ensure precision
-    if (prod.name === "SCM Commercial Paper Placements") {
-      if (oppValue > 500000000) score += 15;
-      if (empCount > 500) score += 10;
-      if (company.industry && ["Manufacturing", "Oil & Gas", "Telecommunications", "Conglomerates"].includes(company.industry)) {
-        score += 10;
-      }
-    } else if (prod.name === "SCM Corporate Money Market Fund") {
-      if (oppValue < 500000000 && oppValue > 0) score += 15;
-      if (empCount > 100) score += 10;
-      if (company.industry && ["Manufacturing", "Technology", "Retail", "Financial Services"].includes(company.industry)) {
-        score += 10;
-      }
-    } else if (prod.name === "SCM Fixed Income Fund") {
-      if (oppValue > 200000000) score += 10;
-      if (company.industry && ["Healthcare", "Agriculture", "Manufacturing", "Telecommunications"].includes(company.industry)) {
-        score += 10;
-      }
-    } else if (prod.name === "SCM Treasury Bills Service") {
-      if (company.industry && ["Banking", "Government Agencies", "Logistics"].includes(company.industry)) {
-        score += 15;
-      }
-      if (oppValue > 100000000) score += 5;
-    } else if (prod.name === "SCM Private Trust") {
-      if (company.industry && ["Family Businesses", "Agriculture", "Manufacturing"].includes(company.industry)) {
-        score += 15;
-      }
-      if (empCount > 200) score += 10;
-    } else if (prod.name === "SCM Portfolio Management (Discretionary)") {
-      if (oppValue > 800000000) score += 20;
-      if (company.industry && ["Insurance", "Foundations"].includes(company.industry)) {
-        score += 15;
-      }
-    } else if (prod.name === "SCM Wealth Advisory Services") {
-      if (company.industry && ["Financial Services", "Oil & Gas"].includes(company.industry)) {
-        score += 15;
-      }
-      if (oppValue > 300000000) score += 10;
-    } else if (prod.name === "SCM Institutional Mandates") {
-      if (oppValue > 1000000000) score += 25;
-      if (company.industry && ["Power", "Construction", "Real Estate", "Infrastructure"].includes(company.industry)) {
-        score += 20;
-      }
-    } else if (prod.name === "SCM Liquidity Management Solutions") {
-      if (company.industry && ["Retail", "FMCG", "Conglomerates"].includes(company.industry)) {
-        score += 25;
-      }
-      if (empCount > 300) score += 10;
-    } else if (prod.name === "SCM Treasury Solutions") {
-      if (company.industry && ["Oil & Gas", "Agriculture", "Logistics", "Aviation"].includes(company.industry)) {
-        score += 25;
-      }
-      if (oppValue > 400000000) score += 10;
-    }
-    
-    // Cap score at 99
-    if (score > 99) score = 99;
-    
-    let reason = `Aligned with ${company.name}'s industry and volume settings.`;
-    if (prod.name === "SCM Commercial Paper Placements") {
-      reason = `${company.name} is a high-volume corporate player (est value: â‚¦${oppValue.toLocaleString()}) operating in ${company.industry || "the sector"}. Commercial Paper provides high yield liquidity matches.`;
-    } else if (prod.name === "SCM Corporate Money Market Fund") {
-      reason = `This client is in ${company.industry || 'active sector'} with cash treasury requirements. SCM MMF optimizes short-term liquidity yields backstops.`;
-    } else if (prod.name === "SCM Treasury Solutions") {
-      reason = `${company.name} is involved in ${company.industry || 'high-resource operations'}. Treasury solutions can act as professional currency exposures hedges.`;
-    } else if (prod.name === "SCM Private Trust") {
-      reason = `Bespoke keyman continuity structures match ${company.name}'s corporate architecture to hedge executor risk.`;
-    } else if (prod.name === "SCM Liquidity Management Solutions") {
-      reason = `Fragmented business balances sweep optimizations are perfect to maximize pooled yield returns for retail/FMCG operations.`;
-    }
-    
-    return { name: prod.name, score, reason };
-  }).sort((a, b) => b.score - a.score);
-  return scoreResults;
-}
-
-function calculateFollowUpStrategy(prospect: any, meetingsForP: any[], tasksForP: any[], activitiesForP: any[]) {
-  const openTasks = tasksForP.filter(t => !t.isCompleted);
-  const pendingMeetings = meetingsForP.filter(m => !m.outcome);
-  
-  let recommendedAction = "Schedule initial introduction meeting.";
-  let reason = `Prospect "${prospect.name}" is newly registered as a "${prospect.status}" lead in our corporate registry.`;
-  let risk = "Competitor momentum may block pipeline acceleration if initial connection delays exceed 5 days.";
-  
-  if (prospect.status === "Prospecting" || prospect.status === "Lead") {
-    if (activitiesForP.length === 0) {
-      recommendedAction = "Verify CFO details and initiate primary telephonic outreach.";
-      reason = "No relationship touches or CRM logs recorded since import registration.";
-      risk = "The account is completely cold. Immediate outreach establishes proactive SCM engagement.";
-    } else {
-      recommendedAction = "Coordinate customized yield briefing and proposal.";
-      reason = "Initial contact succeeded. The next structural milestone is displaying SCM Treasury competence.";
-      risk = "Delaying the custom pitch risks lower conversion probability as competitor treasuries attempt capture.";
-    }
-  } else if (prospect.status === "Qualified" || prospect.status === "Meeting Scheduled") {
-    if (pendingMeetings.length > 0) {
-      const nextM = pendingMeetings[0];
-      recommendedAction = `Prepare briefing presentation folder for scheduled session on ${nextM.date} at ${nextM.time}.`;
-      reason = `Meeting structured with purpose: "${nextM.purpose}". Executive targets need comprehensive SCM slides.`;
-      risk = "Unprepared briefings fail to convert premium C-suite members who require tight financial metrics.";
-    } else {
-      recommendedAction = "Propose and lock specific corporate calendar date for yield optimization discussion.";
-      reason = "The lead is qualified, but no active calendar placeholder secures executive attention.";
-      risk = "CFO calendars pack rapidly. Overlooked scheduling limits our momentum.";
-    }
-  } else if (prospect.status === "Proposal Sent" || prospect.status === "Negotiation") {
-    recommendedAction = "Perform rate negotiation and lock down commitment.";
-    reason = "Proposal details delivered. Transition focus to executive resolution of placement rates.";
-    risk = "Negotiation phases are high-risk periods where competitors bid aggressive premium discounts.";
-    
-    if (openTasks.length === 0) {
-      recommendedAction = "Set high-priority rate review task for relationship officers.";
-      reason = "Active negotiation holds status without a specific owner milestone task registered.";
-      risk = "Account risk rises. Unbacked negotiations tend to stall.";
-    }
-  } else if (prospect.status === "Converted") {
-    recommendedAction = "Conduct post-settlement integration and request subsidiary sweeps.";
-    reason = "Corporate placement converted! SCM is now their registered manager.";
-    risk = "Idle balances outside sweeps bleed premium yields. Swift integration secures maximum liquidity.";
-  }
-  
-  return { recommendedAction, reason, risk };
-}
-
-app.post("/api/gemini/assistant", async (req, res) => {
-  const startMs = Date.now();
-  const { query, selectedCompany, workspaceId, serenaModule } = req.body;
-  if (!query) {
-    return res.status(400).json({ error: "Query is required for SCM AI Assistant." });
-  }
-
-  const { userId, email, isAdmin } = getRequestUser(req);
-  if (!userId) {
-    return res.status(401).json({ error: "Access denied. Sign-in required." });
-  }
-
-  console.log(`Processing Serena V2 AI Assistant interaction query: "${query}" in module: [${serenaModule || "default"}]`);
-
-  // Load Active Pipeline Context
-  if (isDatabaseHealthy) {
-    try {
-      if (isAdmin) {
-        dbProspects = await db.select().from(prospects) as any[];
-        dbMeetings = await db.select().from(meetings) as any[];
-        const rawTasks = await db.select().from(tasks) as any[];
-        dbTasks = rawTasks.map(t => ({ ...t, status: t.isCompleted ? "Completed" : "Pending" }));
-        dbActivities = await db.select().from(activities) as any[];
-        dbContacts = await db.select().from(contacts) as any[];
-      } else {
-        dbProspects = await db.select().from(prospects).where(eq(prospects.assignedOfficerId, userId)) as any[];
-        dbMeetings = await db.select().from(meetings).where(eq(meetings.officerId, userId)) as any[];
-        const rawTasks = await db.select().from(tasks).where(eq(tasks.officerId, userId)) as any[];
-        dbTasks = rawTasks.map(t => ({ ...t, status: t.isCompleted ? "Completed" : "Pending" }));
-        dbActivities = await db.select().from(activities).where(eq(activities.officerId, userId)) as any[];
-        
-        const prospectIds = dbProspects.map(p => p.id);
-        if (prospectIds.length > 0) {
-          dbContacts = await db.select().from(contacts).where(inArray(contacts.prospectId, prospectIds)) as any[];
-        } else {
-          dbContacts = [];
-        }
-      }
-    } catch (err: any) {
-      isDatabaseHealthy = false;
-      console.warn("Serena reading fallback to in-memory databases due to read error:", err.message || err);
-    }
-  }
-
-  // Then get properly filtered arrays using the request:
-  const activeProspects = dbProspects;
-  const activeMeetings = dbMeetings;
-  const activeTasks = dbTasks;
-  const activeActivities = dbActivities;
-  const activeContacts = dbContacts;
-
-  // Identify Focal Prospect
-  let focalProspect: any = null;
-  if (selectedCompany && selectedCompany.name) {
-    focalProspect = activeProspects.find(p => p.name.toLowerCase() === selectedCompany.name.toLowerCase() || p.id === selectedCompany.id);
-  }
-  
-  if (!focalProspect) {
-    const lowerQuery = query.toLowerCase();
-    focalProspect = activeProspects.find(p => 
-      lowerQuery.includes(p.name.toLowerCase()) || 
-      p.name.toLowerCase().split(' ').some((word: string) => word.length > 3 && lowerQuery.includes(word))
-    );
-  }
-
-  // Phase 3 & 4: Deep Workspace Context Compilation and Injection
-  let workspaceContextPrompt = "";
-  let targetCompanyLogName = focalProspect?.name || selectedCompany?.name || null;
-
-  if (workspaceId) {
-    try {
-      const wsFetched = await db.select().from(workspaces).where(eq(workspaces.id, workspaceId));
-      const ws = wsFetched[0];
-      if (ws) {
-        targetCompanyLogName = ws.companyName;
-        const pId = ws.prospectId;
-
-        // Gather children from CRM databases directly
-        const wsContacts = pId ? await db.select().from(contacts).where(eq(contacts.prospectId, pId)) : [];
-        const wsMeetings = pId ? await db.select().from(meetings).where(eq(meetings.prospectId, pId)) : [];
-        const wsTasks = pId ? await db.select().from(tasks).where(eq(tasks.prospectId, pId)) : [];
-        
-        let wsNotes = [];
-        if (pId) {
-          wsNotes = await db.select().from(workspaceNotes).where(
-            sql`${workspaceNotes.workspaceId} = ${workspaceId} OR ${workspaceNotes.prospectId} = ${pId}`
-          );
-        } else {
-          wsNotes = await db.select().from(workspaceNotes).where(eq(workspaceNotes.workspaceId, workspaceId));
-        }
-
-        const wsProposals = await db.select().from(workspaceProposals).where(eq(workspaceProposals.workspaceId, workspaceId));
-        const wsPresentations = await db.select().from(workspacePresentations).where(eq(workspacePresentations.workspaceId, workspaceId));
-        const wsSearchHistory = await db.select().from(workspaceSearchHistory).where(eq(workspaceSearchHistory.workspaceId, workspaceId));
-        const wsConversations = await db.select().from(workspaceAiConversations).where(eq(workspaceAiConversations.workspaceId, workspaceId));
-        
-        let linkedProspect = null;
-        if (pId) {
-          const lpFetched = await db.select().from(prospects).where(eq(prospects.id, pId));
-          linkedProspect = lpFetched[0] || null;
-        }
-
-        workspaceContextPrompt = `
-=== SCM ENTERPRISE RESEARCH WORKSPACE LIVE CONTEXT ===
-WORKSPACE COMPANY NAME: ${ws.companyName}
-WORKSPACE ID: ${ws.id}
-WORKSPACE STATUS: ${ws.status}
-LINKED PROSPECT: ${linkedProspect ? `${linkedProspect.name} (Stage: ${linkedProspect.status}, Value: â‚¦${(linkedProspect.opportunityValue || 0).toLocaleString()}, Score: ${linkedProspect.opportunityScore}/100)` : "No active CRM pipeline linked yet."}
-
-APOLLO FINDINGS & FIRMOGRAPHICS:
-${ws.apolloFindings || "No Apollo findings recorded."}
-
-COMPANY PROFILE:
-${ws.companyProfile || "No profile summary recorded."}
-
-INDUSTRY SECTOR ANALYSIS:
-${ws.industryAnalysis || "No sector analysis recorded."}
-
-EXECUTIVE INSIGHTS:
-${ws.executiveInsights || "No executive insights recorded."}
-
-INVESTMENT OPPORTUNITIES MATRICES:
-${ws.investmentOpportunities || "No investment opportunities matrices recorded."}
-
-RESEARCH TASK SUMMARY NOTES:
-${ws.researchSummaries || "No research summaries compiled."}
-
-REGISTERED EXECUTIVE CONTACTS (DECISION MAKERS):
-${wsContacts.map((c, i) => `${i+1}. ${c.fullName} (${c.position}, Influence: ${c.influenceLevel}, Email: ${c.email || "N/A"}, Decision Maker: ${c.isDecisionMaker ? 'Yes' : 'No'})`).join("\n") || "No contacts registered."}
-
-RELATIONSHIP MEETING TRAIL:
-${wsMeetings.map((m, i) => `${i+1}. [${m.date} ${m.time}] Purpose: ${m.purpose} | Status/Outcome: ${m.outcome || 'Held'} | Next Steps: ${m.nextAction || 'N/A'}`).join("\n") || "No meetings logged."}
-
-CRM TASK TRACKER:
-${wsTasks.map((t, i) => `${i+1}. [Due: ${t.dueDate}] ${t.title} (Completed: ${t.isCompleted ? 'Yes' : 'No'})`).join("\n") || "No tasks logged."}
-
-WORKSPACE STRATEGIC PROPOSALS:
-${wsProposals.map((p, i) => `${i+1}. [Version ${p.version}] Title: ${p.title} | Approval Stage: ${p.approvalStatus}`).join("\n") || "No proposals generated."}
-
-SEARCH INQUIRY HISTORIES:
-${wsSearchHistory.map((s, i) => `${i+1}. Searched "${s.searchTerm}" from source "${s.source}"`).join("\n") || "No searches logged."}
-
-RECENT SERENA WORKSPACE BRAIN CHAT HISTORY:
-${wsConversations.slice(0, 5).map(c => `RO: "${c.userPrompt}"\nSerena: "${c.responseText.substring(0, 200)}..."`).join("\n") || "No past conversations logged."}
-
-EXECUTIVE SUMMARY PLATFORM CONTEXT:
-Active Relationship Officer Email: ${email || "unknown@scmcapitalng.com"}
-======================================================
-`;
-      }
-    } catch (err: any) {
-      console.error("[SCM DATABASE] Failed to load workspace context for Serena:", err.message);
-    }
-  }
-
-  // System Prompt Customization by V2 Modules
-  let moduleSpecificInstruction = "";
-  let finalSearchType = "Serena Research";
-
-  if (serenaModule === "research") {
-    finalSearchType = "Company Research";
-    moduleSpecificInstruction = `
-ROLE: SCM Senior Research Analyst (Module 1)
-DIRECTIVE: Conduct deep corporate analysis, evaluate sector dynamics, model market positions, identify macroeconomic headwinds (specifically addressing Nigerian inflation, FX volatility, CBN monetary policy rates), and assess competitor positioning. Ground your reports strictly in verified facts.
-`;
-  } else if (serenaModule === "proposal") {
-    finalSearchType = "Proposal Generation";
-    moduleSpecificInstruction = `
-ROLE: SCM Capital Placement & Advisory Writer (Module 2)
-DIRECTIVE: Formulate a highly structured, professional corporate investment proposal. Explicitly pitching SCM's "Structured Key Investment Product" (SKIP) or our SCM Corporate Funds. Provide customized interest rates based on the firm's found cash buffers, employee count, and sector parameters (typically between 12% to 22.5% for corporate placements in Nigeria). Structure the pitch using executive headers: executive summary, strategic objectives, placement rate table, risk mitigations, and cash settlement rules.
-`;
-  } else if (serenaModule === "email") {
-    finalSearchType = "Email Generation";
-    moduleSpecificInstruction = `
-ROLE: SCM Corporate Outreach Writer (Module 3)
-DIRECTIVE: Write hyper-personalized outreach emails using strict Nigerian corporate etiquette. Focus heavily on high-value placements, pension briefings, or wealth discretionary advisory. Frame the dialogue around the prospect's sector operating parameters, addressing executives with correct honorifics, and close with a structured call-to-action for a 15-minute briefing session.
-`;
-  } else if (serenaModule === "meeting") {
-    finalSearchType = "Meeting Brief";
-    moduleSpecificInstruction = `
-ROLE: SCM Executive Meeting Brief Architect (Module 4)
-DIRECTIVE: Synthesize all previous CRM interactions, list all past contacts met, and build a high-fidelity Briefing Document. Prepare:
-1. Historical Touchpoint Analysis (outlining past discussions and agreements).
-2. Key C-Suite Targets (who we are pitching, their role, and influence level).
-3. Strategic Talking Points (emphasizing SCM money market fund yields and T+1 liquidity).
-4. Proactive Objection-Handling Responses (handling common CFO concerns regarding sovereign yields and counterparty risks).
-`;
-  } else if (serenaModule === "followup") {
-    finalSearchType = "Follow-Up Recommendation";
-    moduleSpecificInstruction = `
-ROLE: SCM Relationship Workflow & Follow-Up Advisor (Module 5)
-DIRECTIVE: Analyze outstanding tasks and historical touchpoints. Draft a proactive follow-up schedule and timeline. Recommend specific next tasks with clear action owners, check historical meeting outcomes, and propose exact corporate calendar placeholders with clear ownership.
-`;
-  }
-
-  // System prompt setup (Phase 3 System Prompt Engineering)
-  const systemPrompt = `You are "Serena", SCM Capital's Institutional Business Development Intelligence Assistant.
-Your role of absolute trust is to analyze prospects, compute treasury matches, recommended SCM products, draft outreach briefings, and coordinate follow-up schedules.
-
-${moduleSpecificInstruction}
-
-Here is the SCM proprietary Corporate Wealth Management offerings catalog:
-${scmProductsList.map(p => `
-- Name: ${p.name}
-  â€¢ Description: ${p.description}
-  â€¢ Ideal for: ${p.idealCustomer}
-  â€¢ Liquidity Rules: ${p.liquidityProfile}
-  â€¢ Core Benefits: ${p.benefits.join(', ')}
-  â€¢ Ideal Sectors: ${p.idealIndustries.join(', ')}
-  â€¢ Recommended target personas: ${p.recommendedPersonas.join(', ')}
-`).join('\n')}
-
-Always adhere to the following directives:
-- When recommending a product, refer directly to SCM Product Fit Scoring and provide deep, analytical reasoning explaining WHY the product is ideal based on client industry, revenue, or employee metrics.
-- Utilize past CRM activity logs, scheduled meetings, and incomplete tasks to draft outreach strategies and precise next steps.
-- If Apollo or CRM facts are available for a company, ALWAYS rely on those facts. Never make up details or provide generic responses when specific dossier pieces are presented.
-- Compose responses in a polished, senior executive, highly precise manner suitable for immediate executive briefing. 
-- STRICT VISUAL POLISH DIRECTIVE: NEVER use markdown symbols such as hashes (#, ##, ###), bold asterisks (**text**), or italics (*text*) in your output. These symbols cause extreme visual clutter and look highly unprofessional.
-- Format all headers using simple, clean capitalized plain text (e.g., EXECUTIVE ANALYSIS, STRATEGIC RECOMMENDATIONS, CRM WORKFLOW OUTLINE).
-- Organize lists using clean indentation and plain bullets (e.g., "  - " or "  â€¢ "). Ensure proper line spacing between sections to produce a clean, professional SCM report layout.
-- Resemble a pristine, professionally formatted corporate report. Avoid any and all markdown noise.
-`;
-
-  // Context Assembly (Phase 1 Context Injection)
-  let userContextPrompt = "";
-  if (workspaceContextPrompt) {
-    userContextPrompt = `
-${workspaceContextPrompt}
-
-USER QUERY / SYSTEM INQUIRY:
-"${query}"
-
-Apply the SCM advisor guidelines and the requested module directives to satisfy the query. Use ONLY the live workspace details above.
-`;
-  } else if (focalProspect) {
-    const pContacts = activeContacts.filter(c => c.prospectId === focalProspect.id);
-    const pMeetings = activeMeetings.filter(m => m.prospectId === focalProspect.id);
-    const pTasks = activeTasks.filter(t => t.prospectId === focalProspect.id);
-    const pActivities = activeActivities.filter(a => a.prospectId === focalProspect.id);
-    
-    // Fit Scoring & Strategy computation
-    const fitScores = calculateProductFitScores({
-      name: focalProspect.name,
-      industry: focalProspect.industry,
-      employeeCount: selectedCompany?.employeeCount || (pContacts.length * 15) || 120, 
-      opportunityValue: focalProspect.opportunityValue || 0,
-      priority: focalProspect.priority
-    });
-    
-    const followUp = calculateFollowUpStrategy(focalProspect, pMeetings, pTasks, pActivities);
-    
-    userContextPrompt = `
-We are focusing on the active CRM prospect record:
----
-ORGANIZATION DETAIL (Apollo & CRM Factsheet):
-- Name: ${focalProspect.name}
-- Industry: ${focalProspect.industry}
-- Stage/Status: ${focalProspect.status}
-- Location: ${focalProspect.location}
-- Website: ${focalProspect.website || "N/A"}
-- Opportunity Score: ${focalProspect.opportunityScore}/100
-- Est. SCM Opportunity Value: â‚¦${focalProspect.opportunityValue ? focalProspect.opportunityValue.toLocaleString() : "0"}
-- Assigned Officer: ${focalProspect.assignedOfficerName || "N/A"}
-- Notes: ${focalProspect.notes || ""}
-
-DISCOVERED DECISION MAKERS / KEY EXECUTIVES:
-${pContacts.map(c => `â€¢ ${c.fullName} (${c.position}, Email: ${c.email || "N/A"}, Influence: ${c.influenceLevel}, Decision Maker: ${c.isDecisionMaker})`).join('\n') || "No key executives registered yet."}
-
-SCM PRODUCT FIT RANKING & SCORE ANALYSIS:
-${fitScores.slice(0, 5).map((f, i) => `${i + 1}. ${f.name} - Fit Score: ${f.score}/100\n   Reason: ${f.reason}`).join('\n')}
-
-CRM INTERACTION LOGS & RECENT TOUCHES:
-${pActivities.map(a => `â€¢ [${a.date} ${a.time}] ${a.activityType} (${a.status}) - Outcome: ${a.outcome || 'N/A'} - ${a.notes || ''}`).join('\n') || "No interaction logs recorded."}
-
-SCHEDULED MEETINGS:
-${pMeetings.map(m => `â€¢ [${m.date} ${m.time}] Purpose: ${m.purpose} (Outcome: ${m.outcome || 'Pending'}, Next Action: ${m.nextAction || 'N/A'})`).join('\n') || "No meetings registered."}
-
-OPEN ACTION ITEMS (TASKS):
-${pTasks.map(t => `â€¢ Title: ${t.title} (Due: ${t.dueDate}, Assigned: ${t.assignedStaff}, Completed: ${t.isCompleted})`).join('\n') || "No open tasks."}
-
-RECOMMENDED NEXT STRATEGY & CRM ACTIONS:
-- Action: ${followUp.recommendedAction}
-- Reason: ${followUp.reason}
-- Risk of Inaction: ${followUp.risk}
----
-
-USER QUESTION / TASK:
-"${query}"
-
-Answer the user's question directly, citing the precise CRM database facts, computed suitability matrix scoring, executive targets, and next actions shown above.
-`;
-  } else if (selectedCompany) {
-    const fitScores = calculateProductFitScores({
-      name: selectedCompany.name,
-      industry: selectedCompany.industry,
-      employeeCount: selectedCompany.employeeCount || 50,
-      opportunityValue: selectedCompany.revenueValue ? selectedCompany.revenueValue * 0.05 : 150000000, 
-    });
-    
-    userContextPrompt = `
-We are currently researching a corporate target from Apollo (not yet added to SCM CRM active pipeline):
----
-APOLLO DISCOVERED FACTSHEET:
-- Name: ${selectedCompany.name}
-- Industry: ${selectedCompany.industry || "N/A"}
-- Description: ${selectedCompany.description || "N/A"}
-- Website: ${selectedCompany.website || "N/A"}
-- Location: ${selectedCompany.location || "N/A"}
-- Employee Count: ${selectedCompany.employeeCount || "N/A"}
-- Revenue Value: ${selectedCompany.revenueValue ? "â‚¦" + selectedCompany.revenueValue.toLocaleString() : "N/A"}
-
-SCM PRODUCT FIT SUITABILITY ESTIMATES:
-${fitScores.slice(0, 5).map((f, i) => `${i + 1}. ${f.name} - Fit Score: ${f.score}/100\n   Reason: ${f.reason}`).join('\n')}
-
-DIAGNOSTIC STATUS:
-This search resides in memory search workspace. It must be officially registered to the SCM database to trigger officer assignment, real opportunity score compilation, and task tracking.
----
-
-USER QUESTION / TASK:
-"${query}"
-
-Conduct professional, deep client research, executive outline strategy, competitor strategy, and SCM placementfit scores analysis matching the Apollo data above.
-`;
-  } else {
-    // Collective pipeline overview
-    const pipelineSum = activeProspects.map(p => `â€¢ ${p.name} (${p.industry}, Score: ${p.opportunityScore}, Status: ${p.status}, Value: â‚¦${(p.opportunityValue || 0).toLocaleString()}, Officer: ${p.assignedOfficerName || "N/A"})`).join("\n");
-    const tasksSum = activeTasks.slice(0, 10).map(t => `â€¢ ${t.prospectName}: ${t.title} (Due: ${t.dueDate}, Assigned: ${t.assignedStaff}, Completed: ${t.isCompleted})`).join("\n");
-    const meetingsSum = activeMeetings.slice(0, 10).map(m => `â€¢ ${m.prospectName} with ${m.officerName} on ${m.date} at ${m.time} - Purpose: ${m.purpose}`).join("\n");
-    const activitiesSum = activeActivities.slice(0, 10).map(a => `â€¢ ${a.prospectName}: ${a.activityType} (${a.status}) - ${a.notes || ''}`).join("\n");
-    
-    userContextPrompt = `
-The user is asking a general SCM Capital pipeline or operational intelligence question. Here is our entire live CRM pipeline context:
----
-SCM REGISTERED PROSPECTS PIPELINE:
-${pipelineSum || "No active prospects in the CRM."}
-
-ACTIVE CRM RECENT TOUCHES:
-${activitiesSum || "No recent relationship activities."}
-
-UPCOMING CLIENT MEETINGS:
-${meetingsSum || "No meetings scheduled."}
-
-PENDING SCM INTERACTION TASKS:
-${tasksSum || "No open tasks."}
----
-
-USER QUESTION / TASK:
-"${query}"
-
-Answer the user's question, applying SCM Capital's master institutional advisor context, identifying priority prospects to focus on (highest opportunity score), finding dormant leads, recommending SCM product placements, or drafting sales blueprints.
-`;
-  }
-
-  // Dispatch request to robust Gemini pipeline
-  if (aiClient) {
-    try {
-      const response = await robustGenerateContent({
-        model: "gemini-3.5-flash",
-        contents: userContextPrompt,
-        config: {
-          systemInstruction: systemPrompt,
-          temperature: 0.3
-        }
-      });
-      const replyText = response.text || "";
-      if (replyText) {
-        const elapsedMs = Date.now() - startMs;
-
-        // Log search automatically in the AI history
-        await logAiInteraction(req, {
-          searchQuery: query,
-          searchType: finalSearchType,
-          companyName: targetCompanyLogName,
-          modelUsed: "gemini-3.5-flash",
-          tokensConsumed: response.usageMetadata?.totalTokenCount || 1000,
-          responseTime: elapsedMs,
-          status: "Success",
-          workspaceId: workspaceId || null,
-          searchResult: replyText.trim()
-        });
-
-        try {
-          await db.insert(serenaAuditLogs).values({
-            id: `serena-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-            userEmail: email || "unknown@scmcapitalng.com",
-            prompt: query,
-            timestamp: new Date().toISOString(),
-            modelUsed: "gemini-3.5-flash",
-            tokensConsumed: response.usageMetadata?.totalTokenCount || 1000,
-            responseTimeMs: elapsedMs,
-            module: serenaModule || "default"
-          });
-        } catch (dbErr: any) {
-          console.error("[SCM DATABASE] Failed to write into serenaAuditLogs:", dbErr);
-        }
-        return res.json({ reply: replyText.trim() });
-      }
-    } catch (err: any) {
-      console.error("Gemini Serena Assistant failed, returning simulated reply:", err);
-    }
-  }
-
-  // Dynamic high-fidelity offline fallback computations (Phase 5 offline backup)
-  let defaultReply = "I have scanned the SCM Capital CRM database. Register corporate prospects to compute conversion metrics.";
-  if (focalProspect) {
-    const pContacts = activeContacts.filter(c => c.prospectId === focalProspect.id);
-    const fitScores = calculateProductFitScores({
-      name: focalProspect.name,
-      industry: focalProspect.industry,
-      employeeCount: 150,
-      opportunityValue: focalProspect.opportunityValue || 0,
-    });
-    const followUp = calculateFollowUpStrategy(focalProspect, [], [], []);
-    
-    defaultReply = `### SCM Institutional Dossier (Offline Node Audit)
-For **${focalProspect.name}** (${focalProspect.industry})
-
-**Location**: ${focalProspect.location}
-**SCM Opportunity Score**: ${focalProspect.opportunityScore}/100 | **Opportunity Value**: â‚¦${(focalProspect.opportunityValue || 0).toLocaleString()}
-
-#### Executive Context (Apollo & CRM)
-${pContacts.map(c => `- **${c.fullName}** (${c.position}) - Influence: *${c.influenceLevel}*`).join('\n') || "*No executives registered.*"}
-
-#### SCM Product Fit Suitable Matrix (Top Recommendations)
-${fitScores.slice(0, 3).map((f, i) => `${i + 1}. **${f.name}** (Fit Score: **${f.score}/100**)\n   *Reason*: ${f.reason}`).join('\n')}
-
-#### Next Suggested CRM Action
-- **Recommended Action**: ${followUp.recommendedAction}
-- **Reasoning**: ${followUp.reason}
-- **Risk of Inaction**: ${followUp.risk}`;
-  } else if (selectedCompany) {
-    const fitScores = calculateProductFitScores({
-      name: selectedCompany.name,
-      industry: selectedCompany.industry,
-      employeeCount: selectedCompany.employeeCount || 50,
-      opportunityValue: selectedCompany.revenueValue ? selectedCompany.revenueValue * 0.05 : 150000000,
-    });
-    defaultReply = `### SCM Apollo Workspace Dossier (Offline Node Audit)
-For newly researched target: **${selectedCompany.name}** (${selectedCompany.industry || "N/A"})
-
-**Headquarters location**: ${selectedCompany.location || "N/A"}
-**Firmographics**: ${selectedCompany.employeeCount || "N/A"} Employees | Revenue: ${selectedCompany.revenueValue ? "â‚¦" + selectedCompany.revenueValue.toLocaleString() : "N/A"}
-
-#### Recommended SCM Capital Placement Fit
-${fitScores.slice(0, 3).map((f, i) => `- **${f.name}** (Suitability Score: **${f.score}/100**)\n  *Justification*: ${f.reason}`).join('\n')}
-
-#### Strategy Action
-Import this corporate target from the Research desk to calculate active pipeline scores, schedule interactive meetings, and record notes.`;
-  } else {
-    if (activeProspects.length > 0) {
-      const highestScoreP = [...activeProspects].sort((a,b) => (b.opportunityScore || 0) - (a.opportunityScore || 0))[0];
-      defaultReply = `### SCM Active CRM Pipeline priority metrics
-We currently have **${activeProspects.length}** active enterprise prospects registered in the database.
-
-- **Primary Conversion Focus**: **${highestScoreP.name}** (${highestScoreP.industry}, Status: *${highestScoreP.status}*)
-  - **Engagement Priority Score**: **${highestScoreP.opportunityScore}/100**
-  - **Proposed Offering**: SCM Corporate Solutions
-
-- **Neglected Accounts / Dormant Levers**:
-  - We recommend assigning a proactive check task for Julian Draxler on Lead-tier clients to accelerate transition.`;
-    }
-  }
-
-  // Log fallback search
-  const elapsedMs = Date.now() - startMs;
-  await logAiInteraction(req, {
-    searchQuery: query,
-    searchType: finalSearchType,
-    companyName: targetCompanyLogName,
-    modelUsed: "Offline Fallback Generator",
-    tokensConsumed: 0,
-    responseTime: elapsedMs,
-    status: "Success",
-    workspaceId: workspaceId || null,
-    searchResult: defaultReply
-  });
-
-  try {
-    await db.insert(serenaAuditLogs).values({
-      id: `serena-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      userEmail: email || "unknown@scmcapitalng.com",
-      prompt: query,
-      timestamp: new Date().toISOString(),
-      modelUsed: "SCM Offline Fallback Engine",
-      tokensConsumed: 0,
-      responseTimeMs: elapsedMs,
-      module: serenaModule || "default"
-    });
-  } catch (dbErr: any) {
-    console.error("[SCM DATABASE] Failed to write into serenaAuditLogs:", dbErr);
-  }
-
-  return res.json({ reply: defaultReply });
-});
-
-app.get("/api/serena/history", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  const { userId, email, isAdmin } = getRequestUser(req);
-  if (!userId) return res.json([]);
-
-  try {
-    let logs;
-    if (isAdmin) {
-      logs = await db.select().from(serenaAuditLogs);
-    } else {
-      logs = await db.select().from(serenaAuditLogs).where(eq(serenaAuditLogs.userEmail, email));
-    }
-    const mapped = logs.map(l => ({
-      id: l.id,
-      timestamp: l.timestamp,
-      query: l.prompt,
-      reply: "Analyzed via module: " + l.module,
-      userId: userId,
-      userEmail: l.userEmail,
-      focalProspect: null
-    }));
-    return res.json(mapped);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to select from serenaAuditLogs:", err);
-    return res.status(500).json({ error: "Failed to fetch Serena history: " + err.message });
-  }
-});
-
-// AI Search History List Endpoint with Strict Security Rules
-app.get("/api/ai-search-history", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  const { userId, email, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  // Sync from DB if healthy
-  if (isDatabaseHealthy) {
-    try {
-      dbAiSearchHistory = await db.select().from(aiSearchHistory);
-    } catch (err: any) {
-      console.warn("Error reloading ai_search_history from database:", err.message);
-    }
-  }
-
-  // Filter based on roles (Relationship Officers can only view their own history)
-  let filtered = dbAiSearchHistory;
-  if (!isAdmin) {
-    filtered = dbAiSearchHistory.filter(h => h.userId === userId || (email && h.userEmail?.toLowerCase() === email.toLowerCase()));
-  }
-
-  // Apply filters from query params
-  const { user, company, date, model, workspace, module: queryModule } = req.query;
-  
-  if (user && isAdmin) {
-    filtered = filtered.filter(h => h.userName?.toLowerCase().includes((user as string).toLowerCase()) || h.userEmail?.toLowerCase().includes((user as string).toLowerCase()));
-  }
-  if (company) {
-    filtered = filtered.filter(h => h.companyName?.toLowerCase().includes((company as string).toLowerCase()) || h.searchQuery?.toLowerCase().includes((company as string).toLowerCase()));
-  }
-  if (date) {
-    filtered = filtered.filter(h => h.timestamp?.startsWith(date as string));
-  }
-  if (model) {
-    filtered = filtered.filter(h => h.modelUsed?.toLowerCase().includes((model as string).toLowerCase()));
-  }
-  if (workspace) {
-    filtered = filtered.filter(h => h.workspaceId === workspace);
-  }
-  if (queryModule) {
-    filtered = filtered.filter(h => h.searchType?.toLowerCase() === (queryModule as string).toLowerCase());
-  }
-
-  res.json(filtered);
-});
-
-// Admin/RO Analytics Dashboard Endpoint
-app.get("/api/ai-search-history/analytics", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  const { userId, email, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  if (isDatabaseHealthy) {
-    try {
-      dbAiSearchHistory = await db.select().from(aiSearchHistory);
-    } catch (err: any) {
-      console.warn("Error reloading ai_search_history for analytics:", err.message);
-    }
-  }
-
-  // Filter based on roles (Relationship Officers see only their own scoped metrics)
-  let scopeLogs = dbAiSearchHistory;
-  if (!isAdmin) {
-    scopeLogs = dbAiSearchHistory.filter(h => h.userId === userId || (email && h.userEmail?.toLowerCase() === email.toLowerCase()));
-  }
-
-  // Compute analytics metrics
-  const totalSearches = scopeLogs.length;
-  
-  const todayStr = new Date().toISOString().split('T')[0];
-  const searchesToday = scopeLogs.filter(h => h.timestamp?.startsWith(todayStr)).length;
-
-  const geminiRequests = scopeLogs.filter(h => h.searchType !== 'Apollo Search').length;
-  const apolloRequests = scopeLogs.filter(h => h.searchType === 'Apollo Search').length;
-
-  const totalTokens = scopeLogs.reduce((sum, h) => sum + (h.tokensConsumed || 0), 0);
-  const averageTokens = totalSearches > 0 ? Math.round(totalTokens / totalSearches) : 0;
-
-  const totalCost = scopeLogs.reduce((sum, h) => sum + (h.estimatedCost || 0), 0);
-
-  // Most Active User
-  const userCounts: Record<string, number> = {};
-  scopeLogs.forEach(h => {
-    if (h.userName) {
-      userCounts[h.userName] = (userCounts[h.userName] || 0) + 1;
-    }
-  });
-  let mostActiveUser = "N/A";
-  let maxUserCount = 0;
-  Object.entries(userCounts).forEach(([name, count]) => {
-    if (count > maxUserCount) {
-      maxUserCount = count;
-      mostActiveUser = name;
-    }
-  });
-
-  // Most Researched Company
-  const companyCounts: Record<string, number> = {};
-  scopeLogs.forEach(h => {
-    if (h.companyName) {
-      companyCounts[h.companyName] = (companyCounts[h.companyName] || 0) + 1;
-    }
-  });
-  let mostResearchedCompany = "N/A";
-  let maxCompanyCount = 0;
-  Object.entries(companyCounts).forEach(([name, count]) => {
-    if (count > maxCompanyCount) {
-      maxCompanyCount = count;
-      mostResearchedCompany = name;
-    }
-  });
-
-  // Most Used Serena Module
-  const moduleCounts: Record<string, number> = {};
-  scopeLogs.forEach(h => {
-    if (h.searchType && h.searchType !== 'Apollo Search' && h.searchType !== 'Company Research') {
-      moduleCounts[h.searchType] = (moduleCounts[h.searchType] || 0) + 1;
-    }
-  });
-  let mostUsedSerenaModule = "N/A";
-  let maxModuleCount = 0;
-  Object.entries(moduleCounts).forEach(([mod, count]) => {
-    if (count > maxModuleCount) {
-      maxModuleCount = count;
-      mostUsedSerenaModule = mod;
-    }
-  });
-
-  res.json({
-    totalSearches,
-    searchesToday,
-    geminiRequests,
-    apolloRequests,
-    averageTokens,
-    estimatedMonthlyCost: parseFloat(totalCost.toFixed(4)),
-    mostActiveUser,
-    mostResearchedCompany,
-    mostUsedSerenaModule
-  });
-});
-
-// CSV Export Endpoint
-app.get("/api/ai-search-history/export", async (req, res) => {
-  const { userId, email, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).send("Access denied.");
-
-  if (isDatabaseHealthy) {
-    try {
-      dbAiSearchHistory = await db.select().from(aiSearchHistory);
-    } catch (err: any) {
-      console.warn("Error reloading history for export:", err.message);
-    }
-  }
-
-  let filtered = dbAiSearchHistory;
-  if (!isAdmin) {
-    filtered = dbAiSearchHistory.filter(h => h.userId === userId || (email && h.userEmail?.toLowerCase() === email.toLowerCase()));
-  }
-
-  let csv = "ID,User,Email,Company,Search Query,Search Type,Timestamp,Model,Tokens,Cost (USD),Response Time (ms),Status\n";
-  filtered.forEach(h => {
-    const esc = (val: any) => `"${String(val || '').replace(/"/g, '""')}"`;
-    csv += `${esc(h.id)},${esc(h.userName)},${esc(h.userEmail)},${esc(h.companyName)},${esc(h.searchQuery)},${esc(h.searchType)},${esc(h.timestamp)},${esc(h.modelUsed)},${h.tokensConsumed},${h.estimatedCost},${h.responseTime},${esc(h.status)}\n`;
-  });
-
-  res.setHeader("Content-Type", "text/csv");
-  res.setHeader("Content-Disposition", `attachment; filename=SCM_AI_Search_History_${Date.now()}.csv`);
-  res.status(200).send(csv);
-});
-
-app.get("/api/saved-sessions", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  const { userId, email, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  try {
-    let list;
-    if (isAdmin) {
-      list = await db.select().from(savedSessions);
-    } else {
-      list = await db.select().from(savedSessions).where(
-        sql`${savedSessions.userId} = ${userId} OR LOWER(${savedSessions.userEmail}) = ${email.toLowerCase()}`
-      );
-    }
-    return res.json(list);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to query saved sessions from DB:", err);
-    return res.status(500).json({ error: "Failed to load saved sessions: " + err.message });
-  }
-});
-
-app.post("/api/saved-sessions", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  const { userId, email } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  const { title, type, targetCompany, userInput, content, productScoring, notes } = req.body;
-  if (!title || !targetCompany) {
-    return res.status(400).json({ error: "Title and Target Company are required." });
-  }
-
-  const newSession = {
-    id: `session-${Date.now()}`,
-    userId,
-    userEmail: email || "unknown@scmcapitalng.com",
-    title,
-    type: type || "Research Dossier",
-    targetCompany,
-    userInput: userInput || "",
-    content: content || "",
-    productScoring: productScoring || {},
-    createdAt: new Date().toISOString(),
-    notes: notes || ""
-  };
-
-  try {
-    await db.insert(savedSessions).values(newSession);
-    return res.status(201).json(newSession);
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to save session in DB:", err);
-    return res.status(500).json({ error: "Failed to save session: " + err.message });
-  }
-});
-
-app.delete("/api/saved-sessions/:id", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  const { userId, isAdmin } = getRequestUser(req);
-  if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-  const { id } = req.params;
-
-  try {
-    const sessionFetched = await db.select().from(savedSessions).where(eq(savedSessions.id, id));
-    const sessionObj = sessionFetched[0];
-    if (!sessionObj) {
-      return res.status(404).json({ error: "Saved session not found." });
-    }
-
-    if (!isAdmin && sessionObj.userId !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only delete your own saved sessions." });
-    }
-
-    await db.delete(savedSessions).where(eq(savedSessions.id, id));
-    return res.json({ success: true });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to delete session from DB:", err);
-    return res.status(500).json({ error: "Failed to delete session: " + err.message });
-  }
-});
-
-
-// ==========================================
-// PERSONALIZED OUTREACH ENGINE
-// ==========================================
-app.post("/api/gemini/outreach", async (req, res) => {
-  const startMs = Date.now();
-  const { type, companyName, industry, executiveName, position, priority } = req.body;
-  if (!companyName || !executiveName) {
-    return res.status(400).json({ error: "Company name and executive name are required." });
-  }
-
-  const pitchTheme = type === "literacy" 
-    ? "Customized SCM Corporate Financial Literacy Seminars for staff wealth empowerment"
-    : type === "meeting"
-      ? "SCM corporate short-term cash placements and commercial paper yield optimization"
-      : "SCM Wealth Advisor Private Trust discretionary structures for C-suite directors";
-
-  const contextPrompt = `Write a professional, highly persuasive, customized business outreach email from SCM Capital Markets Group to:
-Executive Name: ${executiveName}
-Position: ${position || 'Executive Leader'}
-Division: ${companyName} (${industry || 'Corporate Sector'})
-Outreach Goal: ${pitchTheme}
-Priority Rank: ${priority || 'Medium'}
-
-The tone must be elite, formal, respectful of Nigerian corporate etiquette, and cite specific high-yield benefits: SCM's expert SEC-regulated portfolio yields, T+1 liquidity settlement, and our history of driving structural credit improvements. Address ${executiveName} directly. Provide a polite, clear call-to-action for a 15-minute introductory virtual briefcase session or in-person briefing.`;
-
-  if (aiClient) {
-    try {
-      const response = await robustGenerateContent({
-        model: "gemini-3.5-flash",
-        contents: contextPrompt,
-      });
-      const resultEmail = response.text || "";
-      if (resultEmail) {
-        const elapsedMs = Date.now() - startMs;
-        await logAiInteraction(req, {
-          searchQuery: `Outreach email for ${executiveName} (${position}) at ${companyName}`,
-          searchType: "Email Generation",
-          companyName: companyName,
-          modelUsed: "gemini-3.5-flash",
-          tokensConsumed: 500,
-          responseTime: elapsedMs,
-          status: "Success",
-          searchResult: resultEmail.trim()
-        });
-
-        return res.json({ email: resultEmail.trim() });
-      }
-    } catch (err) {
-      console.error("Gemini outreach tool failed, running simulated content generation:", err);
-    }
-  }
-
-  // Clean fallback email
-  let generatedEmail = `Subject: SCM Capital: Collaborative Treasury placements & Corporate Wealth briefings for ${companyName}
-
-Dear ${executiveName},
-
-I hope this message finds you well. 
-
-As the ${position || 'Executive Leader'} of ${companyName}, you are undoubtedly managing complex capital operating cycles and looking to protect short-term corporate balances from domestic inflation vectors while retaining absolute security.
-
-I am writing to you on behalf of SCM Capital, a premier investment bank and SEC-regulated assets manager in Nigeria. We have designed customized Money Market and Treasury Optimization platforms that support T+1 settlements, giving you standard overnight flexibility while yielding significantly superior risk-adjusted returns relative to commercial banks' default deposits.
-
-Specifically, we can help ${companyName} on:
-1. SCM Corporate Money Market Fund options for seasonal cash buffer reserves.
-2. Bespoke high-yield Commercial Paper placement allocations.
-3. Complimentary, branded "Corporate Financial Literacy briefings" for your human capital cooperative to drive systematic micro-investment programs.
-
-Would you be open to a brief 15-minute briefing or a short virtual call this Thursday at 10:00 AM with our Relationship Director to review our certified performance trackers?
-
-Warm regards,
-
-SCM Capital Markets Group
-Lagos, Nigeria
-www.scmcapital.com.ng`;
-
-  // Log this Offline email generation
-  const elapsedMs = Date.now() - startMs;
-  await logAiInteraction(req, {
-    searchQuery: `Outreach email for ${executiveName} (${position}) at ${companyName}`,
-    searchType: "Email Generation",
-    companyName: companyName,
-    modelUsed: "Offline Fallback Generator",
-    tokensConsumed: 0,
-    responseTime: elapsedMs,
-    status: "Success",
-    searchResult: generatedEmail.trim()
-  });
-
-  // Auto-promote matched prospect status to Proposal Sent on Proposal generated
-  if (companyName) {
-    try {
-      const allP = await getProspectsForUser(req);
-      const matchedP = allP.find(p => 
-        p.name.toLowerCase() === companyName.toLowerCase() || 
-        p.name.toLowerCase().includes(companyName.toLowerCase()) || 
-        companyName.toLowerCase().includes(p.name.toLowerCase())
-      );
-      if (matchedP && ['Lead', 'Qualified', 'Meeting Scheduled', 'Contacted'].includes(matchedP.status)) {
-        const oldStatus = matchedP.status;
-        const updatedAtStr = new Date().toISOString();
-        await db.update(prospects).set({ status: 'Proposal Sent', updatedAt: updatedAtStr }).where(eq(prospects.id, matchedP.id));
-        
-        await createNotification(
-          "Deal moved stage",
-          `Deal Moved Stage: ${matchedP.name}`,
-          `A high-yield corporate outreach proposal was successfully synthesized for "${matchedP.name}". Stage automatically advanced from "${oldStatus}" to "Proposal Sent".`,
-          "Opportunity",
-          matchedP.assignedOfficerId || undefined
-        );
-      }
-    } catch (err: any) {
-      console.warn("[SCM PROP AUTO] Update DB failed:", err);
-    }
-  }
-
-  res.json({ email: generatedEmail });
-});
-
-
-// ==========================================
-// IN-APP NOTIFICATION SYSTEM (PHASE 4 & PHASE 7)
-// ==========================================
-
-interface InAppNotification {
-  id: string;
-  notificationId?: string;
-  userId?: string;
-  type: string;
-  title: string;
-  message: string;
-  description?: string;
-  timestamp: string;
-  createdAt?: string;
-  isRead: boolean;
-  readStatus?: 'read' | 'unread';
-  category: 'Meeting' | 'Task' | 'Assignment' | 'Approval' | 'Opportunity' | string;
-  priority: 'High' | 'Medium' | 'Low' | string;
-  relatedEntityId?: string;
-  isLegacy?: boolean;
-}
-
-async function createNotification(
-  type: 'Meeting reminder' | 'Meeting rescheduled' | 'New task assigned' | 'Task overdue' | 'New prospect assigned to user' | 'User approval request' | 'User approved' | 'User rejected' | 'Deal moved stage' | 'Proposal approved' | 'Proposal rejected' | string,
-  title: string,
-  message: string,
-  categoryOverride?: 'Meeting' | 'Task' | 'Assignment' | 'Approval' | 'Opportunity',
-  targetUserId?: string
-) {
-  const approvedTypes = [
-    'Meeting reminder',
-    'Meeting rescheduled',
-    'New task assigned',
-    'Task overdue',
-    'New prospect assigned to user',
-    'User approval request',
-    'User approved',
-    'User rejected',
-    'Deal moved stage',
-    'Proposal approved',
-    'Proposal rejected',
-    'Weekly report due',
-    'Task Created',
-    'Task Assigned',
-    'Task Updated',
-    'Task Completed',
-    'Meeting Scheduled',
-    'Meeting Updated',
-    'Meeting Cancelled',
-    'Follow-up Created',
-    'Follow-up Due',
-    'Prospect Assigned',
-    'Prospect Updated',
-    'Reminder Triggered',
-    'Weekly Report Submitted',
-    'Weekly Report Approved',
-    'System Announcement'
-  ];
-
-  // Securely enforce: Confirm only approved events create notifications.
-  if (!approvedTypes.includes(type)) {
-    console.log(`[ALERT LOG SYSTEM] Prevented generation of unapproved/noisy event of type: "${type}"`);
-    return null;
-  }
-
-  // Determine Category based on type
-  let category: 'Meeting' | 'Task' | 'Assignment' | 'Approval' | 'Opportunity' | string = 'Opportunity';
-  if (type === 'Meeting reminder' || type === 'Meeting rescheduled' || type === 'Meeting Scheduled' || type === 'Meeting Updated' || type === 'Meeting Cancelled' || type === 'Reminder Triggered') {
-    category = 'Meeting';
-  } else if (type === 'New task assigned' || type === 'Task overdue' || type === 'Task Created' || type === 'Task Assigned' || type === 'Task Updated' || type === 'Task Completed' || type === 'Follow-up Created' || type === 'Follow-up Due') {
-    category = 'Task';
-  } else if (type === 'New prospect assigned to user' || type === 'Prospect Assigned' || type === 'Prospect Updated') {
-    category = 'Assignment';
-  } else if (type === 'User approval request' || type === 'User approved' || type === 'User rejected' || type === 'Weekly report due' || type === 'Weekly Report Submitted' || type === 'Weekly Report Approved') {
-    category = 'Approval';
-  } else if (type === 'Deal moved stage' || type === 'Proposal approved' || type === 'Proposal rejected' || type === 'System Announcement') {
-    category = 'Opportunity';
-  }
-
-  if (categoryOverride) {
-    category = categoryOverride;
-  }
-
-  // Determine Priority (Deal and Proposal events are Medium, others are High)
-  const priority: 'High' | 'Medium' | 'Low' | string = (category === 'Opportunity') ? 'Medium' : 'High';
-
-  const generatedId = `notif-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-
-  const newNotif: any = {
-    id: generatedId,
-    userId: targetUserId || null,
-    type,
-    title,
-    message,
-    timestamp: new Date().toISOString(),
-    isRead: false,
-    category,
-    priority,
-    isLegacy: false,
-    createdAt: new Date().toISOString(),
-    readStatus: "unread",
-  };
-
-  try {
-    await db.insert(notifications).values(newNotif);
-    // Trigger real-time progressive push delivery asynchronously across channels (Browser, WebView, Android)
-    const pushPayload = {
-      id: generatedId,
-      title,
-      message,
-      category,
-      priority,
-      timestamp: newNotif.timestamp,
-    };
-    sendPushNotification(targetUserId || null, pushPayload).catch(err => {
-      console.error("[PUSH ENGINE ERROR] Asynchronous push notification delivery failed:", err);
-    });
-
-    // Trigger OneSignal native push notification asynchronously for Android / WebView targets
-    sendOneSignalPush(targetUserId || null, title, message).catch(err => {
-      console.error("[ONESIGNAL ENGINE ERROR] Asynchronous OneSignal push notification dispatch failed:", err);
-    });
-  } catch (err: any) {
-    console.error("[SCM DATABASE] Failed to save notification in DB:", err.message);
-  }
-
-  return {
-    ...newNotif,
-    notificationId: generatedId,
-    description: message
-  };
-}
-
-app.get("/api/notifications", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  const startTime = Date.now();
-  const { userId, role, email, isAdmin } = getRequestUser(req);
-
-  try {
-    if (!userId) {
-      console.log(`[SCM NOTIFICATION LOG] [${new Date().toISOString()}] No userId provided. Returning empty array.`);
-      return res.json([]);
-    }
-
-    let dbNotifs = [];
-    try {
-      dbNotifs = await db.select().from(notifications);
-    } catch (dbErr: any) {
-      dbNotifs = [];
-    }
-
-    const nowTime = Date.now();
-    for (const n of dbNotifs) {
-      if (!n) continue;
-      if (n.category === "Meeting" || n.type?.includes("Meeting")) {
-        // Expired meeting/event check: if meeting notification is older than 4 hours, mark read
-        let timestampVal = 0;
-        try {
-          timestampVal = new Date(n.timestamp || n.createdAt || '').getTime();
-        } catch (e) {
-          timestampVal = NaN;
-        }
-
-        if (!isNaN(timestampVal)) {
-          const elapsed = nowTime - timestampVal;
-          if (elapsed > 4 * 3600000 && !n.isRead) {
-            n.isRead = true;
-            n.readStatus = "read";
-            try {
-              await db.update(notifications).set({ isRead: true, readStatus: "read" }).where(eq(notifications.id, n.id));
-            } catch (err: any) {
-              console.error("[SCM DATABASE] Auto-archive meeting notification error:", err.message);
-            }
-          }
-        }
-      }
-    }
-
-    // Securely filter based on user-isolation rules
-    const filtered = (dbNotifs || []).filter(n => {
-      if (!n) return false;
-      
-      // Rule 1: Custom assigned notification
-      if (n.userId && n.userId === userId) {
-        return true;
-      }
-
-      // Rule 2: Unassigned or preloaded legacy notifications
-      if (!n.userId || n.isLegacy) {
-        if (isAdmin) {
-          // Admins may view platform administrative alerts, approvals or their own legacy ones
-          if (n.category === "Approval" || n.category === "Assignment" || n.category === "Opportunity" || n.isLegacy) {
-            return true;
-          }
-        }
-        // Relationship Officers do NOT see legacy historical system events
-        return false;
-      }
-
-      return false;
-    });
-
-    const mapped = filtered.map(n => {
-      if (!n) return null;
-      return {
-        ...n,
-        id: n.id,
-        notificationId: n.id,
-        userId: n.userId || null,
-        type: n.type || 'System',
-        title: n.title || 'Notification',
-        message: n.message || '',
-        description: n.message || '',
-        timestamp: n.timestamp || new Date().toISOString(),
-        isRead: !!n.isRead,
-        category: n.category || 'System',
-        priority: n.priority || 'Normal',
-        isLegacy: !!n.isLegacy,
-        createdAt: n.createdAt || null,
-        readStatus: n.readStatus || 'unread'
-      };
-    }).filter(Boolean);
-
-    // Sort newest first
-    mapped.sort((a: any, b: any) => {
-      const timeA = new Date(a.timestamp || a.createdAt || 0).getTime();
-      const timeB = new Date(b.timestamp || b.createdAt || 0).getTime();
-      return timeB - timeA;
-    });
-
-    const responseTime = Date.now() - startTime;
-    console.log(`[SCM NOTIFICATION LOG] [${new Date().toISOString()}] userId=${userId} role=${role} route=/api/notifications responseTime=${responseTime}ms status=200`);
-
-    return res.json(mapped);
-  } catch (err: any) {
-    const responseTime = Date.now() - startTime;
-    console.error(`[SCM NOTIFICATION CRITICAL ERROR] [${new Date().toISOString()}] userId=${userId || 'anonymous'} role=${role || 'none'} route=/api/notifications responseTime=${responseTime}ms status=200 (fallback) error:`, err.message || err);
-    // Always return 200 OK with [] instead of crashing
-    return res.status(200).json([]);
-  }
-});
-
-// Simulation endpoint
-app.post("/api/notifications/simulate", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  try {
-    const { userId: reqUserId, role, email, isAdmin } = getRequestUser(req);
-    const isSuperAdmin = email === 'wisdom.okoh@scmcapitalng.com' || 
-                         email === 'omololu.ajediran@scmcapitalng.com';
-    const isSystemAdmin = isSuperAdmin || 
-                         role === 'Admin' || 
-                         role === 'SUPER_ADMIN' || 
-                         role === 'Administrator' || 
-                         isAdmin;
-
-    if (!reqUserId || !isSystemAdmin) {
-      return res.status(403).json({ error: "Access denied. SCM Enterprise Alert Simulation is reserved strictly for system Administrators." });
-    }
-
-    const { type, userId } = req.body;
-    if (!type) {
-      return res.status(400).json({ error: "Notification type is required to simulate." });
-    }
-
-    let title = "";
-    let message = "";
-
-    switch (type) {
-      case "Meeting reminder":
-        title = "SEC Treasury Briefing Reminder";
-        message = "Reminder: Your C-suite meeting with SEC Nigeria Directors starts in 15 minutes in the Boardroom.";
-        break;
-      case "Meeting rescheduled":
-        title = "Access Bank Advisory Rescheduled";
-        message = "The Access Bank Corporate Treasury Alignment session has been moved to Friday, 2 PM.";
-        break;
-      case "New task assigned":
-        title = "Draft High-Yield Placement Proposal";
-        message = "You have been assigned a task to draft the institutional money market proposal for Oando Petroleum.";
-        break;
-      case "Task overdue":
-        title = "Overdue Task: Shell Client Follow-up";
-        message = "Urgent: The task to complete compliance screening for Shell Oil Directors is overdue.";
-        break;
-      case "New prospect assigned to user":
-        title = "Chevron Nigeria Assigned";
-        message = "Strategic Prospect 'Chevron Nigeria Ltd Corporate Treasury' has been assigned to you by Admin.";
-        break;
-      case "User approval request":
-        title = "Approvals Queue: New User Registration";
-        message = "Security Desk: A new SCM Account Registration request from officer Chinedu Obi is awaiting executive approval.";
-        break;
-      case "User approved":
-        title = "Corporate Access Granted";
-        message = "Success: Your corporate onboarding registration has been approved. You now have full CRM permissions.";
-        break;
-      case "User rejected":
-        title = "Corporate Access Revoked";
-        message = "Security: SCM registration request for audit node 'guest_user' was rejected by Compliance Lead.";
-        break;
-      case "Deal moved stage":
-        title = "Dangote Group Moved to Negotiation";
-        message = "Deal pipeline update: Dangote Group Treasury Placement has progressed from Proposal Sent to active Negotiation.";
-        break;
-      case "Proposal approved":
-        title = "AUM Proposal Accepted: MTN Nigeria";
-        message = "Executive Approval: MTN Nigeria's â‚¦2.5 Billion Money Market Placement proposal has been fully approved by the investment committee.";
-        break;
-      case "Proposal rejected":
-        title = "SCM Placement Proposal Rejected";
-        message = "Investment Committee: The structured fixed deposit rate proposal for BUA Cement was rejected.";
-        break;
-      default:
-        return res.status(400).json({ error: `Notification type "${type}" is not an approved business event.` });
-    }
-
-    const notif = await createNotification(type, title, message, undefined, userId);
-    if (!notif) {
-      return res.status(400).json({ error: `Failed to create notification. Type "${type}" may be blocked.` });
-    }
-    return res.status(201).json(notif);
-  } catch (err: any) {
-    console.error("Simulation endpoint error:", err);
-    return res.status(500).json({ error: "Failed to simulate notification", details: err.message });
-  }
-});
-
-app.post("/api/notifications", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  try {
-    const { type, title, message, userId } = req.body;
-    if (!type || !title || !message) {
-      return res.status(400).json({ error: "Notification Type, Title, and Message are mandatory." });
-    }
-    const notif = await createNotification(type, title, message, undefined, userId);
-    if (!notif) {
-      return res.status(400).json({ error: "This notification type is not approved and has been blocked." });
-    }
-    return res.status(201).json(notif);
-  } catch (err: any) {
-    console.error("POST /api/notifications error:", err);
-    return res.status(500).json({ error: "Failed to post notification", details: err.message });
-  }
-});
-
-app.post("/api/notifications/mark-all-read", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  try {
-    const { userId } = getRequestUser(req);
-    if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-    const result = await db.update(notifications).set({ isRead: true, readStatus: "read" }).where(eq(notifications.userId, userId));
-    return res.json({ success: true, count: result.rowCount || 0 });
-  } catch (err: any) {
-    console.error("POST /api/notifications/mark-all-read error:", err);
-    return res.status(500).json({ error: "Failed to mark all as read", details: err.message });
-  }
-});
-
-app.patch("/api/notifications/:id", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  try {
-    const { userId, isAdmin } = getRequestUser(req);
-    if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-    const { id } = req.params;
-    const { isRead, readStatus } = req.body;
-    
-    const dbNotifs = await db.select().from(notifications).where(eq(notifications.id, id));
-    const notif = dbNotifs[0];
-    if (!notif) {
-      return res.status(404).json({ error: "Notification not found." });
-    }
-
-    if (!isAdmin && notif.userId !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only modify your own notifications." });
-    }
-
-    const updates: any = {};
-    if (isRead !== undefined) {
-      updates.isRead = !!isRead;
-      updates.readStatus = !!isRead ? "read" : "unread";
-    } else if (readStatus !== undefined) {
-      updates.readStatus = readStatus;
-      updates.isRead = readStatus === "read";
-    }
-
-    await db.update(notifications).set(updates).where(eq(notifications.id, id));
-
-    return res.json({
-      ...notif,
-      ...updates,
-      notificationId: notif.id,
-      description: notif.message
-    });
-  } catch (err: any) {
-    console.error("PATCH /api/notifications error:", err);
-    return res.status(500).json({ error: "Failed to patch notification", details: err.message });
-  }
-});
-
-app.delete("/api/notifications/:id", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  try {
-    const { userId, isAdmin } = getRequestUser(req);
-    if (!userId) return res.status(401).json({ error: "Access denied. Sign-in required." });
-
-    const { id } = req.params;
-    const dbNotifs = await db.select().from(notifications).where(eq(notifications.id, id));
-    const notif = dbNotifs[0];
-    if (!notif) {
-      return res.status(404).json({ error: "Notification not found." });
-    }
-
-    if (!isAdmin && notif.userId !== userId) {
-      return res.status(403).json({ error: "Access denied. You can only delete your own notifications." });
-    }
-
-    await db.delete(notifications).where(eq(notifications.id, id));
-    return res.json({ success: true });
-  } catch (err: any) {
-    console.error("DELETE /api/notifications error:", err);
-    return res.status(500).json({ error: "Failed to delete notification", details: err.message });
-  }
-});
-
-// --- SCM ENTERPRISE WEB PUSH CONFIGURATION & ENGINE ---
-import webpush from "web-push";
-
-let vapidKeys: { publicKey: string; privateKey: string };
-const VAPID_KEYS_FILE = path.join(process.cwd(), "vapid-keys.json");
-
-if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
-  vapidKeys = {
-    publicKey: process.env.VAPID_PUBLIC_KEY,
-    privateKey: process.env.VAPID_PRIVATE_KEY
-  };
-} else if (fs.existsSync(VAPID_KEYS_FILE)) {
-  try {
-    vapidKeys = JSON.parse(fs.readFileSync(VAPID_KEYS_FILE, "utf-8"));
-  } catch (err) {
-    console.error("[PUSH ENGINE] Failed to parse local VAPID keys file:", err);
-    vapidKeys = webpush.generateVAPIDKeys();
-    fs.writeFileSync(VAPID_KEYS_FILE, JSON.stringify(vapidKeys), "utf-8");
-  }
-} else {
-  vapidKeys = webpush.generateVAPIDKeys();
-  try {
-    fs.writeFileSync(VAPID_KEYS_FILE, JSON.stringify(vapidKeys), "utf-8");
-    console.log("[PUSH ENGINE] Dynamically generated and cached a stable VAPID keypair.");
-  } catch (err) {
-    console.error("[PUSH ENGINE] Failed to persist VAPID keys file:", err);
-  }
-}
-
-// Set VAPID details with corporate identity context
-webpush.setVapidDetails(
-  "mailto:wikiswisdom07@gmail.com",
-  vapidKeys.publicKey,
-  vapidKeys.privateKey
-);
-
-// Helper function to dispatch push notification payloads to active push subscribers
-async function sendPushNotification(targetUserId: string | null, payload: any) {
-  try {
-    let subs = [];
-    if (targetUserId) {
-      subs = await db.select().from(pushSubscriptions).where(eq(pushSubscriptions.userId, targetUserId));
-    } else {
-      subs = await db.select().from(pushSubscriptions);
-    }
-
-    const payloadString = JSON.stringify(payload);
-    console.log(`[PUSH ENGINE] Found ${subs.length} active subscription(s) to notify for targetUserId: ${targetUserId || "broadcast"}`);
-
-    const promises = subs.map(async (sub) => {
-      const pushSubscription = {
-        endpoint: sub.endpoint,
-        keys: {
-          p256dh: sub.p256dh,
-          auth: sub.auth
-        }
-      };
-
-      try {
-        await webpush.sendNotification(pushSubscription, payloadString);
-        console.log(`[PUSH ENGINE SUCCESS] Dispatched push notification to endpoint ${sub.id} for user ${sub.userId}`);
-      } catch (err: any) {
-        if (err.statusCode === 410 || err.statusCode === 404) {
-          console.log(`[PUSH ENGINE CLEANUP] Deleting expired push subscription ${sub.id}`);
-          try {
-            await db.delete(pushSubscriptions).where(eq(pushSubscriptions.endpoint, sub.endpoint));
-          } catch (delErr: any) {
-            console.error(`[PUSH ENGINE CLEANUP ERROR] Failed to delete expired subscription ${sub.id}:`, delErr.message);
-          }
-        } else {
-          console.error(`[PUSH ENGINE ERROR] Failed to deliver push to ${sub.id}:`, err.message || err);
-        }
-      }
-    });
-
-    await Promise.allSettled(promises);
-  } catch (err: any) {
-    console.error("[PUSH ENGINE CRITICAL] Failed to execute sendPushNotification:", err.message || err);
-  }
-}
-
-// Enterprise-grade OneSignal REST API Push Delivery Engine for Android WebToNative targets
-async function sendOneSignalPush(targetUserId: string | null, title: string, message: string) {
-  const appId = process.env.ONESIGNAL_APP_ID;
-  const apiKey = process.env.ONESIGNAL_REST_API_KEY;
-
-  if (!appId || !apiKey) {
-    console.warn("[ONESIGNAL ENGINE WARNING] ONESIGNAL_APP_ID or ONESIGNAL_REST_API_KEY is not defined in environment variables. Native push delivery skipped.");
-    return;
-  }
-
-  try {
-    const payload: any = {
-      app_id: appId,
-      headings: {
-        en: title
-      },
-      contents: {
-        en: message
-      },
-      priority: 10 // High Priority for instant delivery
-    };
-
-    if (targetUserId) {
-      payload.target_channel = "push";
-      payload.include_external_user_ids = [targetUserId];
-      payload.channel_for_external_user_ids = "push";
-      payload.include_aliases = {
-        external_id: [targetUserId]
-      };
-    } else {
-      payload.included_segments = ["Subscribed Users"];
-    }
-
-    console.log(`[ONESIGNAL ENGINE] Dispatching push to OneSignal REST API... targetUserId: ${targetUserId || "broadcast"}`);
-    
-    const response = await fetch("https://onesignal.com/api/v1/notifications", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        "Authorization": `Basic ${apiKey}`
-      },
-      body: JSON.stringify(payload)
-    });
-
-    const data: any = await response.json();
-    if (response.ok) {
-      console.log("[ONESIGNAL ENGINE SUCCESS] OneSignal dispatch succeeded:", data);
-    } else {
-      console.error("[ONESIGNAL ENGINE ERROR] OneSignal REST API returned non-OK status:", response.status, data);
-    }
-  } catch (err: any) {
-    console.error("[ONESIGNAL ENGINE CRITICAL] Failed to execute sendOneSignalPush:", err.message || err);
-  }
-}
-
-// REST endpoints for the Web Push subscription flow
-app.get("/api/push/public-key", (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  return res.json({ publicKey: vapidKeys.publicKey });
-});
-
-app.post("/api/push/subscribe", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  try {
-    const { subscription, userId } = req.body;
-    if (!subscription || !subscription.endpoint || !subscription.keys || !subscription.keys.p256dh || !subscription.keys.auth) {
-      return res.status(400).json({ error: "Invalid subscription payload." });
-    }
-
-    const { userId: reqUserId } = getRequestUser(req);
-    const targetUserId = userId || reqUserId;
-
-    if (!targetUserId) {
-      return res.status(401).json({ error: "Authenticated user identifier required for subscription." });
-    }
-
-    const subId = `sub-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-
-    const existing = await db.select().from(pushSubscriptions).where(eq(pushSubscriptions.endpoint, subscription.endpoint));
-
-    if (existing.length > 0) {
-      await db.update(pushSubscriptions).set({
-        userId: targetUserId,
-        p256dh: subscription.keys.p256dh,
-        auth: subscription.keys.auth,
-      }).where(eq(pushSubscriptions.endpoint, subscription.endpoint));
-      
-      console.log(`[PUSH ENGINE] Updated existing push subscription ${existing[0].id} for user ${targetUserId}`);
-      return res.json({ success: true, id: existing[0].id, updated: true });
-    } else {
-      await db.insert(pushSubscriptions).values({
-        id: subId,
-        userId: targetUserId,
-        endpoint: subscription.endpoint,
-        p256dh: subscription.keys.p256dh,
-        auth: subscription.keys.auth,
-      });
-      
-      console.log(`[PUSH ENGINE] Created new push subscription ${subId} for user ${targetUserId}`);
-      return res.status(201).json({ success: true, id: subId, created: true });
-    }
-  } catch (err: any) {
-    console.error("POST /api/push/subscribe error:", err);
-    return res.status(500).json({ error: "Failed to persist subscription", details: err.message });
-  }
-});
-
-app.post("/api/push/unsubscribe", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  try {
-    const { endpoint } = req.body;
-    if (!endpoint) {
-      return res.status(400).json({ error: "Subscription endpoint required." });
-    }
-
-    await db.delete(pushSubscriptions).where(eq(pushSubscriptions.endpoint, endpoint));
-    console.log(`[PUSH ENGINE] Unsubscribed endpoint successfully`);
-    return res.json({ success: true });
-  } catch (err: any) {
-    console.error("POST /api/push/unsubscribe error:", err);
-    return res.status(500).json({ error: "Failed to unsubscribe", details: err.message });
-  }
-});
-
-
-
-// Background job to auto-submit pending drafts on Friday at 04:30 PM (and log the submission event to the system)
-function startAutoSubmissionScheduler() {
-  console.log("[SCM AUTO-SUBMISSION] Background automatic performance reporting scheduler started.");
-  setInterval(async () => {
-    try {
-      const now = new Date();
-      const day = now.getDay(); // 5 = Friday
-      const hour = now.getHours();
-      const minute = now.getMinutes();
-
-      // Check if it is Friday and time is >= 16:30 (04:30 PM)
-      if (day === 5 && (hour > 16 || (hour === 16 && minute >= 30))) {
-        // Calculate the current week's Monday date string (YYYY-MM-DD)
-        const currentDay = now.getDay();
-        const distanceToMonday = currentDay === 0 ? -6 : 1 - currentDay;
-        const monday = new Date(now);
-        monday.setDate(now.getDate() + distanceToMonday);
-        const mondayStr = monday.toISOString().split('T')[0];
-
-        // Find all draft reports for the current week that are not finalized
-        const pendingDrafts = await db.select().from(weeklyReports).where(
-          and(
-            eq(weeklyReports.status, "Draft"),
-            eq(weeklyReports.weekStartDate, mondayStr)
-          )
-        );
-
-        if (pendingDrafts.length > 0) {
-          console.log(`[SCM AUTO-SUBMISSION] Found ${pendingDrafts.length} unsubmitted drafts for week ${mondayStr}. Executing automatic submission...`);
-          for (const report of pendingDrafts) {
-            await db.update(weeklyReports).set({
-              status: "Submitted",
-              submittedAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString()
-            }).where(eq(weeklyReports.id, report.id));
-
-            console.log(`[SCM AUTO-SUBMISSION] Sealed and finalized report ${report.id} for Relationship Officer ${report.userName}`);
-          }
-        }
-      }
-    } catch (err: any) {
-      console.error("[SCM AUTO-SUBMISSION ERROR] Background submission engine failed:", err);
-    }
-  }, 1000 * 60 * 10); // Run check every 10 minutes
-}
-
-// Express Vite Mounting & Server initialization (Static vs Dev modes)
-async function startServer() {
-  // Verify or create push_subscriptions table in PostgreSQL if database is healthy
-  if (isDatabaseHealthy) {
-    try {
-      await db.execute(sql`
-        CREATE TABLE IF NOT EXISTS "push_subscriptions" (
-          "id" TEXT PRIMARY KEY,
-          "user_id" TEXT,
-          "endpoint" TEXT NOT NULL UNIQUE,
-          "p256dh" TEXT NOT NULL,
-          "auth" TEXT NOT NULL,
-          "created_at" TIMESTAMP DEFAULT NOW()
-        );
-      `);
-      console.log("[SCM DATABASE SUCCESS] push_subscriptions table verified/created successfully.");
-    } catch (err: any) {
-      isDatabaseHealthy = false;
-      console.log("[SCM DATABASE NOTICE] Operating push_subscriptions in memory fallback mode.");
-    }
-  }
-
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    // Serve production bundle
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  }
-
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`SCM Prospect Intelligence Platform running at http://localhost:${PORT}`);
-    startAutoSubmissionScheduler();
-  });
-}
-
-if (!process.env.VERCEL) {
-  startServer();
-}
-
-export default app;
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×MzóÔèµ©hºÚn¶X§zÍZ[\Ü^™\ÜÈœ›ÛH™^™\ÜÈŽÂš[\Ü]œ›ÛHœ]ŽÂš[\ÜœÈœ›ÛH™œÈŽÂš[\ÜÈÜ™X]TÙ\™\ˆ\ÈÜ™X]Uš]TÙ\™\ˆHœ›ÛHš]HŽÂš[\ÜÈÛÛÙÛQÙ[RK\HHœ›ÛHÛÛÙÛKÙÙ[˜ZHŽÂš[\ÜÝ[ˆœ›ÛH™Ý[ˆŽÂš[\ÜÈÜ™X]PÛY[\ÈÜ™X]TÝ\X˜\ÙPÛY[Hœ›ÛHÝ\X˜\ÙKÜÝ\X˜\ÙKZœÈŽÂš[\ÜÈ‹Ü™X]TÛÛHœ›ÛH‹‹ÜÜ˜ËÙ‹Ú[™^ÈŽÂš[\ÜÈ\Ù\œË›ÜÜXÝËÛÛXÝËXÝ]š]Y\ËYY][™ÜË\ÚÜË™]ÜÐ\XÛ\Ë\ØÛÝ™\™YXYË\ØÛÝ™\žTÙ\ÜÚ[ÛœË\ØÛÝ™\žT]Y]Y\Ë\ÛÑ[œšXÚY[ØXÚK]Y]ÙÜË™[Z[™\œËØ]™YÙ\ÜÚ[ÛœËÙ\™[˜P]Y]ÙÜËÞ\Ý[P]Y]ÙÜËÙYZÛT™\ÜËÛÜšÜÜXÙ\ËÛÜšÜÜXÙS›Ý\ËÛÜšÜÜXÙT›ÜÜØ[ËÛÜšÜÜXÙT™\Ù[][ÛœËÛÜšÜÜXÙPZPÛÛ™\œØ][ÛœËÛÜšÜÜXÙTÙX\˜Ú\ÝÜžKZTÙX\˜Ú\ÝÜžK›ÝYšXØ][ÛœË\ÚÝXœØÜš\[ÛœÈHœ›ÛH‹‹ÜÜ˜ËÙ‹ÜØÚ[XKÈŽÂš[\ÜÈ\K[™\ØË\ØËÜ[[\œ˜^KÜˆHœ›ÛH™š^ž›K[Ü›HŽÂš[\ÜÈˆÙ[™™\šYšXØ][Û‘[XZ[ˆÙ[™\ÜÝÛÜ™™\Ù][XZ[ˆÙ[™›ÜÜXÝ[š]][Û‘[XZ[ˆÙ[™›ÝYšXØ][Û‘[XZ[ŸHœ›ÛH‹‹ÜÜ˜ËÛX‹ÛXZ[\‹ÈŽÂ‚‹ËÈØY[š\›Û›Y[˜\šXX›\Â™Ý[‹˜ÛÛ™šYÊ
+NÂ‚š[\ÜÈÙX\˜ÚÜ™Ø[š^˜][ÛœË\ØÛÝ™\‘XÚ\Ú[Û“XZÙ\œË[œšXÚÜ™Ø[š^˜][Û‹\ÛÑXYÛ›ÜÝXÜÈHœ›ÛH‹‹ÜÜ˜ËÜÙ\šXÙ\ËØ\ÛÔÙ\šXÙKÈŽÂš[\ÜÈ™\šYžQ]HHœ›ÛH‹‹ÜÜ˜ËÜÙ\šXÙ\ËÝ™\šYšXØ][Û”Ù\šXÙKÈŽÂš[\ÜÈØ[Ý[]T›ÙXÝ™XÛÛ[Y[™][ÛœÈHœ›ÛH‹‹ÜÜ˜ËÝ][ËÜ™XÛÛ[Y[™][Û‘[™Ú[™KÈŽÂš[\ÜÈ™YÚ\Ý\”\ÙL”›Ý]\ÈHœ›ÛH‹‹ÜÜ˜ËÜÙ\™\‹Ü\ÙL”›Ý]\ËÈŽÂš[\ÜÈ™YÚ\Ý\”\ÙL•ÙYZÛT›Ý]\ÈHœ›ÛH‹‹ÜÜ˜ËÜÙ\™\‹Ü\ÙL•ÙYZÛT›Ý]\ËÈŽÂš[\ÜÈ™YÚ\Ý\”X›XÐ]]›Ý]\ÈHœ›ÛH‹‹ÜÜ˜ËÜÙ\™\‹ÜX›XÐ]]›Ý]\ËÈŽÂš[\ÜÈ™YÚ\Ý\”\ÙLÔ›Ý]\ÈHœ›ÛH‹‹ÜÜ˜ËÜÙ\™\‹Ü\ÙLÔ›Ý]\ËÈŽÂš[\ÜÈ™YÚ\Ý\”\ÙLÐÜY›Ý]\ÈHœ›ÛH‹‹ÜÜ˜ËÜÙ\™\‹Ü\ÙLÐÜY›Ý]\ËÈŽÂš[\ÜÈ™YÚ\Ý\”\ÙMÔ›Ý]\ÈHœ›ÛH‹‹ÜÜ˜ËÜÙ\™\‹Ü\ÙMÔ›Ý]\ËÈŽÂš[\ÜÈ\ØÛÝ™\žT]Y]YQ[™Ú[™KÛY[ÛÛ^Hœ›ÛH‹‹ÜÜ˜ËÜÙ\šXÙ\ËÙ\ØÛÝ™\žKÙ\ØÛÝ™\žT]Y]YQ[™Ú[™KÈŽÂ‚‹ËÈ[\ˆÈ˜[Y]HÛÜœÜ˜]H[XZ[ÛXZ[ˆ[™›Ü›X]™[˜Ý[Ûˆ\Õ˜[YØÛQ[XZ[
+[XZ[ˆÝš[™ÊNˆ›ÛÛX[ˆÂˆYˆ
+Y[XZ[
+H™]\›ˆ˜[ÙNÂˆÛÛœÝš[[YYH[XZ[š[J
+KÓÝÙ\Ø\ÙJ
+NÂˆYˆ
+]š[[YY™[™ÕÚ]
+ØÛXØ\][™Ë˜ÛÛHŠJH™]\›ˆ˜[ÙNÂˆÛÛœÝØØ[\Hš[[YYœÜ]
+ŠVÌNÂˆYˆ
+[ØØ[\
+H™]\›ˆ˜[ÙNÂˆ™]\›ˆ×–ØK^ŒNK—ËWJÉË\Ý
+ØØ[\
+NÂŸB‚˜ÛÛœÝ[š]X[\Ù\œÎˆ[žV×HH×NÂ‚˜ÛÛœÝ[š]X[›ÜÜXÝÎˆ›ÜÜXÝ×HH×NÂ˜ÛÛœÝ[š]X[ÛÛXÝÎˆÛÛXÝ×HH×NÂ˜ÛÛœÝ[š]X[XÝ]š]Y\ÎˆXÝ]š]V×HH×NÂ˜ÛÛœÝ[š]X[YY][™ÜÎˆYY][™Ö×HH×NÂš[\ÜÈ›ÜÜXÝÛÛXÝXÝ]š]KYY][™Ë\Ù\”›Ùš[K\ÚË™]ÜÐ\XÛK\ØÛÝ™\™YXYÝY™”\™›Ü›X[˜ÙK™[Z[™\‹\Ù\”›ÛHHœ›ÛH‹‹ÜÜ˜ËÝ\\ÈŽÂ‚‹ËÈXÝ]™H\Ù\ˆÐ]]XØÙ\ÜÈÚÙ[œÈX\[™ÈØXÚYÙXÝ\™[H[ˆY[[ÜžHÛˆHÙ\™\‚˜ÛÛœÝXÝ]™U\Ù\•ÚÙ[œÈH™]ÈX\Ýš[™ËÝš[™ÏŠ
+NÂ‚‹ËÈ]][XØ]YY[]H\È\ÝX›\ÚY^Û\Ú]™[HžHHÝ\X˜\ÙH•ÕZY]Ø\™H™[ÝË‚™[˜Ý[ÛˆÙ]™\]Y\Ý\Ù\Š™\Nˆ[žJHÂˆYˆ
+™\OË\Ù\ŠH™]\›ˆ™\K\Ù\ŽÂˆ™]\›ˆÂˆ\Ù\’Yˆ[ˆ›ÛNˆ[ˆ[XZ[ˆ	ÉËˆ\ÐYZ[Žˆ˜[ÙKˆÝ]\Îˆ	ÕSUUS•PÐUQ	Ëˆ\ÔÝ\\YZ[Žˆ˜[ÙKˆ\›Z\ÜÚ[Û“]™[ˆ[ˆNÂŸB‚‹ËÈ™\ÛÛ™HÛ›H\Ù\œÈ][™XYH^\Ý[ˆHÐÓH\Ù\ˆ\™XÝÜžKˆ™]™\ˆ]]Ë\›Ýš\Ú[ÛˆXØÛÝ[Ë‚˜\Þ[˜È[˜Ý[Ûˆ[œÝ\™U˜[Y\Ù\Š™\]Y\ÝY\Ù\’YÎˆÝš[™È[™\]Y\ÝY[XZ[ÎˆÝš[™È[™\]Y\ÝY˜[YOÎˆÝš[™È[
+HÂˆÛÛœÝ\™Ù]YH™\]Y\ÝY\Ù\’YÈÝš[™Ê™\]Y\ÝY\Ù\’Y
+Kš[J
+Hˆ[ÂˆÛÛœÝ\™Ù][XZ[H™\]Y\ÝY[XZ[ÈÝš[™Ê™\]Y\ÝY[XZ[
+Kš[J
+KÓÝÙ\Ø\ÙJ
+Hˆ[Â‚ˆYˆ
+]\™Ù]Y	‰ˆ]\™Ù][XZ[
+HÂˆ›ÝÈ™]È\œ›ÜŠ	ÐH˜[Y\ÜÚYÛ™YÐÓH\Ù\ˆ\È™\]Z\™Y‰ÊNÂˆB‚ˆÛÛœÝ›Ý[™H\™Ù]YˆÈ]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\Ù\œÊKÚ\™J\J\Ù\œËšY\™Ù]Y
+JBˆˆ]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\Ù\œÊKÚ\™J\J\Ù\œË™[XZ[\™Ù][XZ[JJNÂ‚ˆYˆ
+›Ý[™›[™ÝOOH
+HÂˆ›ÝÈ™]È\œ›ÜŠ	Ð\ÜÚYÛ™YÐÓH\Ù\ˆÙ\È›Ý^\ÝÜˆ\È›Ý™Y[ˆXÝ]˜]Y‰ÊNÂˆB‚ˆ™]\›ˆÈYˆ›Ý[™ÌKšY[˜[YNˆ›Ý[™ÌK™[˜[YK[XZ[ˆ›Ý[™ÌK™[XZ[NÂŸB‚‹ËÈÞ\Ý[HÙÙÚ[™È[\ˆ›Üˆ]Y][™È[™ÙXÝ\š]H˜XÚÚ[™Â˜\Þ[˜È[˜Ý[ÛˆÙÔÞ\Ý[Q]™[
+ˆXÝ[ÛŽˆÝš[™Ëˆ\™Ù]ˆÝš[™È[ˆÝ]\ÎˆÝš[™Ëˆ™\Nˆ[žKˆY]Y]OÎˆ[žBŠHÂˆÛÛœÝÈ\Ù\’Y[XZ[HHÙ]™\]Y\Ý\Ù\Š™\JNÂˆ]\Ù\“˜[YHH”Þ\Ý[HŽÂˆYˆ
+\Ù\’Y[XZ[
+HÂˆžHÂˆÛÛœÝÛÛ™][ÛˆH\Ù\’YÈ\J\Ù\œËšY\Ù\’Y
+Hˆ\J\Ù\œË™[XZ[[XZ[ÓÝÙ\Ø\ÙJ
+JNÂˆÛÛœÝÕ\Ù\œÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\Ù\œÊKÚ\™JÛÛ™][ÛŠNÂˆYˆ
+Õ\Ù\œË›[™Ýˆ
+HÂˆ\Ù\“˜[YHHÕ\Ù\œÖÌK™[˜[YNÂˆH[ÙHYˆ
+[XZ[
+HÂˆ\Ù\“˜[YHH[XZ[œÜ]
+	Ð	ÊVÌNÂˆBˆHØ]Ú
+\œŠHÂˆYˆ
+[XZ[
+H\Ù\“˜[YHH[XZ[œÜ]
+	Ð	ÊVÌNÂˆBˆB‚ˆÛÛœÝÙÑ[žHHÂˆYˆ]Y]IÑ]K››ÝÊ
+_KIÓX]™›ÛÜŠX]œ˜[™ÛJ
+H
+ˆL
+_Xˆ[Y\Ý[\ˆ™]È]J
+KÒTÓÔÝš[™Ê
+Kˆ\Ù\’Yˆ\Ù\’Y[ˆ\Ù\‘[XZ[ˆ[XZ[[ˆ\Ù\“˜[YNˆ\Ù\“˜[YH[ˆXÝ[Û‹ˆ\™Ù]ˆÝ]\ËˆY]Y]NˆY]Y]HßBˆNÂ‚ˆžHÂˆ]ØZ]‹š[œÙ\
+Þ\Ý[P]Y]ÙÜÊK˜[Y\ÊÂˆYˆÙÑ[žKšYˆ[Y\Ý[\ˆÙÑ[žK[Y\Ý[\ˆ\Ù\’YˆÙÑ[žK\Ù\’Yˆ\Ù\‘[XZ[ˆÙÑ[žK\Ù\‘[XZ[ˆ\Ù\“˜[YNˆÙÑ[žK\Ù\“˜[YKˆXÝ[ÛŽˆÙÑ[žK˜XÝ[Û‹ˆ\™Ù]ˆÙÑ[žK\™Ù]ˆÝ]\ÎˆÙÑ[žKœÝ]\ËˆY]Y]NˆÙÑ[žK›Y]Y]BˆJNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWH˜Z[YÈÜš]HÞ\Ý[H]Y]ÙÎˆ‹\œŠNÂˆBŸB‚˜\Þ[˜È[˜Ý[ÛˆÙ]›ÜÜXÝÑ›Ü•\Ù\Š™\Nˆ[žJHÂˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ×NÂˆžHÂˆYˆ
+\ÐYZ[ŠHÂˆ™]\›ˆ]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊNÂˆBˆ™]\›ˆ]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™Jˆ[™
+ˆ\J›ÜÜXÝË˜\ÜÚYÛ™YÙ™šXÙ\’Y\Ù\’Y
+KˆÜ[	Ü›ÜÜXÝËœÝ]\ßHOH	Ð\˜Ú]™Y	ØˆÜ[	Ü›ÜÜXÝËœÝ]\ßHOH	ÔÙYY]IØˆ
+Bˆ
+NÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ	ÖÔÔTUPTÑWH›ÜÜXÝ]Y\žH˜Z[Y‰Ë\œË›Y\ÜØYÙH\œŠNÂˆ›ÝÈ\œŽÂˆBŸB‚˜\Þ[˜È[˜Ý[ÛˆÙ]YY][™ÜÑ›Ü•\Ù\Š™\Nˆ[žJHÂˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ×NÂˆžHÂˆYˆ
+\ÐYZ[ŠHÂˆ™]\›ˆ]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJYY][™ÜÊNÂˆBˆ™]\›ˆ]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJYY][™ÜÊKÚ\™J\JYY][™ÜË›Ù™šXÙ\’Y\Ù\’Y
+JNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ	ÖÔÔTUPTÑWHYY][™È]Y\žH˜Z[Y‰Ë\œË›Y\ÜØYÙH\œŠNÂˆ›ÝÈ\œŽÂˆBŸB‚˜\Þ[˜È[˜Ý[ÛˆÙ]\ÚÜÑ›Ü•\Ù\Š™\Nˆ[žJHÂˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ×NÂˆžHÂˆYˆ
+\ÐYZ[ŠHÂˆ™]\›ˆ]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\ÚÜÊNÂˆBˆ™]\›ˆ]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\ÚÜÊKÚ\™J\J\ÚÜË›Ù™šXÙ\’Y\Ù\’Y
+JNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ	ÖÔÔTUPTÑWH\ÚÈ]Y\žH˜Z[Y‰Ë\œË›Y\ÜØYÙH\œŠNÂˆ›ÝÈ\œŽÂˆBŸB‚˜\Þ[˜È[˜Ý[ÛˆÙ]XÝ]š]Y\Ñ›Ü•\Ù\Š™\Nˆ[žJHÂˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ×NÂˆžHÂˆYˆ
+\ÐYZ[ŠHÂˆ™]\›ˆ]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJXÝ]š]Y\ÊNÂˆBˆ™]\›ˆ]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJXÝ]š]Y\ÊKÚ\™J\JXÝ]š]Y\Ë›Ù™šXÙ\’Y\Ù\’Y
+JNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ	ÖÔÔTUPTÑWHXÝ]š]H]Y\žH˜Z[Y‰Ë\œË›Y\ÜØYÙH\œŠNÂˆ›ÝÈ\œŽÂˆBŸB‚˜\Þ[˜È[˜Ý[ÛˆÙ]ÛÛXÝÑ›Ü•\Ù\Š™\Nˆ[žJHÂˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ×NÂˆžHÂˆYˆ
+\ÐYZ[ŠHÂˆ™]\›ˆ]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÛÛXÝÊNÂˆBˆÛÛœÝÙ™šXÙ\”›ÜÜXÝÈH]ØZ]‹œÙ[XÝ
+ÈYˆ›ÜÜXÝËšYJK™œ›ÛJ›ÜÜXÝÊKÚ\™J\J›ÜÜXÝË˜\ÜÚYÛ™YÙ™šXÙ\’Y\Ù\’Y
+JNÂˆÛÛœÝ›ÜÜXÝYÈHÙ™šXÙ\”›ÜÜXÝË›X\
+OˆšY
+NÂˆYˆ
+›ÜÜXÝYË›[™Ýˆ
+HÂˆ™]\›ˆ]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÛÛXÝÊKÚ\™J[\œ˜^JÛÛXÝËœ›ÜÜXÝY›ÜÜXÝYÊJNÂˆBˆ™]\›ˆ×NÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ	ÖÔÔTUPTÑWHÛÛXÝ]Y\žH˜Z[Y‰Ë\œË›Y\ÜØYÙH\œŠNÂˆ›ÝÈ\œŽÂˆBŸB‚˜\Þ[˜È[˜Ý[ÛˆÙ]™[Z[™\œÑ›Ü•\Ù\Š™\Nˆ[žJHÂˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ×NÂˆžHÂˆYˆ
+\ÐYZ[ŠHÂˆ™]\›ˆ]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ™[Z[™\œÊNÂˆBˆ™]\›ˆ]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ™[Z[™\œÊKÚ\™J\J™[Z[™\œË\Ù\’Y\Ù\’Y
+JNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ	ÖÔÔTUPTÑWH™[Z[™\ˆ]Y\žH˜Z[Y‰Ë\œË›Y\ÜØYÙH\œŠNÂˆ›ÝÈ\œŽÂˆBŸB‚‹ËÈ[‹[Y[[ÜžH[[YH]X˜\ÙHÛ[™ÈÝ\ÝÛHÝ]B›]•\Ù\œÎˆ\Ù\”›Ùš[V×HHË‹‹š[š]X[\Ù\œ×NÂ›]”›ÜÜXÝÎˆ›ÜÜXÝ×HHË‹‹š[š]X[›ÜÜXÝ×NÂ›]ÛÛXÝÎˆÛÛXÝ×HHË‹‹š[š]X[ÛÛXÝ×NÂ›]XÝ]š]Y\ÎˆXÝ]š]V×HHË‹‹š[š]X[XÝ]š]Y\×NÂ›]“YY][™ÜÎˆYY][™Ö×HHË‹‹š[š]X[YY][™Ü×NÂ›]”™[Z[™\œÎˆ™[Z[™\–×HH×NÂ‚›]•\ÚÜÎˆ\ÚÖ×HH×NÂ‚›]“™]ÜÐ\XÛ\Îˆ™]ÜÐ\XÛV×HH×NÂ‚›]‘\ØÛÝ™\™YXYÎˆ\ØÛÝ™\™YXY×HH×NÂ‚›]”ÝY™”\™›Ü›X[˜ÙNˆÝY™”\™›Ü›X[˜ÙV×HH×NÂ‚‹ËÈ\ÙHMˆ[‹SY[[ÜžHYZ[ˆ]Y]ÙÜÈ]X˜\ÙH›Üˆ˜[Y][™ÈÞ\Ý[H™[XXš[]B›]]Y]ÙÜÎˆ[žV×HH×NÂ›]”Ù\™[˜SÙÜÎˆ[žV×HH×NÂ›]”Ø]™YÙ\ÜÚ[ÛœÎˆ[žV×HH×NÂ›]•ÙYZÛT™\ÜÎˆ[žV×HH×NÂ‚‚‹ËÈØY™[H[š]X[^™HÙ[Z[šHÛY[›]ZPÛY[ˆÛÛÙÛQÙ[RH[H[ÂšYˆ
+›ØÙ\ÜË™[‹‘ÑSRS’WÐTWÒÑVH	‰ˆ›ØÙ\ÜË™[‹‘ÑSRS’WÐTWÒÑVHOOH“VWÑÑSRS’WÐTWÒÑVHŠHÂˆžHÂˆZPÛY[H™]ÈÛÛÙÛQÙ[RJÂˆ\RÙ^Nˆ›ØÙ\ÜË™[‹‘ÑSRS’WÐTWÒÑVKˆÜ[ÛœÎˆÂˆXY\œÎˆÂˆ	Õ\Ù\‹PYÙ[	Îˆ	ØZ\ÝY[ËXZ[	ËˆBˆBˆJNÂˆÛÛœÛÛK›ÙÊ”Ý]\ÎˆÙ\™\‹\ÚYHÛÛÙÛQÙ[RHÛY[]]Üš^™YÝXØÙ\ÜÙ[KˆŠNÂˆHØ]Ú
+\œŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘\œ›ÜˆÙ][™È\ÛÛÙÛQÙ[RHÛY[ˆ‹\œŠNÂˆBŸH[ÙHÂˆÛÛœÛÛK›ÙÊ”Ý]\ÎˆÙ\š[™È[[YÙ[˜ÙH]Y\šY\È\Ú[™ÈÐÓH™[Z][HšYÙ\šX[ˆÛÜœÜ˜]\È˜[˜XÚÈ[™Ú[™KˆŠNÂŸB‚˜\Þ[˜È[˜Ý[Ûˆ›Ø\ÝÙ[™\˜]PÛÛ[
+\˜[\ÎˆÈ[Ù[ÎˆÝš[™ÎÈÛÛ[Îˆ[žNÈÛÛ™šYÏÎˆ[žHJNˆ›ÛZ\ÙO[žOˆÂˆYˆ
+XZPÛY[
+HÂˆ›ÝÈ™]È\œ›ÜŠ˜ZPÛY[\È›Ý[š]X[^™YŠNÂˆB‚ˆÛÛœÝš[X\žS[Ù[H\˜[\Ë›[Ù[™Ù[Z[šKLËKY›\ÚŽÂˆÛÛœÝ˜XÚÝ\[Ù[H™Ù[Z[šKLËŒKY›\Ú[]HŽÂ‚ˆÛÛœÝ]Y\žUÚ]™]šY\ÈH\Þ[˜È
+[Ù[˜[YNˆÝš[™ËX^][\ÈHË[š]X[[^HHL
+Nˆ›ÛZ\ÙO[žOˆOˆÂˆ]Ý\œ™[[^HH[š]X[[^NÂˆ›Üˆ
+]][\HNÈ][\HX^][\ÎÈ][\
+ÊÊHÂˆžHÂˆÛÛœÛÛK›ÙÊÑÑSRS’HS‘“×H][\[™ÈÛÛ[\[[™HÚ]\™Ù]‰Û[Ù[˜[Y_Hˆ
+[ˆ	Ø][\KÉÛX^][\ßJX
+NÂˆÛÛœÝ™\ÜÛœÙHH]ØZ]ZPÛY[K›[Ù[Ë™Ù[™\˜]PÛÛ[
+Âˆ[Ù[ˆ[Ù[˜[YKˆÛÛ[Îˆ\˜[\Ë˜ÛÛ[ËˆÛÛ™šYÎˆ\˜[\Ë˜ÛÛ™šYÂˆJNÂˆÛÛœÛÛK›ÙÊÑÑSRS’HS‘“×H\™Ù]‰Û[Ù[˜[Y_HˆÝXØÙ\ÜÙ[HÛÛ\]Y›ØÙ\ÜÚ[™Ë˜
+NÂˆ™]\›ˆ™\ÜÛœÙNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÝ\ÙÈH\œË›Y\ÜØYÙHÝš[™Ê\œŠNÂˆÛÛœÝ\Õ˜[œÚY[H\ÙËš[˜ÛY\ÊLÈŠH\ÙËš[˜ÛY\Ê•SURSP“HŠH\ÙËš[˜ÛY\Ê™[X[™ŠH\ÙËš[˜ÛY\Ê[\Ü˜\žHŠNÂˆˆËÈØ[š]^™HHÙÙÙYY\ÜØYÙHÈ]›ÚYÝ]][™È˜]È	Ù\œ›Ü‰È”ÓÓˆÝš[™ÜÈÜˆHÛÜ™	Ù\œ›Ü‰ÂˆËÈÚXÚšYÙÙ\œÈ]›Ü›H[\ØØ[›™\œÈÛˆX[H™]žHXÝ[ÛœË‚ˆÛÛœÝÛX[“\ÙÈH\ÙÂˆœ™\XÙJÙ\œ›Ü‹ÙÚKœÝ]\×Ù]Z[ŠBˆœÝXœÝš[™ÊML
+NÂˆˆÛÛœÛÛK›ÙÊÑÑSRS’HS‘“×H\™Ù]‰Û[Ù[˜[Y_Hˆ˜[œØXÝ[ÛˆÝ]\ÎˆY™\œ™Y
+][\	Ø][\KÉÛX^][\ßJKˆY\ÜØYÙH^[ØYˆ	ØÛX[“\ÙßX
+NÂˆˆYˆ
+][\OOHX^][\ÊHÂˆ›ÝÈ\œŽÂˆBˆˆËÈY˜[™ÛHš]\ˆÈ[^HÈ™]™[H[™\š[™È\™›Ø›[BˆÛÛœÝš]\ˆHX]™›ÛÜŠX]œ˜[™ÛJ
+H
+ˆŒ
+NÂˆÛÛœÝ[^U[YHH
+\Õ˜[œÚY[ÈÝ\œ™[[^HˆL
+H
+Èš]\ŽÂˆ]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™HOˆÙ][Y[Ý]
+™\ÛÛ™K[^U[YJJNÂˆÝ\œ™[[^H
+HKNÈˆBˆBˆNÂ‚ˆžHÂˆ™]\›ˆ]ØZ]]Y\žUÚ]™]šY\Êš[X\žS[Ù[ËŒ
+NÂˆHØ]Ú
+š[X\žQ^Ù\[ÛŠHÂˆÛÛœÛÛK›ÙÊÑÑSRS’HS‘“×H›Ý][™È\ÚÈ^XÝ][ÛˆÈÙXÛÛ™\žH\[[™Nˆ‰Ø˜XÚÝ\[Ù[H˜
+NÂˆžHÂˆ™]\›ˆ]ØZ]]Y\žUÚ]™]šY\Ê˜XÚÝ\[Ù[‹L
+NÂˆHØ]Ú
+ÙXÛÛ™\žQ^Ù\[ÛŠHÂˆÛÛœÛÛK›ÙÊÑÑSRS’HS‘“×H[™Y^Ù\[Ûˆ]ÙXÛÛ™\žH[Ù[]Ø^HÛÛ\][Û‹˜
+NÂˆ›ÝÈš[X\žQ^Ù\[ÛŽÈˆBˆBŸB‚˜ÛÛœÝ\H^™\ÜÊ
+NÂ˜\\ÙJ^™\ÜËšœÛÛŠ
+JNÂ‚˜ÛÛœÝÝ\X˜\ÙU\›H›ØÙ\ÜË™[‹”ÕTPTÑWÕT“Ëš[J
+NÂ˜ÛÛœÝÝ\X˜\ÙTÙ\™\’Ù^HH
+›ØÙ\ÜË™[‹”ÕTPTÑWÔÑPÔ‘UÒÑVH›ØÙ\ÜË™[‹”ÕTPTÑWÔÑT•’PÑWÔ“ÓWÒÑVJOËš[J
+NÂ‚šYˆ
+\Ý\X˜\ÙU\›\Ý\X˜\ÙTÙ\™\’Ù^JHÂˆÛÛœÛÛKØ\›Š	ÖÔÔTÑPÕT’UWHÙ\™\‹\ÚYHÝ\X˜\ÙHÛÛ™šYÝ\˜][Ûˆ\È[˜ÛÛ\]K‰ÊNÂŸB‚˜ÛÛœÝÝ\X˜\ÙTÙ\™\ˆHÜ™X]TÝ\X˜\ÙPÛY[
+ˆÝ\X˜\ÙU\›	ÚÎ‹ËÚ[˜[YœÝ\X˜\ÙK˜ÛÉËˆÝ\X˜\ÙTÙ\™\’Ù^H	ÛZ\ÜÚ[™Ë\Ù\™\‹ZÙ^IËˆÈ]]ˆÈ\œÚ\ÝÙ\ÜÚ[ÛŽˆ˜[ÙK]]Ô™Yœ™\ÚÚÙ[Žˆ˜[ÙHHBŠNÂ‚‹ËÈ™YÚ\Ý˜][Ûˆ\È™YÚ\Ý\™Y™Y›Ü™HH]][XØ][ÛˆZY]Ø\™H™XØ]\ÙH]Ü™X]\Â‹ËÈHS‘S‘ÈXØÛÝ[[™™]™\ˆ™]\›œÈHÚYÛ™YZ[ˆÙ\ÜÚ[Û‹‚œ™YÚ\Ý\”X›XÐ]]›Ý]\Ê\Ý\X˜\ÙTÙ\™\ŠNÂ‚˜ÛÛœÝP“P×ÐTWÔUÈH™]ÈÙ]
+Âˆ	ËØ\KØ]]ØÛÛ™šYÉËˆ	ËØ\KØ]]ÛÙÚ[‰Ëˆ	ËØ\KØ]]Ü™YÚ\Ý\‰Ëˆ	ËØ\KØ]]Ý™\šYžIËˆ	ËØ\KØ]]Ù›Ü™ÛÝ\\ÜÝÛÜ™	Ëˆ	ËØ\KØ]]Ü™\Ù]\\ÜÝÛÜ™	Ëˆ	ËØ\KØœ˜[™[™ÉÂ—JNÂ‚˜\\ÙJ\Þ[˜È
+™\K™\Ë™^
+HOˆÂˆYˆ
+\™\Kœ]œÝ\ÕÚ]
+	ËØ\IÊJH™]\›ˆ™^
+
+NÂˆYˆ
+P“P×ÐTWÔUËš\Ê™\Kœ]
+JH™]\›ˆ™^
+
+NÂ‚ˆÛÛœÝ]]Üš^˜][ÛˆH™\KšXY\œË˜]]Üš^˜][Ûˆ	ÉÎÂˆYˆ
+X]]Üš^˜][Û‹œÝ\ÕÚ]
+	Ð™X\™\ˆ	ÊJHÂˆ™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆ	Ð]][XØ][Ûˆ™\]Z\™Y‰ÈJNÂˆB‚ˆÛÛœÝÚÙ[ˆH]]Üš^˜][Û‹œÛXÙJÊKš[J
+NÂˆYˆ
+]ÚÙ[ŠH™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆ	Ð]][XØ][Ûˆ™\]Z\™Y‰ÈJNÂ‚ˆžHÂˆÛÛœÝÈ]Nˆ]]]K\œ›ÜŽˆ]]\œ›ÜˆHH]ØZ]Ý\X˜\ÙTÙ\™\‹˜]]™Ù]\Ù\ŠÚÙ[ŠNÂˆÛÛœÝ]]\Ù\ˆH]]]OË\Ù\ŽÂˆYˆ
+]]\œ›ÜˆX]]\Ù\ËšYX]]\Ù\‹™[XZ[
+HÂˆ™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆ	Ö[Ý\ˆÙ\ÜÚ[Ûˆ\È[˜[YÜˆ\È^\™Y‰ÈJNÂˆB‚ˆÛÛœÝ[XZ[H]]\Ù\‹™[XZ[š[J
+KÓÝÙ\Ø\ÙJ
+NÂˆYˆ
+Z\Õ˜[YØÛQ[XZ[
+[XZ[
+JHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆ	ÔÔTXØÙ\ÜÈ™\]Z\™\È[ˆÐÓHØ\][ÛÜœÜ˜]H[XZ[‰ÈJNÂˆB‚ˆÛÛœÝÈ]Nˆ›Ùš[K\œ›ÜŽˆ›Ùš[Q\œ›ÜˆHH]ØZ]Ý\X˜\ÙTÙ\™\‚ˆ™œ›ÛJ	Ü›Ùš[\ÉÊBˆœÙ[XÝ
+	ÚY[Û˜[YK[XZ[\›Z\ÜÚ[Û—Û]™[›Ø—Ý]K\\Y[Ý]\Ë]˜]\—Ý\›	ÊBˆ™\J	ÚY	Ë]]\Ù\‹šY
+BˆœÚ[™ÛJ
+NÂ‚ˆYˆ
+›Ùš[Q\œ›Üˆ\›Ùš[JHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆ	Ö[Ý\ˆÔT›Ùš[H\È[˜]˜Z[X›KˆÛÛXÝ[ˆYZ[š\Ý˜]Ü‹‰ÈJNÂˆB‚ˆYˆ
+›Ùš[KœÝ]\ÈOOH	ÐPÕU‘IÊHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÂˆ\œ›ÜŽˆ›Ùš[KœÝ]\ÈOOH	ÔS‘S‘ÉÂˆÈ	Ö[Ý\ˆÔTXØÙ\ÜÈ™\]Y\Ý\È[™[™ÈYZ[š\Ý˜]Üˆ\›Ý˜[‰Âˆˆ[Ý\ˆÔTXØÛÝ[\È	ÔÝš[™Ê›Ùš[KœÝ]\ÊKÓÝÙ\Ø\ÙJ
+_KˆÛÛXÝ[ˆYZ[š\Ý˜]Ü‹˜ˆJNÂˆB‚ˆÛÛœÝ\›Z\ÜÚ[Û“]™[H›Ùš[Kœ\›Z\ÜÚ[Û—Û]™[ÂˆÛÛœÝ\ÔÝ\\YZ[ˆH\›Z\ÜÚ[Û“]™[OOH	ÔÕTT—ÐQRS‰ÎÂˆÛÛœÝ\ÐYZ[ˆH\ÔÝ\\YZ[ˆ\›Z\ÜÚ[Û“]™[OOH	ÒÑÐQRS‰ÎÂˆÛÛœÝYØXÞT›ÛHH\ÔÝ\\YZ[ˆÈ	ÔÕTT—ÐQRS‰Èˆ\›Z\ÜÚ[Û“]™[OOH	ÒÑÐQRS‰ÈÈ	ÐYZ[‰Èˆ	Ð\Ú[™\ÜÈ]™[ÜY[Ù™šXÙ\‰ÎÂ‚ˆËÈY[]H\ÈÛÝ\˜ÙYœ›ÛHHPÕU‘HÝ\X˜\ÙH›Ùš[HX›Ý™KˆH\ÙHPˆ›Ùš[BˆËÈšYÙÙ\ˆÝÛœÈYØXÞH\Ù\œËY\™XÝÜžHÞ[˜Ú›Ûš^˜][Û‹ÛÈ]][XØ][Ûˆ™]™\ˆØZ]ÂˆËÈ›ÜˆHÙ\\˜]H\™XÝÜÝÜ™TÔSÛÛ›™XÝ[Û‹‚‚ˆ
+™\H\È[žJK\Ù\ˆHÂˆ\Ù\’Yˆ]]\Ù\‹šYˆ[XZ[ˆ›ÛNˆYØXÞT›ÛKˆ\›Z\ÜÚ[Û“]™[ˆ\ÐYZ[‹ˆ\ÔÝ\\YZ[‹ˆÝ]\Îˆ	ÐPÕU‘IËˆ[˜[YNˆ›Ùš[K™[Û˜[YKˆ\\Y[ˆ›Ùš[K™\\Y[	Ð\ÜÙ]X[˜YÙ[Y[	Ëˆ]˜]\•\›ˆ›Ùš[K˜]˜]\—Ý\›	ÉÂˆNÂ‚ˆYˆ
+™\Kœ]OOH	ËØ\KØ]]ÛYIÊHÂˆ]ØZ]Ý\X˜\ÙTÙ\™\‹™œ›ÛJ	Ü›Ùš[\ÉÊK\]JÈ\ÝÛÙÚ[—Ø]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+HJK™\J	ÚY	Ë]]\Ù\‹šY
+NÂˆ™]\›ˆ™\ËšœÛÛŠÂˆ\Ù\ŽˆÂˆYˆ]]\Ù\‹šYˆ[˜[YNˆ›Ùš[K™[Û˜[YKˆ[XZ[ˆ›ÛNˆYØXÞT›ÛKˆ\›Z\ÜÚ[Û“]™[ˆ\\Y[ˆ›Ùš[K™\\Y[	Ð\ÜÙ]X[˜YÙ[Y[	Ëˆ]˜]\•\›ˆ›Ùš[K˜]˜]\—Ý\›	ÉËˆÝ]\Îˆ	ÐXÝ]™IËˆ™\šYšYYˆYBˆBˆJNÂˆB‚ˆ™]\›ˆ™^
+
+NÂˆHØ]Ú
+\œ›ÜŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ	ÖÔÔTÑPÕT’UWH]][XØ][ÛˆZY]Ø\™H˜Z[\™N‰Ë\œ›ÜË›Y\ÜØYÙH\œ›ÜŠNÂˆ™]\›ˆ™\ËœÝ]\ÊLÊKšœÛÛŠÈ\œ›ÜŽˆ	Ð]][XØ][ÛˆÙ\šXÙH\È[\Ü˜\š[H[˜]˜Z[X›K‰ÈJNÂˆBŸJNÂ‚‹ËÈ\ÙHˆY[]KYZ[š\Ý˜][Ûˆ[™™\Ü[™È›Ý]\È\ÙHH\ÝYÝ\X˜\ÙB‹ËÈÙ\™\ˆÛY[[™\™H™YÚ\Ý\™Y™Y›Ü™HHYØXÞHÜÝÜ™TÔSX[Ø]K‚œ™YÚ\Ý\”\ÙL”›Ý]\Ê\Ý\X˜\ÙTÙ\™\ŠNÂœ™YÚ\Ý\”\ÙL•ÙYZÛT›Ý]\Ê\Ý\X˜\ÙTÙ\™\ŠNÂ‹ËÈ\ÙHÈÛÜ™HÔ“H›Ý]\È[ÛÈ[ˆÛˆHØ[›ÛšXØ[Ý\X˜\ÙH]H[™K™Y›Ü™B‹ËÈHYØXÞH\™XÝTÜÝÜ™TÔSX[Ø]K‚œ™YÚ\Ý\”\ÙLÔ›Ý]\Ê\Ý\X˜\ÙTÙ\™\ŠNÂœ™YÚ\Ý\”\ÙLÐÜY›Ý]\Ê\Ý\X˜\ÙTÙ\™\ŠNÂœ™YÚ\Ý\”\ÙMÔ›Ý]\Ê\Ý\X˜\ÙTÙ\™\ŠNÂ‚˜ÛÛœÝÔ•H[X™\Š›ØÙ\ÜË™[‹”Ô•Ì
+NÂ‚‹ËÈTH“ÕUTÂ‚›]\Ñ]X˜\ÙRX[HH˜[ÙNÂ‚˜\\ÙJ	ËØ\IË
+™\K™\Ë™^
+HOˆÂˆËÈ]][XØ][Û‹Ý\X˜\ÙKX˜XÚÙYÔ“KØYZ[ˆ›Ý]\È[™Ý][\ÜÈ™\ÙX\˜Ú[™Ú[ÂˆËÈÈ›Ý\[™ÛˆHYØXÞH\™XÝÜÝÜ™TÔSÛÛˆ^H™[XZ[ˆ›ÝXÝYžHBˆËÈÝ\X˜\ÙH™X\™\‹]ÚÙ[ˆZY]Ø\™H™YÚ\Ý\™YX›Ý™H\ÈØ]K‚ˆÛÛœÝ]X˜\ÙR[™\[™[™Yš^\ÈHÂˆ	ËØ]]ÉËˆ	ËØYZ[‹ÉËˆ	ËØÜ›KÉËˆ	ËÝÙYZÛK\™\ÜÉËˆ	ËØØ[\ZYÛœÉËˆ	ËØÛY[LÍŒ	Ëˆ	ËØ\ÛËÉËˆ	ËÙÙ[Z[šKÉËˆ	ËÜÙ\™[˜KÉËˆNÂˆYˆ
+]X˜\ÙR[™\[™[™Yš^\ËœÛÛYJ
+™Yš^
+HOˆ™\Kœ]œÝ\ÕÚ]
+™Yš^
+JJH™]\›ˆ™^
+
+NÂ‚ˆYˆ
+›ØÙ\ÜË™[‹““ÑWÑS•ˆOOH	Ü›ÙXÝ[Û‰È	‰ˆZ\Ñ]X˜\ÙRX[JHÂˆ™]\›ˆ™\ËœÝ]\ÊLÊKšœÛÛŠÂˆ\œ›ÜŽˆ	Õ\ÈYØXÞH]HÙ\šXÙH\È[\Ü˜\š[H[˜]˜Z[X›Kˆ[Ý\ˆ]][XØ]YÔTÙ\ÜÚ[Ûˆ™[XZ[œÈXÝ]™K‰ËˆÛÙNˆ	ÓQÐPÖWÑUPTÑWÕSURSP“IËˆJNÂˆBˆ™]\›ˆ™^
+
+NÂŸJNÂ‚˜\Þ[˜È[˜Ý[ÛˆÙYYY˜][YZ[œÊ
+HÂˆËÈ]][XØ][ÛˆY[]Y\È\™HÜ™X]YÛ›H[ˆÝ\X˜\ÙH]]ˆ›ÈY˜][\Ù\œÈÜˆ\ÜÝÛÜ™È\™HÙYYY‚ˆ™]\›ŽÂŸB‚‹ËÈ[‹SY[[ÜžHÛÜšÜÜXÙHÝÜ˜YÙH˜[˜XÚÜÂ™^Ü]•ÛÜšÜÜXÙ\Îˆ[žV×HH×NÂ™^Ü]•ÛÜšÜÜXÙS›Ý\Îˆ[žV×HH×NÂ™^Ü]•ÛÜšÜÜXÙT›ÜÜØ[Îˆ[žV×HH×NÂ™^Ü]•ÛÜšÜÜXÙT™\Ù[][ÛœÎˆ[žV×HH×NÂ™^Ü]•ÛÜšÜÜXÙPZPÛÛ™\œØ][ÛœÎˆ[žV×HH×NÂ™^Ü]•ÛÜšÜÜXÙTÙX\˜Ú\ÝÜžNˆ[žV×HH×NÂ™^Ü]ZTÙX\˜Ú\ÝÜžNˆ[žV×HH×NÂ‚‹ËÈÛØ˜[RH[\˜XÝ[ÛˆÙÙÙ\‚™^Ü\Þ[˜È[˜Ý[ÛˆÙÐZR[\˜XÝ[ÛŠˆ™\Nˆ[žKˆ\˜[\ÎˆÂˆÙX\˜Ú]Y\žNˆÝš[™ÎÂˆÙX\˜Ú\NˆÝš[™ÎÂˆÛÛ\[žS˜[YOÎˆÝš[™È[ÂˆÛÜšÜÜXÙRYÎˆÝš[™È[Âˆ[Ù[\ÙYÎˆÝš[™È[ÂˆÚÙ[œÐÛÛœÝ[YYÎˆ[X™\ŽÂˆ\Ý[X]YÛÜÝÎˆ[X™\ŽÂˆ™\ÜÛœÙU[YOÎˆ[X™\ŽÂˆÙX\˜Ú™\Ý[ÎˆÝš[™È[ÂˆÝ]\ÏÎˆÝš[™ÎÂˆBŠHÂˆÛÛœÝÈ\Ù\’Y[XZ[HHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ŽÈËÈÝšXÝ›ÛH\ÛÛ][Ûˆ[™XØÙ\ÜÈÝX\™‚ˆ]\Ù\“˜[YHH•\Ù\ˆŽÂˆžHÂˆÛÛœÝÛÛ™][ÛˆH\Ù\’YÈ\J\Ù\œËšY\Ù\’Y
+Hˆ\J\Ù\œË™[XZ[[XZ[ÓÝÙ\Ø\ÙJ
+JNÂˆÛÛœÝÕ\Ù\œÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\Ù\œÊKÚ\™JÛÛ™][ÛŠNÂˆYˆ
+Õ\Ù\œË›[™Ýˆ
+HÂˆ\Ù\“˜[YHHÕ\Ù\œÖÌK™[˜[YNÂˆH[ÙHYˆ
+[XZ[
+HÂˆ\Ù\“˜[YHH[XZ[œÜ]
+	Ð	ÊVÌNÂˆBˆHØ]Ú
+\œŠHÂˆYˆ
+[XZ[
+H\Ù\“˜[YHH[XZ[œÜ]
+	Ð	ÊVÌNÂˆB‚ˆÛÛœÝ[žRYHZKZ\ÝIÑ]K››ÝÊ
+_KIÓX]™›ÛÜŠX]œ˜[™ÛJ
+H
+ˆL
+_XÂˆÛÛœÝ[Y\Ý[\H™]È]J
+KÒTÓÔÝš[™Ê
+NÂˆÛÛœÝš[˜[Ý]\ÈH\˜[\ËœÝ]\È	ÔÝXØÙ\ÜÉÎÂ‚ˆÛÛœÝÚÙ[œÈH\˜[\ËÚÙ[œÐÛÛœÝ[YYÂˆÛÛœÝÛÜÝH\˜[\Ë™\Ý[X]YÛÜÝ
+ÚÙ[œÈ
+ˆŒMJNÂ‚ˆÛÛœÝÙÑ[žHHÂˆYˆ[žRYˆ\Ù\’Yˆ\Ù\’Yˆ\Ù\“˜[YNˆ\Ù\“˜[YKˆ\Ù\‘[XZ[ˆ[XZ[[šÛ›ÝÛØÛXØ\][™Ë˜ÛÛH‹ˆÛÛ\[žS˜[YNˆ\˜[\Ë˜ÛÛ\[žS˜[YH[ˆÙX\˜Ú]Y\žNˆ\˜[\ËœÙX\˜Ú]Y\žKˆÙX\˜Ú\Nˆ\˜[\ËœÙX\˜Ú\Kˆ[Y\Ý[\ˆ[Y\Ý[\ˆ[Ù[\ÙYˆ\˜[\Ë›[Ù[\ÙY[ˆÚÙ[œÐÛÛœÝ[YYˆÚÙ[œËˆ\Ý[X]YÛÜÝˆ\œÙQ›Ø]
+ÛÜÝÑš^Y
+ŠJKˆ™\ÜÛœÙU[YNˆ\˜[\Ëœ™\ÜÛœÙU[YHˆÛÜšÜÜXÙRYˆ\˜[\ËÛÜšÜÜXÙRY[ˆÙX\˜Ú™\Ý[ˆ\˜[\ËœÙX\˜Ú™\Ý[È\˜[\ËœÙX\˜Ú™\Ý[œÝXœÝš[™ÊL
+Hˆ[ˆÝ]\Îˆš[˜[Ý]\ËˆNÂ‚ˆžHÂˆ]ØZ]‹š[œÙ\
+ZTÙX\˜Ú\ÝÜžJK˜[Y\ÊÙÑ[žJNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWH˜Z[YÈ\œÚ\ÝZWÜÙX\˜ÚÚ\ÝÜžNˆ‹\œ‹›Y\ÜØYÙH\œŠNÂˆBŸB‚‹ËÈOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOB‹ËÈQUSÑQQQ‘UÔÈT•PÓTÈ“Ôˆ’QÑT’PSˆÓÔ”ÔUTÂ‹ËÈOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOB™^ÜÛÛœÝY˜][™]ÜÐ\XÛ\Îˆ[žV×HH×NÂ‚‹ËÈ\Þ[˜Ú›Û›Ý\ÛHÚXÚÈ]X˜\ÙHX[]›ÛÝÈ]›ÚY™\]Y\ÝÈ›ØÚÚ[™Â˜\Þ[˜È[˜Ý[ÛˆÚXÚÑ]X˜\ÙRX[
+
+HÂˆ][\ÛÛÂˆ][\ÛY[ÂˆžHÂˆ[\ÛÛHÜ™X]TÛÛ
+
+NÂˆ[\ÛY[H]ØZ][\ÛÛ˜ÛÛ›™XÝ
+
+NÂˆ]ØZ][\ÛY[œ]Y\žJ”ÑSPÕNÈŠNÂˆˆ\Ñ]X˜\ÙRX[HHYNÂˆÛÛœÛÛK›ÙÊ–ÔÐÓHUPTÑWHÝ\X˜\ÙHÜÝÜ™TÔS]X˜\ÙHÛÛ›™XÝ[Ûˆ™\šYšYY	ˆX[KˆŠNÂ‚ˆËÈ][\X›HØÚ[XH™\šYšXØ][ÛœÈYˆ\›Z]YˆžHÂˆ]ØZ][\ÛY[œ]Y\žJˆÔ‘PUHP“HQˆ“ÕVTÕÈ››ÝYšXØ][ÛœÈˆ
+ˆšYˆ^’SPT–HÑVH“Õ•Sˆ\Ù\—ÚYˆ^‘Q‘T‘SÑTÈ\Ù\œÈŠšYŠHÓˆSUHÐTÐÐQKˆ\Hˆ^“Õ•Sˆ]Hˆ^“Õ•Sˆ›Y\ÜØYÙHˆ^“Õ•Sˆ[Y\Ý[\ˆ^“Õ•Sˆš\×Ü™XYˆ›ÛÛX[ˆQUS˜[ÙH“Õ•Sˆ˜Ø]YÛÜžHˆ^ˆœš[Üš]Hˆ^ˆš\×ÛYØXÞHˆ›ÛÛX[ˆQUS˜[ÙKˆ˜Ü™X]YØ]ˆ^ˆœ™XYÜÝ]\Èˆ^QUS	Ý[œ™XY	Âˆ
+NÂˆ
+NÂˆˆ]ØZ][\ÛY[œ]Y\žJˆSTˆP“H˜]Y]ÛÙÜÈˆQÓÓSSˆQˆ“ÕVTÕÈ\Ù\—ÚYˆ^ÂˆSTˆP“H˜]Y]ÛÙÜÈˆQÓÓSSˆQˆ“ÕVTÕÈ\Ù\—Ù[XZ[ˆ^Âˆ
+NÂ‚ˆ]ØZ][\ÛY[œ]Y\žJˆÔ‘PUHP“HQˆ“ÕVTÕÈ™\ØÛÝ™\žWÜÙ\ÜÚ[ÛœÈˆ
+ˆšYˆ^’SPT–HÑVH“Õ•Sˆ\Ù\—ÚYˆ^“Õ•Sˆ\Ù\—Ù[XZ[ˆ^ˆœÛÝ\˜ÙHˆ^“Õ•Sˆš[™\ÝžHˆ^“Õ•Sˆ›ØØ][Ûˆˆ^“Õ•SˆœÚ^™WÝY\ˆˆ^“Õ•Sˆœ™]™[YWÜ˜[™ÙHˆ^“Õ•Sˆ\™Ù]Ü›ÙXÝˆ^“Õ•Sˆ™]˜[ØÛÝ[ˆ[YÙ\ˆQUS“Õ•Sˆœ™X×ØÛÝ[ˆ[YÙ\ˆQUS“Õ•SˆœØ]™YØÛÝ[ˆ[YÙ\ˆQUS“Õ•Sˆ˜Ü™X]YØ]ˆ^“Õ•Sˆ
+NÂ‚ˆSTˆP“H™\ØÛÝ™\™YÛXYÈˆQÓÓSSˆQˆ“ÕVTÕÈ˜ÛÛ™šY[˜ÙWÜØÛÜ™Hˆ[YÙ\ˆQUSNÂˆSTˆP“H™\ØÛÝ™\™YÛXYÈˆQÓÓSSˆQˆ“ÕVTÕÈ˜\Ú[™\Ü×Ùš]ˆ^QUS	ÒYÚš]	ÎÂˆSTˆP“H™\ØÛÝ™\™YÛXYÈˆQÓÓSSˆQˆ“ÕVTÕÈ™X\Ý\žWÜÝ[X[ˆ^ÂˆSTˆP“H™\ØÛÝ™\™YÛXYÈˆQÓÓSSˆQˆ“ÕVTÕÈ™\Ý[X]YÜ™]™[YWÝ˜[YHˆšYÚ[QUSLÂˆSTˆP“H™\ØÛÝ™\™YÛXYÈˆQÓÓSSˆQˆ“ÕVTÕÈœ™XÛÛ[Y[™YÜ›ÙXÝÈˆœÛÛ˜ŽÂˆSTˆP“H™\ØÛÝ™\™YÛXYÈˆQÓÓSSˆQˆ“ÕVTÕÈ™XÚ\Ú[Û—ÛXZÙ\œÈˆœÛÛ˜ŽÂˆSTˆP“H™\ØÛÝ™\™YÛXYÈˆQÓÓSSˆQˆ“ÕVTÕÈ›]\ÝÛ™]ÜÈˆ^ÂˆSTˆP“H™\ØÛÝ™\™YÛXYÈˆQÓÓSSˆQˆ“ÕVTÕÈœÛÝ\˜ÙHˆ^ÂˆSTˆP“H™\ØÛÝ™\™YÛXYÈˆQÓÓSSˆQˆ“ÕVTÕÈœ™]™[YWÜ˜[™ÙHˆ^ÂˆSTˆP“H™\ØÛÝ™\™YÛXYÈˆQÓÓSSˆQˆ“ÕVTÕÈ˜Ü™X]YØ]ˆ^Âˆ
+NÂˆHØ]Ú
+ØÚ[XQ\œŽˆ[žJHÂˆÛÛœÛÛK›ÙÊ–ÔÐÓHUPTÑWH›ÝNˆ›ÛÝ™\šYšXØ][ÛˆÚÚ\Y
+X›\ÈX[˜YÙYšXHZYÜ˜][ÛœÊNˆ‹ØÚ[XQ\œ‹›Y\ÜØYÙJNÂˆB‚ˆ]ØZ]ÙYYY˜][YZ[œÊ
+NÂˆHØ]Ú
+\œŽˆ[žJHÂˆ\Ñ]X˜\ÙRX[HH˜[ÙNÂˆÛÛœÛÛK›ÙÊ–ÔÐÓHUPTÑH“ÕPÑWH\™XÝÜÝÜ™TÔSÛÛ›™XÝ[Ûˆ[˜]˜Z[X›NÈÔ“H]H›Ý]\È™[XZ[ˆ˜Z[XÛÜÙYˆ‹\œ‹›Y\ÜØYÙJNÂˆHš[˜[HÂˆYˆ
+[\ÛY[
+H[\ÛY[œ™[X\ÙJ
+NÂˆYˆ
+[\ÛÛ
+H]ØZ][\ÛÛ™[™
+
+NÂˆBŸB˜ÚXÚÑ]X˜\ÙRX[
+
+NÂœÙ][\˜[
+ÚXÚÑ]X˜\ÙRX[Ì
+NÂ‚‹ËÈUUS•PÐUSÓ‚‚˜\™Ù]
+	ËØ\KØ]]ØÛÛ™šYÉË
+Ü™\K™\ÊHOˆÂˆ™]\›ˆ™\ËšœÛÛŠÂˆ›ÝšY\Žˆ	ÜÝ\X˜\ÙIËˆÛÜœÜ˜]QÛXZ[Žˆ	ÜØÛXØ\][™Ë˜ÛÛIËˆ[[Ó[ÙNˆ˜[ÙBˆJNÂŸJNÂ‚˜\œÜÝ
+	ËØ\KØ]]ÛÙÛÝ]	Ë\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈ\Ù\’YHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+\Ù\’Y
+H]ØZ]ÙÔÞ\Ý[Q]™[
+	Õ\Ù\ˆÙÛÝ]	Ë\Ù\’Y	ÔÝXØÙ\ÜÉË™\JNÂˆ™]\›ˆ™\ËšœÛÛŠÈÝXØÙ\ÜÎˆYHJNÂŸJNÂ‚˜ÛÛœÝ\™XØ]Y]][™\ˆH
+Ü™\Nˆ[žK™\Îˆ[žJHOˆ™\ËœÝ]\ÊL
+KšœÛÛŠÂˆ\œ›ÜŽˆ	Õ\ÈYØXÞHÜ™Y[X[[™Ú[\È™Y[ˆ\ØX›YˆÔT›ÝÈ\Ù\ÈÝ\X˜\ÙH]]‰ÂŸJNÂ˜\œÜÝ
+	ËØ\KØ]]ÛÙÚ[‰Ë\™XØ]Y]][™\ŠNÂ˜\œÜÝ
+	ËØ\KØ]]Ü™YÚ\Ý\‰Ë\™XØ]Y]][™\ŠNÂ˜\œÜÝ
+	ËØ\KØ]]Ý™\šYžIË\™XØ]Y]][™\ŠNÂ˜\œÜÝ
+	ËØ\KØ]]Ù›Ü™ÛÝ\\ÜÝÛÜ™	Ë\™XØ]Y]][™\ŠNÂ˜\œÜÝ
+	ËØ\KØ]]Ü™\Ù]\\ÜÝÛÜ™	Ë\™XØ]Y]][™\ŠNÂ‚‹ËÈÓÓÑÓHÓÔ’ÔÔPÑHTHS•QÔUSÓ”Â‚‹ËÈÙ[™H˜]È[XZ[šXHÛXZ[‘TÕTHÝ\ˆ[ˆ[‹X\Ú[][][Û‚˜\œÜÝ
+‹Ø\KÙÛXZ[ÜÙ[™‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈ\Ù\’YËÝXš™XÝ›ÙHHH™\K˜›ÙNÂˆYˆ
+]È\ÝXš™XÝX›ÙJHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆœ™XÚ\Y[
+ÊKÝXš™XÝ[™›ÙH\™H™\]Z\™YÈÙ[™[XZ[ËˆˆJNÂˆB‚ˆËÈÚXÚÈYˆÙH]™H[ˆXÝ]™HÛÛÙÛHÐ]]ÚÙ[ˆØXÚYÛˆÙ\™\ˆ›Üˆ\ÈÙ™šXÙ\ˆRQˆÛÛœÝÚÙ[ˆH\Ù\’YÈXÝ]™U\Ù\•ÚÙ[œË™Ù]
+\Ù\’Y
+Hˆ[ÂˆˆYˆ
+ÚÙ[ŠHÂˆžHÂˆËÈZ[RSQH^[ØYˆÛÛœÝÝˆHÂˆÎˆ	ÝßXˆÝXš™XÝˆ	ÜÝXš™XÝXˆÛÛ[U\Nˆ^ÜZ[ŽÈÚ\œÙ]H•U‹N˜ˆÛÛ[U˜[œÙ™\‹Q[˜ÛÙ[™ÎˆØš]ˆˆ‹ˆ›ÙBˆKš›Ú[Š——ˆŠNÂ‚ˆËÈÛXZ[‘TÕTH^XÝÈ˜\ÙM\›[˜ÛÙYRSQH˜]ÈY\ÜØYÙBˆÛÛœÝ˜]ÈHY™™\‹™œ›ÛJÝŠBˆÔÝš[™Ê˜˜\ÙMŠBˆœ™\XÙJ×
+ËÙË‹HŠBˆœ™\XÙJ×ËÙË—ÈŠBˆœ™\XÙJÏJÉËˆŠNÂ‚ˆÛÛœÝ™\ÜÛœÙHH]ØZ]™]Ú
+šÎ‹ËÙÛXZ[™ÛÛÙÛX\\Ë˜ÛÛKÙÛXZ[ÝŒKÝ\Ù\œËÛYKÛY\ÜØYÙ\ËÜÙ[™‹ÂˆY]Ùˆ”ÔÕ‹ˆXY\œÎˆÂˆ]]Üš^˜][ÛˆŽˆ™X\™\ˆ	ÝÚÙ[ŸXˆÛÛ[U\HŽˆ˜\XØ][Û‹ÚœÛÛˆ‚ˆKˆ›ÙNˆ”ÓÓ‹œÝš[™ÚYžJÈ˜]ÈJBˆJNÂ‚ˆYˆ
+\™\ÜÛœÙK›ÚÊHÂˆÛÛœÝ\œ•H]ØZ]™\ÜÛœÙK^
+
+NÂˆ›ÝÈ™]È\œ›ÜŠÛXZ[TH™\ÜÛœÙH\œ›ÜŽˆ	Ù\œ•X
+NÂˆB‚ˆÛÛœÛÛK›ÙÊÔÐÓHÓÔ’ÔÔPÑWH™X[Ý]™XXÚ[XZ[Ù[ÝXØÙ\ÜÙ[HšXHÛXZ[THÈ	ÝßX
+NÂˆ™]\›ˆ™\ËšœÛÛŠÈÝXØÙ\ÜÎˆYK[ÙNˆœ™X[ÙÛXZ[Ø\H‹Y\ÜØYÙNˆ‘[XZ[˜[œÛZ]YÝXØÙ\ÜÙ[HšXH[Ý\ˆÛÛ›™XÝYÛÛÙÛHXØÛÝ[ˆˆJNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛKØ\›ŠÔÐÓHÓÔ’ÔÔPÑHÐT“’S‘×HÛXZ[TH\Ü]Ú˜Z[YØ\ØØY[™ÈÝÛˆÈØØ[Ú[][][ÛŽ˜\œŠNÂˆBˆB‚ˆËÈ˜[˜XÚÈÈÝ[™\™Ú[][][ÛˆÙÈÙˆ[XZ[ˆÛÛœÛÛK›ÙÊÔÐÓHÕU“ÖÒSUSUSÓ—H
+›ÈÐ]]ÚÙ[‹Ù^\™Y
+Nˆ[XZ[È	ÝßKÝXš™XÝˆ‰ÜÝXš™XÝH˜
+NÂˆ™]\›ˆ™\ËšœÛÛŠÈÝXØÙ\ÜÎˆYK[ÙNˆœÚ[][]Y‹Y\ÜØYÙNˆ“Ù™šXÙH[XZ[›Ý]YšXHÐÓHÚ[][]YØ]]Ø^HÝXØÙ\ÜÙ[H
+ÛÛÙÛH]]\ØÛÛ›™XÝYÙ^\™Y
+KˆˆJNÂŸJNÂ‚‹ËÈ™]ÚÝ[™\™™XÙ[[˜›ÞY\ÜØYÙ\Â˜\™Ù]
+‹Ø\KÙÛXZ[ÛY\ÜØYÙ\È‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝ\Ù\’YH™\Kœ]Y\žK\Ù\’Y\ÈÝš[™ÎÂˆÛÛœÝÚÙ[ˆH\Ù\’YÈXÝ]™U\Ù\•ÚÙ[œË™Ù]
+\Ù\’Y
+Hˆ[Â‚ˆYˆ
+]ÚÙ[ŠHÂˆ™]\›ˆ™\ËšœÛÛŠÈÛÛ›™XÝYˆ˜[ÙKY\ÜØYÙ\Îˆ×HJNÂˆB‚ˆžHÂˆÛÛœÝ\Ý™\ÈH]ØZ]™]Ú
+šÎ‹ËÙÛXZ[™ÛÛÙÛX\\Ë˜ÛÛKÙÛXZ[ÝŒKÝ\Ù\œËÛYKÛY\ÜØYÙ\ÏÛX^™\Ý[ÏMH‹ÂˆXY\œÎˆÈ]]Üš^˜][ÛˆŽˆ™X\™\ˆ	ÝÚÙ[ŸXBˆJNÂˆYˆ
+[\Ý™\Ë›ÚÊH›ÝÈ™]È\œ›ÜŠÛÝ[›Ý\ÝÛÛÙÛHXZ[Y\ÜØYÙ\ËˆŠNÂˆÛÛœÝ\Ý]HH]ØZ]\Ý™\ËšœÛÛŠ
+NÂˆˆÛÛœÝY\ÜØYÙ\ÈH×NÂˆYˆ
+\Ý]K›Y\ÜØYÙ\È	‰ˆ\œ˜^Kš\Ð\œ˜^J\Ý]K›Y\ÜØYÙ\ÊJHÂˆ›Üˆ
+ÛÛœÝ\ÙÈÙˆ\Ý]K›Y\ÜØYÙ\ÊHÂˆÛÛœÝ]Z[™\ÈH]ØZ]™]Ú
+Î‹ËÙÛXZ[™ÛÛÙÛX\\Ë˜ÛÛKÙÛXZ[ÝŒKÝ\Ù\œËÛYKÛY\ÜØYÙ\ËÉÛ\ÙËšYXÂˆXY\œÎˆÈ]]Üš^˜][ÛˆŽˆ™X\™\ˆ	ÝÚÙ[ŸXBˆJNÂˆYˆ
+]Z[™\Ë›ÚÊHÂˆÛÛœÝ]Z[H]ØZ]]Z[™\ËšœÛÛŠ
+NÂˆÛÛœÝÝXš™XÝXY\ˆH]Z[œ^[ØYËšXY\œÏË™š[™
+
+ˆ[žJHOˆ›˜[YKÓÝÙ\Ø\ÙJ
+HOOHœÝXš™XÝŠNÂˆÛÛœÝœ›ÛRXY\ˆH]Z[œ^[ØYËšXY\œÏË™š[™
+
+ˆ[žJHOˆ›˜[YKÓÝÙ\Ø\ÙJ
+HOOH™œ›ÛHŠNÂˆY\ÜØYÙ\Ëœ\Ú
+ÂˆYˆ\ÙËšYˆÛš\]ˆ]Z[œÛš\]ˆÝXš™XÝˆÝXš™XÝXY\ˆÈÝXš™XÝXY\‹˜[YHˆ“›ÈÝXš™XÝ‹ˆœ›ÛNˆœ›ÛRXY\ˆÈœ›ÛRXY\‹˜[YHˆ•[šÛ›ÝÛˆÙ[™\ˆ‚ˆJNÂˆBˆBˆBˆ™]\›ˆ™\ËšœÛÛŠÈÛÛ›™XÝYˆYKY\ÜØYÙ\ÈJNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛKØ\›Š–ÔÐÓHÓÔ’ÔÔPÑHÐT“’S‘×H˜Z[YÈ™]šY]™H™X[ÛÛÙÛHY\ÜØYÙ\Îˆ‹\œŠNÂˆ™]\›ˆ™\ËšœÛÛŠÈÛÛ›™XÝYˆ˜[ÙKY\ÜØYÙ\Îˆ×K\œ›ÜŽˆ\œ‹›Y\ÜØYÙHJNÂˆBŸJNÂ‚‹ËÈTÒ“ÐT‘QU’PÔÂ˜\™Ù]
+‹Ø\KÙ\Ú›Ø\™ÛY]šXÜÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝXÝ]™TÝYÙ\ÈHÉÓXY	Ë	ÐÛÛXÝY	Ë	ÓYY][™ÈØÚY[Y	Ë	Ñš[˜[˜ÚX[]\˜XÞHÙ\ÜÚ[ÛˆØÚY[Y	Ë	Ô›ÜÜØ[Ù[	Ë	Ó™YÛÝX][Û‰×NÂˆˆžHÂˆÛÛœÝš[\™Y›ÜÜXÝÈH]ØZ]Ù]›ÜÜXÝÑ›Ü•\Ù\Š™\JNÂˆÛÛœÝš[\™YYY][™ÜÈH]ØZ]Ù]YY][™ÜÑ›Ü•\Ù\Š™\JNÂˆÛÛœÝš[\™YXÝ]š]Y\ÈH]ØZ]Ù]XÝ]š]Y\Ñ›Ü•\Ù\Š™\JNÂˆÛÛœÝš[\™Y\ÚÜÈH]ØZ]Ù]\ÚÜÑ›Ü•\Ù\Š™\JNÂ‚ˆÛÛœÝÝ[›ÜÜXÝÈHš[\™Y›ÜÜXÝË›[™ÝÂˆÛÛœÝXÝ]™SÜÜ[š]Y\ÈHš[\™Y›ÜÜXÝË™š[\ŠOˆXÝ]™TÝYÙ\Ëš[˜ÛY\ÊœÝ]\ÊJK›[™ÝÂˆÛÛœÝYY][™ÜÔØÚY[YHš[\™YYY][™ÜË›[™ÝÂˆˆËÈÛÝ[›ÛÝË]\ÈYHÜˆXÝ]™H\ÚÜÂˆÛÛœÝ›ÛÝÕ\ÑYHHš[\™Y\ÚÜË™š[\ŠOˆ]š\ÐÛÛ\]Y
+K›[™ÝÂˆÛÛœÝš[˜[˜ÚX[]\˜XÞTÙ\ÜÚ[ÛœÈHš[\™YXÝ]š]Y\Ë™š[\ŠHOˆK˜XÝ]š]U\HOOH	Ñš[˜[˜ÚX[]\˜XÞHÙ\ÜÚ[Û‰È	‰ˆKœÝ]\ÈOOH	ÐÛÛ\]Y	ÊK›[™ÝÂˆˆËÈÝ[USHÝ[X[\[[™H˜[YH
+^ÛY[™ÈÜÝØ\˜Ú]™Y
+BˆÛÛœÝÝ[\Ý[X]Y˜[YHHš[\™Y›ÜÜXÝÂˆ™š[\ŠOˆVÉÓÜÝ	Ë	Ð\˜Ú]™Y	×Kš[˜ÛY\ÊœÝ]\ÊJBˆœ™YXÙJ
+Ý[K
+HOˆÝ[H
+È
+›ÜÜ[š]U˜[YH
+K
+NÂ‚ˆ™\ËšœÛÛŠÂˆÝ[›ÜÜXÝËˆXÝ]™SÜÜ[š]Y\ËˆYY][™ÜÔØÚY[Yˆ›ÛÝÕ\ÑYKˆš[˜[˜ÚX[]\˜XÞTÙ\ÜÚ[ÛœËˆÝ[\Ý[X]Y˜[YBˆJNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWH\Ú›Ø\™Y]šXÜÈ^˜XÝ[Ûˆ˜Z[Yˆ‹\œŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈÛÛ\[HÛÜœÜ˜]H\Ú›Ø\™Y]šXÜËˆˆJNÂˆBŸJNÂ‚‹ËÈÔ•Q“ÔÔPÕÂ˜\™Ù]
+‹Ø\KÜ›ÜÜXÝÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈ\Ù\’YHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËšœÛÛŠ×JNÂ‚ˆžHÂˆÛÛœÝ\ÝH]ØZ]Ù]›ÜÜXÝÑ›Ü•\Ù\Š™\JNÂˆ™\ËšœÛÛŠ\Ý
+NÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWH›ÜÜXÝÈ]Y\žH˜Z[Yˆ‹\œŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ]Y\žH›ÜÜXÝ™YÚ\ÝžKˆˆJNÂˆBŸJNÂ‚˜\œÜÝ
+‹Ø\KÜ›ÜÜXÝÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝ]HH™\K˜›ÙNÂˆÛÛœÝÈ\Ù\’Y[XZ[HHÙ]™\]Y\Ý\Ù\Š™\JNÂ‚ˆËÈšY[]™[˜[Y][ÛœÂˆYˆ
+Y]K›˜[YHTÝš[™Ê]K›˜[YJKš[J
+JHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ“Ü™Ø[š^˜][Ûˆ˜[YH\È™\]Z\™YˆˆJNÂˆBˆYˆ
+Y]Kš[™\ÝžHTÝš[™Ê]Kš[™\ÝžJKš[J
+JHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ’[™\ÝžHÙXÝÜˆ\È™\]Z\™YˆˆJNÂˆBˆYˆ
+Y]K›ØØ][ÛˆTÝš[™Ê]K›ØØ][ÛŠKš[J
+JHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ’HØØ][ÛˆÚ]H\È™\]Z\™YˆˆJNÂˆBˆYˆ
+]K™[XZ[	‰ˆÝš[™Ê]K™[XZ[
+Kš[J
+H	‰ˆK×–×—ÐJÐ×—ÐJ×–×—ÐJÉË\Ý
+Ýš[™Ê]K™[XZ[
+Kš[J
+JJHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ“Ù™šXÚX[ÛÜœÜ˜]H[XZ[›Ü›X]\È[˜[YˆˆJNÂˆBˆYˆ
+]K›ÜÜ[š]U˜[YHOOH[™Yš[™Y	‰ˆ[X™\Š]K›ÜÜ[š]U˜[YJH
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ‘\Ý[X]YØ\][˜[YHØ[››Ý™H™YØ]]™KˆˆJNÂˆB‚ˆÛÛœÝš[[YY˜[YHHÝš[™Ê]K›˜[YJKš[J
+NÂ‚ˆžHÂˆËÈ[œÝ\™HÙ™šXÙ\ˆQ\È™\ÛÛ™YÈH˜[Y\Ù\ˆ[ˆH\Ù\œÈX›BˆÛÛœÝ˜[Y\Ù\ˆH]ØZ][œÝ\™U˜[Y\Ù\Šˆ]K˜\ÜÚYÛ™YÙ™šXÙ\’Y\Ù\’Yˆ]K˜\ÜÚYÛ™YÙ™šXÙ\‘[XZ[[XZ[ˆ]K˜\ÜÚYÛ™YÙ™šXÙ\“˜[YBˆ
+NÂ‚ˆËÈ\XØ]H]XÝ[Ûˆ
+Ø\ÙKZ[œÙ[œÚ]]™KØÛÜYÈ\ÜÚYÛ™YÙ™šXÙ\ˆÈÛÜšÜÜXÙHÝÛ™\œÚ\›Ý[™\žJBˆÛÛœÝ\XØ]HH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™Jˆ[™
+ˆÜ[ÕÑTŠ	Ü›ÜÜXÝË›˜[Y_JHHÕÑTŠ	Ýš[[YY˜[Y_JXˆ\J›ÜÜXÝË˜\ÜÚYÛ™YÙ™šXÙ\’Y˜[Y\Ù\‹šY
+Bˆ
+Bˆ
+NÂˆYˆ
+\XØ]K›[™Ýˆ
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ[ˆÜ™Ø[š^˜][Ûˆ˜[YY‰Ýš[[YY˜[Y_Hˆ[™XYH^\ÝÈ[™\ˆ[Ý\ˆ\ÜÚYÛ™Y›ÜÜXÝ\™XÝÜžK˜JNÂˆB‚ˆÛÛœÝ™]Ô›ÜÜXÝYH›ÜÜXÝIÑ]K››ÝÊ
+_XÂˆÛÛœÝ™]Ô›ÜÜXÝHÂˆYˆ™]Ô›ÜÜXÝYˆ˜[YNˆš[[YY˜[YKˆ[™\ÝžNˆÝš[™Ê]Kš[™\ÝžJKš[J
+KˆÜ™Õ\Nˆ]K›Ü™Õ\H”š]˜]HÛÜœÜ˜][Ûˆ‹ˆØØ][ÛŽˆÝš[™Ê]K›ØØ][ÛŠKš[J
+KˆÙXœÚ]Nˆ]KÙXœÚ]HÈÝš[™Ê]KÙXœÚ]JKš[J
+Hˆˆ‹ˆÛ™Nˆ]KœÛ™HÈÝš[™Ê]KœÛ™JKš[J
+Hˆˆ‹ˆ[XZ[ˆ]K™[XZ[ÈÝš[™Ê]K™[XZ[
+Kš[J
+Hˆˆ‹ˆÛÝ\˜ÙNˆ]KœÛÝ\˜ÙH‘\™XÝ›ÜÜXÝ[™È‹ˆ\ÜÚYÛ™YÙ™šXÙ\’Yˆ˜[Y\Ù\‹šYˆ\ÜÚYÛ™YÙ™šXÙ\“˜[YNˆ˜[Y\Ù\‹™[˜[YKˆÝ]\Îˆ]KœÝ]\È“XY‹ˆš[Üš]Nˆ]Kœš[Üš]H“YY][H‹ˆ›Ý\Îˆ]K››Ý\Èˆ‹ˆÛÛ™\œÚ[Û”›Ø˜Xš[]NˆX]›Z[ŠLX]›X^
+[X™\Š]K˜ÛÛ™\œÚ[Û”›Ø˜Xš[]JHŒ
+JKˆÜÜ[š]U˜[YNˆX]›X^
+[X™\Š]K›ÜÜ[š]U˜[YJH
+Kˆ™X\Ý\žTÝ[X[ˆ]K™X\Ý\žTÝ[X[]ØZ][™È[˜[\Ú\È‹ˆ[Y”Ý[X[ˆ]K›[Y”Ý[X[]ØZ][™È[˜[\Ú\È‹ˆÙX[Ý[X[ˆ]KÙX[Ý[X[]ØZ][™È[˜[\Ú\È‹ˆ]\˜XÞTÝ[X[ˆ]K›]\˜XÞTÝ[X[]ØZ][™È[˜[\Ú\È‹ˆÜÜ[š]TØÛÜ™Nˆ[X™\Š]K›ÜÜ[š]TØÛÜ™JHLˆš[X\žPÛÛXÝYˆ[ˆÜ™X]Y]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+Kˆ\]Y]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+BˆNÂ‚ˆÛÛœÝÛÜšÜÜXÙRYHÛÜšÜÜXÙKIÑ]K››ÝÊ
+_KIÓX]™›ÛÜŠX]œ˜[™ÛJ
+H
+ˆL
+_XÂˆÛÛœÝ™]ÕÛÜšÜÜXÙNˆ[žHHÂˆYˆÛÜšÜÜXÙRYˆ›ÜÜXÝYˆ™]Ô›ÜÜXÝYˆÝÛ™\•\Ù\’Yˆ˜[Y\Ù\‹šYˆÛÛ\[žS˜[YNˆš[[YY˜[YKˆÜ™X]Y]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+Kˆ\]Y]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+KˆÝ]\ÎˆXÝ]™H‹ˆ\ÛÑš[™[™ÜÎˆ\ÛÈÙX\˜Ú]]ÛX]XÈš[™[™ÜÎ—‹HXYÛÝ[Y\Žˆ\™ÙW‹H™YÚ\ÝžHÝ]\ÎˆXÝ]™W‹H™\šYšXØ][Ûˆ]™[ˆX\YÛˆÐÓHØ\][Ü[ˆÛÛ\[žT›Ùš[Nˆ]K››Ý\È”Ý˜]YÚXÈ[\œš\ÙHÜ›Û[Ëˆ‹ˆ[™\ÝžP[˜[\Ú\ÎˆšYÙ\šX[ˆ[™\ÝžHÙXÝÜŽˆ	Ù]Kš[™\Ýž_Kˆ]˜[X][ÛˆÛÛ™XÝYžHÐÓK˜ˆ^XÝ]]™R[œÚYÚÎˆÛÜœÜ˜]H™X\Ý\žHÙ™šXÙ\œÈ\™H]ØZ][™ÈX[X[Ô“H\ÜÚYÛ›Y[˜ˆ[™\ÝY[ÜÜ[š]Y\Îˆš^Y[˜ÛÛYHXÙ[Y[È	ˆ[Û™^HX\šÙ][™ÈÜÜ[š]HX\Y˜ˆ™\ÙX\˜ÚÝ[[X\šY\Îˆ™\ÙX\˜ÚÛÜšÜÜXÙH[š]X[^™Y›ÜˆÝ\ÝÛHYš\ÛÜžHÜÜÚY\œË˜ˆNÂ‚ˆ]ØZ]‹š[œÙ\
+›ÜÜXÝÊK˜[Y\Ê™]Ô›ÜÜXÝ
+NÂˆ]ØZ]‹š[œÙ\
+ÛÜšÜÜXÙ\ÊK˜[Y\Ê™]ÕÛÜšÜÜXÙJNÂ‚ˆËÈ]Y]Þ\Ý[H]™[ˆÙÔÞ\Ý[Q]™[
+ˆ“Ü™Ø[š^˜][ÛˆÜ™X]Y‹ˆš[[YY˜[YKˆ”ÝXØÙ\ÜÈ‹ˆ™\KˆÈ›ÜÜXÝYˆ™]Ô›ÜÜXÝY[™\ÝžNˆ]Kš[™\ÝžKÙ™šXÙ\’Yˆ˜[Y\Ù\‹šYBˆ
+NÂ‚ˆËÈšYÙÙ\ˆ]]ÛX]Y›ÝYšXØ][ÛœÂˆYˆ
+™]Ô›ÜÜXÝ˜\ÜÚYÛ™YÙ™šXÙ\’Y
+HÂˆÜ™X]S›ÝYšXØ][ÛŠˆ“™]È›ÜÜXÝ\ÜÚYÛ™YÈ\Ù\ˆ‹ˆ™]È›ÜÜXÝ\ÜÚYÛ™Yˆ	Û™]Ô›ÜÜXÝ›˜[Y_XˆHYÚ^ZY[›ÜÜXÝ‰Û™]Ô›ÜÜXÝ›˜[Y_Hˆ\È™Y[ˆ\ÜÚYÛ™YÈ[ÝH›ÜˆÛÜœÜ˜]HÙX[Yš\ÛÜžH[™USHXÜ]Z\Ú][Û‹˜ˆ[™Yš[™Yˆ™]Ô›ÜÜXÝ˜\ÜÚYÛ™YÙ™šXÙ\’Yˆ
+NÂ‚ˆÜ™X]S›ÝYšXØ][ÛŠˆ”›ÜÜXÝ\ÜÚYÛ™Y‹ˆ›ÜÜXÝ\ÜÚYÛ™Yˆ	Û™]Ô›ÜÜXÝ›˜[Y_XˆH›ÜÜXÝ‰Û™]Ô›ÜÜXÝ›˜[Y_Hˆ\È™Y[ˆ\ÜÚYÛ™YÈ[ÝK˜ˆ\ÜÚYÛ›Y[‹ˆ™]Ô›ÜÜXÝ˜\ÜÚYÛ™YÙ™šXÙ\’Yˆ
+NÂˆB‚ˆ™\ËœÝ]\ÊŒJKšœÛÛŠ™]Ô›ÜÜXÝ
+NÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWH[œÙ\›ÜÜXÝ˜Z[Yˆ‹ÂˆÛÙNˆ\œ‹˜ÛÙKˆY\ÜØYÙNˆ\œ‹›Y\ÜØYÙKˆÛÛœÝ˜Z[ˆ\œ‹˜ÛÛœÝ˜Z[ˆX›Nˆ\œ‹X›KˆÛÛ[[Žˆ\œ‹˜ÛÛ[[‹ˆ]Z[ˆ\œ‹™]Z[ˆ[ˆ\œ‹š[ˆJNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈˆ\œ›ÜŽˆ‘˜Z[YÈ\œÚ\ÝÜ™Ø[š^˜][Ûˆ[È\™XÝÜžNˆˆ
+È
+\œ‹™]Z[\œ‹›Y\ÜØYÙJKˆÛÙNˆ\œ‹˜ÛÙKˆÛÛœÝ˜Z[ˆ\œ‹˜ÛÛœÝ˜Z[ˆX›Nˆ\œ‹X›Kˆ]Z[ˆ\œ‹™]Z[ˆ[ˆ\œ‹š[ˆJNÂˆBŸJNÂ‚‹ËÈÝ\Ü›ÝU[™UÒ›ÜˆÙX[[\ÜÈÜ›ÜÜËXÛY[ÛÛœÝ[\[Û‚˜\œ]Ú
+‹Ø\KÜ›ÜÜXÝËÎšY‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂˆÛÛœÝ]HH™\K˜›ÙNÂ‚ˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆžHÂˆÛÛœÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™J\J›ÜÜXÝËšYY
+JNÂˆÛÛœÝ\™Ù]›ÜÜXÝH™]ÚYÌNÂˆYˆ
+]\™Ù]›ÜÜXÝ
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”›ÜÜXÝ›Ý›Ý[™ˆˆJNÂˆB‚ˆYˆ
+Z\ÐYZ[ˆ	‰ˆ\™Ù]›ÜÜXÝ˜\ÜÚYÛ™YÙ™šXÙ\’YOOH\Ù\’Y
+HÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆ[ÝHØ[ˆÛ›H[ÙYžH[Ý\ˆÝÛˆ›ÜÜXÝËˆˆJNÂˆB‚ˆYˆ
+]K›˜[YH	‰ˆÝš[™Ê]K›˜[YJKš[J
+H	‰ˆÝš[™Ê]K›˜[YJKš[J
+KÓÝÙ\Ø\ÙJ
+HOOH\™Ù]›ÜÜXÝ›˜[YKÓÝÙ\Ø\ÙJ
+JHÂˆÛÛœÝ™]Õš[[YY˜[YHHÝš[™Ê]K›˜[YJKš[J
+NÂˆÛÛœÝ\™Ù]Ù™šXÙ\’YH]K˜\ÜÚYÛ™YÙ™šXÙ\’Y\™Ù]›ÜÜXÝ˜\ÜÚYÛ™YÙ™šXÙ\’YÂˆÛÛœÝ\XØ]HH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™Jˆ[™
+ˆÜ[ÕÑTŠ	Ü›ÜÜXÝË›˜[Y_JHHÕÑTŠ	Û™]Õš[[YY˜[Y_JXˆ\J›ÜÜXÝË˜\ÜÚYÛ™YÙ™šXÙ\’Y\™Ù]Ù™šXÙ\’Y
+KˆÜ[	Ü›ÜÜXÝËšYHOH	ÚYXˆ
+Bˆ
+NÂˆYˆ
+\XØ]K›[™Ýˆ
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ[ˆÜ™Ø[š^˜][Ûˆ˜[YY‰Û™]Õš[[YY˜[Y_Hˆ[™XYH^\ÝÈ[™\ˆ[Ý\ˆ\ÜÚYÛ™Y›ÜÜXÝ\™XÝÜžK˜JNÂˆBˆB‚ˆ]Ù™šXÙ\“˜[YHH[™Yš[™YÂˆYˆ
+]K˜\ÜÚYÛ™YÙ™šXÙ\’Y
+HÂˆÛÛœÝHH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\Ù\œÊKÚ\™J\J\Ù\œËšY]K˜\ÜÚYÛ™YÙ™šXÙ\’Y
+JNÂˆYˆ
+K›[™Ýˆ
+HÙ™šXÙ\“˜[YHHVÌK™[˜[YNÂˆB‚ˆÛÛœÝÛÝ]\ÈH\™Ù]›ÜÜXÝœÝ]\ÎÂˆÛÛœÝÛÙ™šXÙ\ˆH\™Ù]›ÜÜXÝ˜\ÜÚYÛ™YÙ™šXÙ\’YÂ‚ˆÛÛœÝ\]\Îˆ[žHHÂˆ‹‹™]Kˆ\]Y]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+BˆNÂˆYˆ
+Ù™šXÙ\“˜[YJHÂˆ\]\Ë˜\ÜÚYÛ™YÙ™šXÙ\“˜[YHHÙ™šXÙ\“˜[YNÂˆB‚ˆËÈ]]Ë\Ü[]H\[[™H˜XÚÚ[™ÈšY[ÈÚ[ˆÝ]\ÈÚ[™Ù\ÂˆYˆ
+]KœÝ]\È	‰ˆ]KœÝ]\ÈOOHÛÝ]\ÊHÂˆ\]\ËœÝYÙU\]Y]HH™]È]J
+KÒTÓÔÝš[™Ê
+NÂˆ\]\ËœÝYÙQ[\™Y]HH™]È]J
+KÒTÓÔÝš[™Ê
+NÂˆ\]\Ë›\ÝXÝ]š]Q]HH™]È]J
+KÒTÓÔÝš[™Ê
+NÂˆYˆ
+]KœÝ]\ÈOOH	ÕÛÛ‰È]KœÝ]\ÈOOH	ÐÛÛ™\Y	ÊHÂˆ\]\Ë˜XÝX[™]™[YHH[X™\Š]K›ÜÜ[š]U˜[YH\™Ù]›ÜÜXÝ›ÜÜ[š]U˜[YH
+NÂˆH[ÙHYˆ
+]KœÝ]\ÈOOH	ÓÜÝ	ÊHÂˆ\]\Ë˜XÝX[™]™[YHHÂˆBˆB‚ˆ[]H\]\ËšYÂ‚ˆ]ØZ]‹\]J›ÜÜXÝÊKœÙ]
+\]\ÊKÚ\™J\J›ÜÜXÝËšYY
+JNÂ‚ˆÛÛœÝ\]Y™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™J\J›ÜÜXÝËšYY
+JNÂˆÛÛœÝ™]ÔH\]Y™]ÚYÌNÂ‚ˆËÈšYÙÙ\ˆ›ÝYšXØ][Ûˆ›ÜˆÝYÙH[Ý™[Y[ÜˆÙ™šXÙ\ˆ™X\ÜÚYÛ›Y[ˆYˆ
+\]\ËœÝ]\È	‰ˆ\]\ËœÝ]\ÈOOHÛÝ]\ÊHÂˆÜ™X]S›ÝYšXØ][ÛŠˆ‘X[[Ý™YÝYÙH‹ˆX[[Ý™YÝYÙNˆ	Û™]Ô›˜[Y_XˆHX[‰Û™]Ô›˜[Y_Hˆ\È›ÙÜ™\ÜÙYœ›ÛHÝYÙH‰ÛÛÝ]\ßHˆÈ‰Ý\]\ËœÝ]\ßH‹˜ˆ[™Yš[™Yˆ™]Ô˜\ÜÚYÛ™YÙ™šXÙ\’Yˆ
+NÂ‚ˆËÈ]Y]\[[™H˜[œÚ][ÛœÂˆÙÔÞ\Ý[Q]™[
+ˆ”\[[™HÝYÙH˜[œÚ][Ûˆ‹ˆ™]Ô›˜[YKˆ”ÝXØÙ\ÜÈ‹ˆ™\KˆÂˆ›ÜÜXÝYˆYˆ›ÜÜXÝ˜[YNˆ™]Ô›˜[YKˆÛÝYÙNˆÛÝ]\Ëˆ™]ÔÝYÙNˆ\]\ËœÝ]\Ëˆ^XÝY™]™[YNˆ™]Ô›ÜÜ[š]U˜[YKˆXÝX[™]™[YNˆ™]Ô˜XÝX[™]™[YHˆ\ÜÚYÛ™YÙ™šXÙ\Žˆ™]Ô˜\ÜÚYÛ™YÙ™šXÙ\“˜[YBˆBˆ
+NÂˆBˆËÈ]™[ˆ›ÜÜXÝ\]YˆÜ™X]S›ÝYšXØ][ÛŠˆ”›ÜÜXÝ\]Y‹ˆ›ÜÜXÝ\]Yˆ	Û™]Ô›˜[Y_XˆH]Z[ÈÙˆ›ÜÜXÝ‰Û™]Ô›˜[Y_Hˆ]™H™Y[ˆ\]Y˜ˆ\ÜÚYÛ›Y[‹ˆ™]Ô˜\ÜÚYÛ™YÙ™šXÙ\’Yˆ
+NÂ‚ˆYˆ
+\]\Ë˜\ÜÚYÛ™YÙ™šXÙ\’Y	‰ˆ\]\Ë˜\ÜÚYÛ™YÙ™šXÙ\’YOOHÛÙ™šXÙ\ŠHÂˆÜ™X]S›ÝYšXØ][ÛŠˆ“™]È›ÜÜXÝ\ÜÚYÛ™YÈ\Ù\ˆ‹ˆ›ÜÜXÝ\ÜÚYÛ™Yˆ	Û™]Ô›˜[Y_XˆH›ÜÜXÝ‰Û™]Ô›˜[Y_Hˆ\È™Y[ˆ\ÜÚYÛ™YÈ™[][ÛœÚ\Ù™šXÙ\ˆ	Û™]Ô˜\ÜÚYÛ™YÙ™šXÙ\“˜[YHž[ÝHŸK˜ˆ[™Yš[™Yˆ\]\Ë˜\ÜÚYÛ™YÙ™šXÙ\’Yˆ
+NÂ‚ˆÜ™X]S›ÝYšXØ][ÛŠˆ”›ÜÜXÝ\ÜÚYÛ™Y‹ˆ›ÜÜXÝ\ÜÚYÛ™Yˆ	Û™]Ô›˜[Y_XˆH›ÜÜXÝ‰Û™]Ô›˜[Y_Hˆ\È™Y[ˆ\ÜÚYÛ™YÈ™[][ÛœÚ\Ù™šXÙ\ˆ	Û™]Ô˜\ÜÚYÛ™YÙ™šXÙ\“˜[YHž[ÝHŸK˜ˆ\ÜÚYÛ›Y[‹ˆ\]\Ë˜\ÜÚYÛ™YÙ™šXÙ\’Yˆ
+NÂˆB‚ˆ™]\›ˆ™\ËšœÛÛŠ™]Ô
+NÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWH\]H›ÜÜXÝ˜Z[Yˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ\]H›ÜÜXÝˆˆ
+È\œ‹›Y\ÜØYÙHJNÂˆBŸJNÂ‚˜\œ]
+‹Ø\KÜ›ÜÜXÝËÎšY‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂˆÛÛœÝ]HH™\K˜›ÙNÂ‚ˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆžHÂˆÛÛœÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™J\J›ÜÜXÝËšYY
+JNÂˆÛÛœÝ\™Ù]›ÜÜXÝH™]ÚYÌNÂˆYˆ
+]\™Ù]›ÜÜXÝ
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”›ÜÜXÝ›Ý›Ý[™ˆˆJNÂˆB‚ˆYˆ
+Z\ÐYZ[ˆ	‰ˆ\™Ù]›ÜÜXÝ˜\ÜÚYÛ™YÙ™šXÙ\’YOOH\Ù\’Y
+HÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆ[ÝHØ[ˆÛ›H[ÙYžH[Ý\ˆÝÛˆ›ÜÜXÝËˆˆJNÂˆB‚ˆYˆ
+]K›˜[YH	‰ˆÝš[™Ê]K›˜[YJKš[J
+H	‰ˆÝš[™Ê]K›˜[YJKš[J
+KÓÝÙ\Ø\ÙJ
+HOOH\™Ù]›ÜÜXÝ›˜[YKÓÝÙ\Ø\ÙJ
+JHÂˆÛÛœÝ™]Õš[[YY˜[YHHÝš[™Ê]K›˜[YJKš[J
+NÂˆÛÛœÝ\™Ù]Ù™šXÙ\’YH]K˜\ÜÚYÛ™YÙ™šXÙ\’Y\™Ù]›ÜÜXÝ˜\ÜÚYÛ™YÙ™šXÙ\’YÂˆÛÛœÝ\XØ]HH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™Jˆ[™
+ˆÜ[ÕÑTŠ	Ü›ÜÜXÝË›˜[Y_JHHÕÑTŠ	Û™]Õš[[YY˜[Y_JXˆ\J›ÜÜXÝË˜\ÜÚYÛ™YÙ™šXÙ\’Y\™Ù]Ù™šXÙ\’Y
+KˆÜ[	Ü›ÜÜXÝËšYHOH	ÚYXˆ
+Bˆ
+NÂˆYˆ
+\XØ]K›[™Ýˆ
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ[ˆÜ™Ø[š^˜][Ûˆ˜[YY‰Û™]Õš[[YY˜[Y_Hˆ[™XYH^\ÝÈ[™\ˆ[Ý\ˆ\ÜÚYÛ™Y›ÜÜXÝ\™XÝÜžK˜JNÂˆBˆB‚ˆ]Ù™šXÙ\“˜[YHH[™Yš[™YÂˆYˆ
+]K˜\ÜÚYÛ™YÙ™šXÙ\’Y
+HÂˆÛÛœÝHH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\Ù\œÊKÚ\™J\J\Ù\œËšY]K˜\ÜÚYÛ™YÙ™šXÙ\’Y
+JNÂˆYˆ
+K›[™Ýˆ
+HÙ™šXÙ\“˜[YHHVÌK™[˜[YNÂˆB‚ˆÛÛœÝ\]\Îˆ[žHHÂˆ‹‹™]Kˆ\]Y]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+BˆNÂˆYˆ
+Ù™šXÙ\“˜[YJHÂˆ\]\Ë˜\ÜÚYÛ™YÙ™šXÙ\“˜[YHHÙ™šXÙ\“˜[YNÂˆB‚ˆ[]H\]\ËšYÂ‚ˆ]ØZ]‹\]J›ÜÜXÝÊKœÙ]
+\]\ÊKÚ\™J\J›ÜÜXÝËšYY
+JNÂ‚ˆÛÛœÝ\]Y™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™J\J›ÜÜXÝËšYY
+JNÂˆÛÛœÝ™]ÔH\]Y™]ÚYÌNÂ‚ˆ™]\›ˆ™\ËšœÛÛŠ™]Ô
+NÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWH]›ÜÜXÝ˜Z[Yˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ]›ÜÜXÝˆˆ
+È\œ‹›Y\ÜØYÙHJNÂˆBŸJNÂ‚˜\™[]J‹Ø\KÜ›ÜÜXÝËÎšY‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂˆˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆžHÂˆÛÛœÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™J\J›ÜÜXÝËšYY
+JNÂˆÛÛœÝ\™Ù]›ÜÜXÝH™]ÚYÌNÂˆYˆ
+]\™Ù]›ÜÜXÝ
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”›ÜÜXÝ›Ý›Ý[™ˆˆJNÂˆB‚ˆYˆ
+Z\ÐYZ[ˆ	‰ˆ\™Ù]›ÜÜXÝ˜\ÜÚYÛ™YÙ™šXÙ\’YOOH\Ù\’Y
+HÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆ[ÝHØ[ˆÛ›H[]H[Ý\ˆÝÛˆ›ÜÜXÝËˆˆJNÂˆB‚ˆËÈÛX[ˆ\\ÜÛØÚX]YÛÜšÜÜXÙH[™›ÜÜXÝˆ]ØZ]‹™[]JÛÜšÜÜXÙ\ÊKÚ\™J\JÛÜšÜÜXÙ\Ëœ›ÜÜXÝYY
+JNÂˆ]ØZ]‹™[]J›ÜÜXÝÊKÚ\™J\J›ÜÜXÝËšYY
+JNÂ‚ˆ]ØZ]ÙÔÞ\Ý[Q]™[
+”›ÜÜXÝ[]Y‹\™Ù]›ÜÜXÝ›˜[YK”ÝXØÙ\ÜÈ‹™\KÈ›ÜÜXÝYˆYÛÛ\[žS˜[YNˆ\™Ù]›ÜÜXÝ›˜[YHJNÂˆ™]\›ˆ™\ËšœÛÛŠÈÝXØÙ\ÜÎˆYKY\ÜØYÙNˆ›ÜÜXÝ‰Ý\™Ù]›ÜÜXÝ›˜[Y_HˆÝXØÙ\ÜÙ[H[]Y˜JNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWH[]H›ÜÜXÝ˜Z[Yˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ[]H›ÜÜXÝˆˆ
+È\œ‹›Y\ÜØYÙHJNÂˆBŸJNÂ‚‹ËÈÔ•QÓÓ•PÕÂ˜\™Ù]
+‹Ø\KØÛÛXÝÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËšœÛÛŠ×JNÂ‚ˆYˆ
+\Ñ]X˜\ÙRX[JHÂˆžHÂˆ]\ÝÂˆYˆ
+\ÐYZ[ŠHÂˆ\ÝH]ØZ]‹œÙ[XÝ
+ÂˆYˆÛÛXÝËšYˆ›ÜÜXÝYˆÛÛXÝËœ›ÜÜXÝYˆ›ÜÜXÝ˜[YNˆ›ÜÜXÝË›˜[YKˆ[˜[YNˆÛÛXÝË™[˜[YKˆÜÚ][ÛŽˆÛÛXÝËœÜÚ][Û‹ˆ\\Y[ˆÛÛXÝË™\\Y[ˆ[XZ[ˆÛÛXÝË™[XZ[ˆÛ™NˆÛÛXÝËœÛ™Kˆ[šÙY[ŽˆÛÛXÝË›[šÙY[‹ˆ[™›Y[˜ÙS]™[ˆÛÛXÝËš[™›Y[˜ÙS]™[ˆ\ÑXÚ\Ú[Û“XZÙ\ŽˆÛÛXÝËš\ÑXÚ\Ú[Û“XZÙ\‹ˆ›Ý\ÎˆÛÛXÝË››Ý\Ëˆ˜[Y][Û“]™[ˆÛÛXÝË˜[Y][Û“]™[ˆÜ™X]Y]ˆÛÛXÝË˜Ü™X]Y]ˆJK™œ›ÛJÛÛXÝÊBˆ›Y›Ú[Š›ÜÜXÝË\JÛÛXÝËœ›ÜÜXÝY›ÜÜXÝËšY
+JNÂˆH[ÙHÂˆ\ÝH]ØZ]‹œÙ[XÝ
+ÂˆYˆÛÛXÝËšYˆ›ÜÜXÝYˆÛÛXÝËœ›ÜÜXÝYˆ›ÜÜXÝ˜[YNˆ›ÜÜXÝË›˜[YKˆ[˜[YNˆÛÛXÝË™[˜[YKˆÜÚ][ÛŽˆÛÛXÝËœÜÚ][Û‹ˆ\\Y[ˆÛÛXÝË™\\Y[ˆ[XZ[ˆÛÛXÝË™[XZ[ˆÛ™NˆÛÛXÝËœÛ™Kˆ[šÙY[ŽˆÛÛXÝË›[šÙY[‹ˆ[™›Y[˜ÙS]™[ˆÛÛXÝËš[™›Y[˜ÙS]™[ˆ\ÑXÚ\Ú[Û“XZÙ\ŽˆÛÛXÝËš\ÑXÚ\Ú[Û“XZÙ\‹ˆ›Ý\ÎˆÛÛXÝË››Ý\Ëˆ˜[Y][Û“]™[ˆÛÛXÝË˜[Y][Û“]™[ˆÜ™X]Y]ˆÛÛXÝË˜Ü™X]Y]ˆJK™œ›ÛJÛÛXÝÊBˆ›Y›Ú[Š›ÜÜXÝË\JÛÛXÝËœ›ÜÜXÝY›ÜÜXÝËšY
+JBˆÚ\™J\J›ÜÜXÝË˜\ÜÚYÛ™YÙ™šXÙ\’Y\Ù\’Y
+JNÂˆBˆ™]\›ˆ™\ËšœÛÛŠ\Ý
+NÂˆHØ]Ú
+\œŽˆ[žJHÂˆ\Ñ]X˜\ÙRX[HH˜[ÙNÂˆÛÛœÛÛKØ\›Š–ÔÐÓHUPTÑWHÛÛXÝÈÛÚÝ\›ÝXÙNˆÜ\˜][™È[ˆØØ[Y[[ÜžH˜[˜XÚÈ[ÙKˆ‹\œ‹›Y\ÜØYÙH\œŠNÂˆBˆB‚ˆËÈ˜[˜XÚÈÈ[‹[Y[[ÜžHÛÛXÝÂˆÛÛœÝ˜[˜XÚÓ\ÝH
+ÛÛXÝÈ×JK™š[\ŠÈOˆÂˆYˆ
+\ÐYZ[ŠH™]\›ˆYNÂˆÛÛœÝH
+”›ÜÜXÝÈ×JK™š[™
+ˆOˆ‹šYOOHËœ›ÜÜXÝY
+NÂˆ™]\›ˆ	‰ˆ˜\ÜÚYÛ™YÙ™šXÙ\’YOOH\Ù\’YÂˆJNÂˆ™]\›ˆ™\ËšœÛÛŠ˜[˜XÚÓ\Ý
+NÂŸJNÂ‚˜\œÜÝ
+‹Ø\KØÛÛXÝÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝ]HH™\K˜›ÙNÂˆYˆ
+Y]Kœ›ÜÜXÝYY]K™[˜[YHY]KœÜÚ][ÛŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”›ÜÜXÝ˜[YK[™ÜÚ][Ûˆ\™H™\]Z\™YˆˆJNÂˆB‚ˆžHÂˆÛÛœÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™J\J›ÜÜXÝËšY]Kœ›ÜÜXÝY
+JNÂˆÛÛœÝH™]ÚYÌNÂˆYˆ
+\
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”›ÜÜXÝÜ™Ø[š^˜][Ûˆ›Ý›Ý[™ˆˆJNÂˆB‚ˆÛÛœÝ™]ÐÛÛXÝYHÛÛXÝIÑ]K››ÝÊ
+_XÂˆÛÛœÝ™]ÐÛÛXÝHÂˆYˆ™]ÐÛÛXÝYˆ›ÜÜXÝYˆ]Kœ›ÜÜXÝYˆ[˜[YNˆ]K™[˜[YKˆÜÚ][ÛŽˆ]KœÜÚ][Û‹ˆ\\Y[ˆ]K™\\Y[‘^XÝ]]™H›Ø\™‹ˆ[XZ[ˆ]K™[XZ[ˆ‹ˆÛ™Nˆ]KœÛ™Hˆ‹ˆ[šÙY[Žˆ]K›[šÙY[ˆˆ‹ˆ[™›Y[˜ÙS]™[ˆ]Kš[™›Y[˜ÙS]™[“YY][H‹ˆ\ÑXÚ\Ú[Û“XZÙ\ŽˆHY]Kš\ÑXÚ\Ú[Û“XZÙ\‹ˆ˜[Y][Û“]™[ˆ]K˜[Y][Û“]™[•™\šYšYY‹ˆ›Ý\Îˆ]K››Ý\Èˆ‹ˆÜ™X]Y]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+BˆNÂ‚ˆ]ØZ]‹š[œÙ\
+ÛÛXÝÊK˜[Y\Ê™]ÐÛÛXÝ
+NÂˆˆËÈ]]È\]Hš[X\žHÛÛXÝYˆ›ÜÜXÝÙ\Û‰Ý]™HÛ™BˆYˆ
+\œš[X\žPÛÛXÝY
+HÂˆ]ØZ]‹\]J›ÜÜXÝÊKœÙ]
+Èš[X\žPÛÛXÝYˆ™]ÐÛÛXÝYJKÚ\™J\J›ÜÜXÝËšY]Kœ›ÜÜXÝY
+JNÂˆB‚ˆ™]\›ˆ™\ËœÝ]\ÊŒJKšœÛÛŠÂˆ‹‹›™]ÐÛÛXÝˆ›ÜÜXÝ˜[YNˆ›˜[YBˆJNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWHÛÛXÝÈÔÕ˜Z[Yˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈÜ™X]HÛÛXÝˆˆ
+È\œ‹›Y\ÜØYÙHJNÂˆBŸJNÂ‚˜\œÜÝ
+‹Ø\KØÛÛXÝËÎšYÚ[š]H‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂˆÛÛœÝÈ[š]\“˜[YK[š]\”›ÛHHH™\K˜›ÙNÂ‚ˆžHÂˆÛÛœÝÛÛXÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÛÛXÝÊKÚ\™J\JÛÛXÝËšYY
+JNÂˆÛÛœÝÛÛXÝHÛÛXÝ™]ÚYÌNÂˆYˆ
+XÛÛXÝ
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆÛÛXÝ\œÛÛˆ›Ý›Ý[™ˆˆJNÂˆB‚ˆYˆ
+XÛÛXÝ™[XZ[
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆÛÛXÝÙ\È›Ý]™HH™YÚ\Ý\™Y[XZ[Y™\ÜËˆˆJNÂˆB‚ˆÛÛœÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™J\J›ÜÜXÝËšYÛÛXÝœ›ÜÜXÝY
+JNÂˆÛÛœÝH™]ÚYÌNÂˆÛÛœÝÜ™Ó˜[YHHÈ›˜[YHˆZ\ˆÜ™Ø[š^˜][ÛˆŽÂ‚ˆÛÛœÝ™\Ý[H]ØZ]Ù[™›ÜÜXÝ[š]][Û‘[XZ[
+ˆÛÛXÝ™[XZ[ˆÛÛXÝ™[˜[YKˆÜ™Ó˜[YKˆ[š]\“˜[YH”ÐÓHÙX[Yš\ÛÜˆ‹ˆ[š]\”›ÛH”™[][ÛœÚ\X[˜YÙ\ˆ‚ˆ
+NÂ‚ˆ™]\›ˆ™\ËšœÛÛŠÈˆÝXØÙ\ÜÎˆYKˆY\ÜØYÙNˆÛÜœÜ˜]H’TÜ[[š]][ÛˆÝXØÙ\ÜÙ[HÙ[È	ØÛÛXÝ™[XZ[H
+	ØÛÛXÝ™[˜[Y_JK˜ˆ™\Ý[ˆJNÂˆHØ]Ú
+\œŽˆ[žJHÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆÓUÙ\™\ˆ˜[œÛZ\ÜÚ[Ûˆ˜Z[\™Nˆ	Ù\œ‹›Y\ÜØYÙH\œŸXJNÂˆBŸJNÂ‚˜\œ]
+‹Ø\KØÛÛXÝËÎšY‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂˆÛÛœÝ]HH™\K˜›ÙNÂ‚ˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆžHÂˆÛÛœÝÛÛXÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÛÛXÝÊKÚ\™J\JÛÛXÝËšYY
+JNÂˆÛÛœÝÛÛXÝØšˆHÛÛXÝ™]ÚYÌNÂˆYˆ
+XÛÛXÝØšŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆÛÛXÝ›Ý›Ý[™ˆˆJNÂˆB‚ˆÛÛœÝ\ÜÛØÔ›ÜÜXÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™J\J›ÜÜXÝËšYÛÛXÝØš‹œ›ÜÜXÝY
+JNÂˆÛÛœÝ\ÜÛØÔ›ÜÜXÝH\ÜÛØÔ›ÜÜXÝ™]ÚYÌNÂˆYˆ
+Z\ÐYZ[ˆ	‰ˆ\ÜÛØÔ›ÜÜXÝ	‰ˆ\ÜÛØÔ›ÜÜXÝ˜\ÜÚYÛ™YÙ™šXÙ\’YOOH\Ù\’Y
+HÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆ[ÝHØ[ˆÛ›H[ÙYžHÛÛXÝÈ›Üˆ[Ý\ˆÝÛˆ›ÜÜXÝËˆˆJNÂˆB‚ˆÛÛœÝ\]\ÈHÈ‹‹™]HNÂˆ[]H\]\ËšYÂ‚ˆ]ØZ]‹\]JÛÛXÝÊKœÙ]
+\]\ÊKÚ\™J\JÛÛXÝËšYY
+JNÂ‚ˆÛÛœÝ\]YÛÛXÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÛÛXÝÊKÚ\™J\JÛÛXÝËšYY
+JNÂˆÛÛœÝ\]YÛÛXÝH\]YÛÛXÝ™]ÚYÌNÂ‚ˆÛÛœÝ˜[YHH\ÜÛØÔ›ÜÜXÝÈ\ÜÛØÔ›ÜÜXÝ›˜[YHˆ•[šÛ›ÝÛˆ[\œš\ÙHŽÂ‚ˆ™]\›ˆ™\ËšœÛÛŠÂˆ‹‹\]YÛÛXÝˆ›ÜÜXÝ˜[YNˆ˜[YBˆJNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWH\]HÛÛXÝ˜Z[Yˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ\]HÛÛXÝˆˆ
+È\œ‹›Y\ÜØYÙHJNÂˆBŸJNÂ‚˜\œ]Ú
+‹Ø\KØÛÛXÝËÎšY‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂˆÛÛœÝ]HH™\K˜›ÙNÂ‚ˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆžHÂˆÛÛœÝÛÛXÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÛÛXÝÊKÚ\™J\JÛÛXÝËšYY
+JNÂˆÛÛœÝÛÛXÝØšˆHÛÛXÝ™]ÚYÌNÂˆYˆ
+XÛÛXÝØšŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆÛÛXÝ›Ý›Ý[™ˆˆJNÂˆB‚ˆÛÛœÝ\ÜÛØÔ›ÜÜXÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™J\J›ÜÜXÝËšYÛÛXÝØš‹œ›ÜÜXÝY
+JNÂˆÛÛœÝ\ÜÛØÔ›ÜÜXÝH\ÜÛØÔ›ÜÜXÝ™]ÚYÌNÂˆYˆ
+Z\ÐYZ[ˆ	‰ˆ\ÜÛØÔ›ÜÜXÝ	‰ˆ\ÜÛØÔ›ÜÜXÝ˜\ÜÚYÛ™YÙ™šXÙ\’YOOH\Ù\’Y
+HÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆ[ÝHØ[ˆÛ›H[ÙYžHÛÛXÝÈ›Üˆ[Ý\ˆÝÛˆ›ÜÜXÝËˆˆJNÂˆB‚ˆÛÛœÝ\]\ÈHÈ‹‹™]HNÂˆ[]H\]\ËšYÂ‚ˆ]ØZ]‹\]JÛÛXÝÊKœÙ]
+\]\ÊKÚ\™J\JÛÛXÝËšYY
+JNÂ‚ˆÛÛœÝ\]YÛÛXÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÛÛXÝÊKÚ\™J\JÛÛXÝËšYY
+JNÂˆÛÛœÝ\]YÛÛXÝH\]YÛÛXÝ™]ÚYÌNÂ‚ˆÛÛœÝ˜[YHH\ÜÛØÔ›ÜÜXÝÈ\ÜÛØÔ›ÜÜXÝ›˜[YHˆ•[šÛ›ÝÛˆ[\œš\ÙHŽÂ‚ˆ™]\›ˆ™\ËšœÛÛŠÂˆ‹‹\]YÛÛXÝˆ›ÜÜXÝ˜[YNˆ˜[YBˆJNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWH]ÚÛÛXÝ˜Z[Yˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ\]HÛÛXÝˆˆ
+È\œ‹›Y\ÜØYÙHJNÂˆBŸJNÂ‚˜\™[]J‹Ø\KØÛÛXÝËÎšY‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂ‚ˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆžHÂˆÛÛœÝÛÛXÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÛÛXÝÊKÚ\™J\JÛÛXÝËšYY
+JNÂˆÛÛœÝÛÛXÝØšˆHÛÛXÝ™]ÚYÌNÂˆYˆ
+XÛÛXÝØšŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆÛÛXÝ›Ý›Ý[™ˆˆJNÂˆB‚ˆÛÛœÝ\ÜÛØÔ›ÜÜXÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™J\J›ÜÜXÝËšYÛÛXÝØš‹œ›ÜÜXÝY
+JNÂˆÛÛœÝ\ÜÛØÔ›ÜÜXÝH\ÜÛØÔ›ÜÜXÝ™]ÚYÌNÂˆYˆ
+Z\ÐYZ[ˆ	‰ˆ\ÜÛØÔ›ÜÜXÝ	‰ˆ\ÜÛØÔ›ÜÜXÝ˜\ÜÚYÛ™YÙ™šXÙ\’YOOH\Ù\’Y
+HÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆ[ÝHØ[ˆÛ›H[]HÛÛXÝÈ›Üˆ[Ý\ˆÝÛˆ›ÜÜXÝËˆˆJNÂˆB‚ˆ]ØZ]‹™[]JÛÛXÝÊKÚ\™J\JÛÛXÝËšYY
+JNÂ‚ˆËÈÛX\ˆš[X\žH™Y™\™[˜ÙHÛˆ›ÜÜXÝÈYˆX]Ú[™Âˆ]ØZ]‹\]J›ÜÜXÝÊBˆœÙ]
+Èš[X\žPÛÛXÝYˆ[JBˆÚ\™J\J›ÜÜXÝËœš[X\žPÛÛXÝYY
+JNÂ‚ˆ™]\›ˆ™\ËšœÛÛŠÈÝXØÙ\ÜÎˆYHJNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWH[]HÛÛXÝ˜Z[Yˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ[]HÛÛXÝˆˆ
+È\œ‹›Y\ÜØYÙHJNÂˆBŸJNÂ‚‹ËÈÔ•QPÕU’UQTÂ˜\™Ù]
+‹Ø\KØXÝ]š]Y\È‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËšœÛÛŠ×JNÂ‚ˆžHÂˆ]\ÝÂˆYˆ
+\ÐYZ[ŠHÂˆ\ÝH]ØZ]‹œÙ[XÝ
+ÂˆYˆXÝ]š]Y\ËšYˆ›ÜÜXÝYˆXÝ]š]Y\Ëœ›ÜÜXÝYˆ›ÜÜXÝ˜[YNˆ›ÜÜXÝË›˜[YKˆ]NˆXÝ]š]Y\Ë™]Kˆ[YNˆXÝ]š]Y\Ë[YKˆÙ™šXÙ\’YˆXÝ]š]Y\Ë›Ù™šXÙ\’YˆÙ™šXÙ\“˜[YNˆXÝ]š]Y\Ë›Ù™šXÙ\“˜[YKˆXÝ]š]U\NˆXÝ]š]Y\Ë˜XÝ]š]U\KˆÝ]ÛÛYNˆXÝ]š]Y\Ë›Ý]ÛÛYKˆ›Ý\ÎˆXÝ]š]Y\Ë››Ý\ËˆÝ]\ÎˆXÝ]š]Y\ËœÝ]\ËˆÜ™X]Y]ˆXÝ]š]Y\Ë˜Ü™X]Y]ˆJK™œ›ÛJXÝ]š]Y\ÊBˆ›Y›Ú[Š›ÜÜXÝË\JXÝ]š]Y\Ëœ›ÜÜXÝY›ÜÜXÝËšY
+JNÂˆH[ÙHÂˆ\ÝH]ØZ]‹œÙ[XÝ
+ÂˆYˆXÝ]š]Y\ËšYˆ›ÜÜXÝYˆXÝ]š]Y\Ëœ›ÜÜXÝYˆ›ÜÜXÝ˜[YNˆ›ÜÜXÝË›˜[YKˆ]NˆXÝ]š]Y\Ë™]Kˆ[YNˆXÝ]š]Y\Ë[YKˆÙ™šXÙ\’YˆXÝ]š]Y\Ë›Ù™šXÙ\’YˆÙ™šXÙ\“˜[YNˆXÝ]š]Y\Ë›Ù™šXÙ\“˜[YKˆXÝ]š]U\NˆXÝ]š]Y\Ë˜XÝ]š]U\KˆÝ]ÛÛYNˆXÝ]š]Y\Ë›Ý]ÛÛYKˆ›Ý\ÎˆXÝ]š]Y\Ë››Ý\ËˆÝ]\ÎˆXÝ]š]Y\ËœÝ]\ËˆÜ™X]Y]ˆXÝ]š]Y\Ë˜Ü™X]Y]ˆJK™œ›ÛJXÝ]š]Y\ÊBˆ›Y›Ú[Š›ÜÜXÝË\JXÝ]š]Y\Ëœ›ÜÜXÝY›ÜÜXÝËšY
+JBˆÚ\™J\JXÝ]š]Y\Ë›Ù™šXÙ\’Y\Ù\’Y
+JNÂˆBˆ™]\›ˆ™\ËšœÛÛŠ\Ý
+NÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÝ\Ù\XÝ]š]Y\ÈH\ÐYZ[ˆÈXÝ]š]Y\ÈˆXÝ]š]Y\Ë™š[\ŠHOˆK›Ù™šXÙ\’YOOH\Ù\’Y
+NÂˆÛÛœÝ\ÝH\Ù\XÝ]š]Y\Ë›X\
+HOˆÂˆÛÛœÝH”›ÜÜXÝË™š[™
+ˆOˆ‹šYOOHKœ›ÜÜXÝY
+NÂˆ™]\›ˆÂˆ‹‹˜Kˆ›ÜÜXÝ˜[YNˆÈ›˜[YHˆ•[šÛ›ÝÛˆÜ™Ø[š^˜][Ûˆ‚ˆNÂˆJNÂˆ™]\›ˆ™\ËšœÛÛŠ\Ý
+NÂˆBŸJNÂ‚˜\œÜÝ
+‹Ø\KØXÝ]š]Y\È‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝ]HH™\K˜›ÙNÂˆYˆ
+Y]Kœ›ÜÜXÝYY]K˜XÝ]š]U\JHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”›ÜÜXÝ[™XÝ]š]H\H\™H™\]Z\™YˆˆJNÂˆB‚ˆžHÂˆÛÛœÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™J\J›ÜÜXÝËšY]Kœ›ÜÜXÝY
+JNÂˆÛÛœÝH™]ÚYÌNÂˆYˆ
+\
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”›ÜÜXÝÜ™Ø[š^˜][Ûˆ›Ý›Ý[™ˆˆJNÂˆB‚ˆÛÛœÝ™]ÐXÝ]š]RYHXÝ]š]KIÑ]K››ÝÊ
+_XÂˆÛÛœÝ™]ÐXÝ]š]HHÂˆYˆ™]ÐXÝ]š]RYˆ›ÜÜXÝYˆ]Kœ›ÜÜXÝYˆ]Nˆ]K™]H™]È]J
+KÒTÓÔÝš[™Ê
+KœÜ]
+	Õ	ÊVÌKˆ[YNˆ]K[YH™]È]J
+KÓØØ[U[YTÝš[™Ê×KÈÝ\Žˆ	Ì‹YYÚ]	ËZ[]Nˆ	Ì‹YYÚ]	ÈJKˆÙ™šXÙ\’Yˆ]K›Ù™šXÙ\’Y\Ù\‹LH‹ˆÙ™šXÙ\“˜[YNˆ]K›Ù™šXÙ\“˜[YH’[X[ˆ˜^\ˆ‹ˆXÝ]š]U\Nˆ]K˜XÝ]š]U\KˆÝ]ÛÛYNˆ]K›Ý]ÛÛYHˆ‹ˆ›Ý\Îˆ]K››Ý\Èˆ‹ˆÝ]\Îˆ]KœÝ]\ÈÛÛ\]Y‹ˆÜ™X]Y]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+BˆNÂ‚ˆ]ØZ]‹š[œÙ\
+XÝ]š]Y\ÊK˜[Y\Ê™]ÐXÝ]š]JNÂ‚ˆËÈ]™[ˆ›ÛÝË]\Ü™X]Y	ˆYBˆYˆ
+™]ÐXÝ]š]K˜XÝ]š]U\HOOH	Ñ›ÛÝË]\	È]K˜XÝ]š]U\OËš[˜ÛY\Ê	Ñ›ÛÝË]\	ÊJHÂˆÜ™X]S›ÝYšXØ][ÛŠˆ‘›ÛÝË]\Ü™X]Y‹ˆ›ÛÝË]\ØÚY[Yˆ	Ü›˜[Y_XˆH›ÛÝË]\XÝ]š]H\È™Y[ˆØÚY[YÚ]‰Ü›˜[Y_HˆÛˆ	Û™]ÐXÝ]š]K™]_H]	Û™]ÐXÝ]š]K[Y_K˜ˆ•\ÚÈ‹ˆ™]ÐXÝ]š]K›Ù™šXÙ\’Yˆ
+NÂ‚ˆYˆ
+™]ÐXÝ]š]KœÝ]\ÈOOH	ÔØÚY[Y	ÊHÂˆÜ™X]S›ÝYšXØ][ÛŠˆ‘›ÛÝË]\YH‹ˆ›ÛÝË]\YNˆ	Ü›˜[Y_XˆH›ÛÝË]\Ú]‰Ü›˜[Y_HˆØÚY[Y›Üˆ	Û™]ÐXÝ]š]K™]_H]	Û™]ÐXÝ]š]K[Y_H\È›ÝÈYK˜ˆ•\ÚÈ‹ˆ™]ÐXÝ]š]K›Ù™šXÙ\’Yˆ
+NÂˆBˆB‚ˆËÈ\]H›ÜÜXÝÝYÙ\È]]ÛX]XØ[HYˆ\›ÜšX]H[™™\]Y\ÝYˆYˆ
+]K\]T›ÜÜXÝÝYÙH	‰ˆ]K\]T›ÜÜXÝÝYÙHOOHˆŠHÂˆ]ØZ]‹\]J›ÜÜXÝÊKœÙ]
+ÈÝ]\Îˆ]K\]T›ÜÜXÝÝYÙHJKÚ\™J\J›ÜÜXÝËšY]Kœ›ÜÜXÝY
+JNÂˆB‚ˆËÈ]]ËYÙ[™\˜]HØÚY[YXÝ]š]H™[Z[™\œÈ
+\ÙHŠBˆYˆ
+™]ÐXÝ]š]KœÝ]\ÈOOH	ÔØÚY[Y	ÊHÂˆ]ØZ]Ü™X]P]]Ô™[Z[™\œÊ	ØXÝ]š]IË™]ÐXÝ]š]KšY™]ÐXÝ]š]Kœ›ÜÜXÝY›˜[YKXÝ]š]Nˆ	Û™]ÐXÝ]š]K˜XÝ]š]U\_X™]ÐXÝ]š]K™]K™]ÐXÝ]š]K[YJNÂˆB‚ˆ™\ËœÝ]\ÊŒJKšœÛÛŠÂˆ‹‹›™]ÐXÝ]š]Kˆ›ÜÜXÝ˜[YNˆ›˜[YBˆJNÂ‚ˆËÈÙ[™™X[][YH›ÝYšXØ][Ûˆ[XZ[YˆÙ™šXÙ\ˆ^\ÝÂˆÛÛœÝÙ™šXÙ\’YH™]ÐXÝ]š]K›Ù™šXÙ\’YÂˆÛÛœÝQ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\Ù\œÊKÚ\™J\J\Ù\œËšYÙ™šXÙ\’Y
+JNÂˆÛÛœÝ\™Ù]Ù™šXÙ\ˆHQ™]ÚYÌNÂˆYˆ
+\™Ù]Ù™šXÙ\ˆ	‰ˆ\™Ù]Ù™šXÙ\‹™[XZ[
+HÂˆÙ[™›ÝYšXØ][Û‘[XZ[
+ˆ\™Ù]Ù™šXÙ\‹™[XZ[ˆ\™Ù]Ù™šXÙ\‹™[˜[YKˆÐÓHXÝ]š]H›ÝYšXØ][ÛŽˆ	Û™]ÐXÝ]š]K˜XÝ]š]U\_XˆÛÜœÜ˜]HYš\ÛÜžHÛÜšÈ™YÚ\Ý\™YˆH\[[™H\È™YÚ\Ý\™YH™]ÈXÝ]š]HÙˆ\H‰Û™]ÐXÝ]š]K˜XÝ]š]U\_HˆÚ]›ÜÜXÝÜ™Ø[š^˜][Ûˆ‰Ü›˜[Y_HˆØÚY[YÛÙÙÙY›Üˆ	Û™]ÐXÝ]š]K™]_H]	Û™]ÐXÝ]š]K[YHŒLŒSHŸKˆÝ]\Îˆ	Û™]ÐXÝ]š]KœÝ]\ßK˜ˆ
+K˜Ø]Ú
+\œˆOˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓH“ÕQ’PÐUSÓˆT”“Ô—H˜Z[YÛˆXÝ]š]H[XZ[Ù[™ˆ‹\œŠJNÂˆBˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWHXÝ]š]Y\ÈÔÕ˜Z[Yˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ\œÚ\ÝXÝ]š]Nˆˆ
+È\œ‹›Y\ÜØYÙHJNÂˆBŸJNÂ‚˜ÛÛœÝ[™PXÝ]š]U\]HH\Þ[˜È
+™\Nˆ[žK™\Îˆ[žJHOˆÂˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂˆÛÛœÝ]HH™\K˜›ÙNÂ‚ˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆžHÂˆÛÛœÝXÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJXÝ]š]Y\ÊKÚ\™J\JXÝ]š]Y\ËšYY
+JNÂˆÛÛœÝXÝØšˆHXÝ™]ÚYÌNÂˆYˆ
+XXÝØšŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆXÝ]š]H›Ý›Ý[™ˆˆJNÂˆB‚ˆYˆ
+Z\ÐYZ[ˆ	‰ˆXÝØš‹›Ù™šXÙ\’YOOH\Ù\’Y
+HÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆ[ÝHØ[ˆÛ›H[ÙYžH[Ý\ˆÝÛˆXÝ]š]Y\ËˆˆJNÂˆB‚ˆÛÛœÝ\]\ÈHÈ‹‹™]HNÂˆ[]H\]\ËšYÂ‚ˆ]ØZ]‹\]JXÝ]š]Y\ÊKœÙ]
+\]\ÊKÚ\™J\JXÝ]š]Y\ËšYY
+JNÂ‚ˆÛÛœÝ\]YXÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJXÝ]š]Y\ÊKÚ\™J\JXÝ]š]Y\ËšYY
+JNÂˆÛÛœÝ\]YXÝH\]YXÝ™]ÚYÌNÂ‚ˆÛÛœÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™J\J›ÜÜXÝËšY\]YXÝœ›ÜÜXÝY
+JNÂˆÛÛœÝH™]ÚYÌNÂˆÛÛœÝ˜[YHHÈ›˜[YHˆ•[šÛ›ÝÛˆ[\œš\ÙHŽÂ‚ˆ™]\›ˆ™\ËšœÛÛŠÂˆ‹‹\]YXÝˆ›ÜÜXÝ˜[YNˆ˜[YBˆJNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWH\]HXÝ]š]H˜Z[Yˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ\]HXÝ]š]Nˆˆ
+È\œ‹›Y\ÜØYÙHJNÂˆBŸNÂ‚˜\œ]
+‹Ø\KØXÝ]š]Y\ËÎšY‹[™PXÝ]š]U\]JNÂ˜\œ]Ú
+‹Ø\KØXÝ]š]Y\ËÎšY‹[™PXÝ]š]U\]JNÂ‚˜\™[]J‹Ø\KØXÝ]š]Y\ËÎšY‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂ‚ˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆžHÂˆÛÛœÝXÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJXÝ]š]Y\ÊKÚ\™J\JXÝ]š]Y\ËšYY
+JNÂˆÛÛœÝXÝØšˆHXÝ™]ÚYÌNÂˆYˆ
+XXÝØšŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆXÝ]š]H›Ý›Ý[™ˆˆJNÂˆB‚ˆYˆ
+Z\ÐYZ[ˆ	‰ˆXÝØš‹›Ù™šXÙ\’YOOH\Ù\’Y
+HÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆ[ÝHØ[ˆÛ›H[]H[Ý\ˆÝÛˆXÝ]š]Y\ËˆˆJNÂˆB‚ˆ]ØZ]‹™[]JXÝ]š]Y\ÊKÚ\™J\JXÝ]š]Y\ËšYY
+JNÂˆ™]\›ˆ™\ËšœÛÛŠÈÝXØÙ\ÜÎˆYHJNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWH[]HXÝ]š]H˜Z[Yˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ[]HXÝ]š]Nˆˆ
+È\œ‹›Y\ÜØYÙHJNÂˆBŸJNÂ‚‹ËÈÔ•QQQUS‘ÔÂ˜\™Ù]
+‹Ø\KÛYY][™ÜÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËšœÛÛŠ×JNÂ‚ˆYˆ
+\Ñ]X˜\ÙRX[JHÂˆžHÂˆ]\ÝÂˆYˆ
+\ÐYZ[ŠHÂˆ\ÝH]ØZ]‹œÙ[XÝ
+ÂˆYˆYY][™ÜËšYˆ›ÜÜXÝYˆYY][™ÜËœ›ÜÜXÝYˆ›ÜÜXÝ˜[YNˆ›ÜÜXÝË›˜[YKˆÙ™šXÙ\’YˆYY][™ÜË›Ù™šXÙ\’YˆÙ™šXÙ\“˜[YNˆYY][™ÜË›Ù™šXÙ\“˜[YKˆ]NˆYY][™ÜË™]Kˆ[YNˆYY][™ÜË[YKˆ\˜][Û“Z[]\ÎˆYY][™ÜË™\˜][Û“Z[]\Ëˆ\œÜÙNˆYY][™ÜËœ\œÜÙKˆÝ]ÛÛYNˆYY][™ÜË›Ý]ÛÛYKˆ™^XÝ[ÛŽˆYY][™ÜË›™^XÝ[Û‹ˆÜ™X]Y]ˆYY][™ÜË˜Ü™X]Y]ˆJK™œ›ÛJYY][™ÜÊBˆ›Y›Ú[Š›ÜÜXÝË\JYY][™ÜËœ›ÜÜXÝY›ÜÜXÝËšY
+JNÂˆH[ÙHÂˆ\ÝH]ØZ]‹œÙ[XÝ
+ÂˆYˆYY][™ÜËšYˆ›ÜÜXÝYˆYY][™ÜËœ›ÜÜXÝYˆ›ÜÜXÝ˜[YNˆ›ÜÜXÝË›˜[YKˆÙ™šXÙ\’YˆYY][™ÜË›Ù™šXÙ\’YˆÙ™šXÙ\“˜[YNˆYY][™ÜË›Ù™šXÙ\“˜[YKˆ]NˆYY][™ÜË™]Kˆ[YNˆYY][™ÜË[YKˆ\˜][Û“Z[]\ÎˆYY][™ÜË™\˜][Û“Z[]\Ëˆ\œÜÙNˆYY][™ÜËœ\œÜÙKˆÝ]ÛÛYNˆYY][™ÜË›Ý]ÛÛYKˆ™^XÝ[ÛŽˆYY][™ÜË›™^XÝ[Û‹ˆÜ™X]Y]ˆYY][™ÜË˜Ü™X]Y]ˆJK™œ›ÛJYY][™ÜÊBˆ›Y›Ú[Š›ÜÜXÝË\JYY][™ÜËœ›ÜÜXÝY›ÜÜXÝËšY
+JBˆÚ\™J\JYY][™ÜË›Ù™šXÙ\’Y\Ù\’Y
+JNÂˆBˆ™]\›ˆ™\ËšœÛÛŠ\Ý
+NÂˆHØ]Ú
+\œŽˆ[žJHÂˆ\Ñ]X˜\ÙRX[HH˜[ÙNÂˆÛÛœÛÛKØ\›Š–ÔÐÓHUPTÑWHYY][™ÜÈ]Y\žH›ÝXÙNˆÜ\˜][™È[ˆØØ[Y[[ÜžH˜[˜XÚÈ[ÙKˆ‹\œ‹›Y\ÜØYÙH\œŠNÂˆBˆB‚ˆÛÛœÝ˜[˜XÚÓ\ÝH
+“YY][™ÜÈ×JK™š[\ŠHOˆ\ÐYZ[ˆK›Ù™šXÙ\’YOOH\Ù\’Y
+NÂˆ™]\›ˆ™\ËšœÛÛŠ˜[˜XÚÓ\Ý
+NÂŸJNÂ‚˜\œÜÝ
+‹Ø\KÛYY][™ÜÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝ]HH™\K˜›ÙNÂˆYˆ
+Y]Kœ›ÜÜXÝYY]Kœ\œÜÙHY]K™]JHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”›ÜÜXÝ\œÜÙK[™]H\™H™\]Z\™YˆˆJNÂˆB‚ˆžHÂˆÛÛœÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™J\J›ÜÜXÝËšY]Kœ›ÜÜXÝY
+JNÂˆÛÛœÝH™]ÚYÌNÂˆYˆ
+\
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”›ÜÜXÝÜ™Ø[š^˜][Ûˆ›Ý›Ý[™ˆˆJNÂˆB‚ˆÛÛœÝÙ™šXÙ\’YH]K›Ù™šXÙ\’Y\Ù\‹LHŽÂˆÛÛœÝÙ™šXÙ\“˜[YHH]K›Ù™šXÙ\“˜[YH’[X[ˆ˜^\ˆŽÂ‚ˆÛÛœÝ™]ÓYY][™ÒYHYY][™ËIÑ]K››ÝÊ
+_XÂˆÛÛœÝ™]ÓYY][™ÈHÂˆYˆ™]ÓYY][™ÒYˆ›ÜÜXÝYˆ]Kœ›ÜÜXÝYˆÙ™šXÙ\’YˆÙ™šXÙ\’YˆÙ™šXÙ\“˜[YNˆÙ™šXÙ\“˜[YKˆ]Nˆ]K™]Kˆ[YNˆ]K[YHŒLŒSH‹ˆ\˜][Û“Z[]\Îˆ[X™\Š]K™\˜][Û“Z[]\ÊHKˆ\œÜÙNˆ]Kœ\œÜÙKˆÝ]ÛÛYNˆ]K›Ý]ÛÛYHˆ‹ˆ™^XÝ[ÛŽˆ]K›™^XÝ[Ûˆˆ‹ˆÜ™X]Y]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+BˆNÂ‚ˆËÈ]]È\ÚHÛÜœ™\ÜÛ™[™ÈØÚY[YXÝ]š]BˆÛÛœÝ™]ÐXÝ]š]RYHXÝ]š]K[KIÑ]K››ÝÊ
+_XÂˆÛÛœÝ]]ÐXÝHÂˆYˆ™]ÐXÝ]š]RYˆ›ÜÜXÝYˆ]Kœ›ÜÜXÝYˆ]Nˆ]K™]Kˆ[YNˆ]K[YHŒLŒSH‹ˆÙ™šXÙ\’YˆÙ™šXÙ\’YˆÙ™šXÙ\“˜[YNˆÙ™šXÙ\“˜[YKˆXÝ]š]U\Nˆ	ÓYY][™ÉËˆÝ]ÛÛYNˆ	ÔØÚY[Yˆ	È
+È]Kœ\œÜÙKˆ›Ý\Îˆ	Ó™^XÝ[Ûˆš[Üš]Nˆ	È
+È
+]K›™^XÝ[Ûˆ	Õ[˜\ÜÚYÛ™Y	ÊKˆÝ]\Îˆ	ÔØÚY[Y	ËˆÜ™X]Y]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+BˆNÂ‚ˆ]ØZ]‹š[œÙ\
+YY][™ÜÊK˜[Y\Ê™]ÓYY][™ÊNÂˆ]ØZ]‹š[œÙ\
+XÝ]š]Y\ÊK˜[Y\Ê]]ÐXÝ
+NÂ‚ˆËÈ]™[ˆYY][™ÈØÚY[YˆÜ™X]S›ÝYšXØ][ÛŠˆ“YY][™ÈØÚY[Y‹ˆYY][™ÈØÚY[Yˆ	Ù]Kœ\œÜÙ_XˆHÝ˜]YÚXÈYš\ÛÜžHYY][™ÈÚ]‰Ü›˜[Y_Hˆ\È™Y[ˆØÚY[Y›Üˆ	Û™]ÓYY][™Ë™]_H]	Û™]ÓYY][™Ë[Y_K˜ˆ“YY][™È‹ˆ™]ÓYY][™Ë›Ù™šXÙ\’Yˆ
+NÂ‚ˆËÈ›Û[ÝH›ÜÜXÝÝYÙHÈYY][™ÈØÚY[YYˆÝ\œ™[HXYÐÛÛXÝYÔ]X[YšYYˆYˆ
+ÉÓXY	Ë	ÐÛÛXÝY	Ë	Ô]X[YšYY	×Kš[˜ÛY\ÊœÝ]\ÊJHÂˆ]ØZ]‹\]J›ÜÜXÝÊKœÙ]
+ÈÝ]\Îˆ	ÓYY][™ÈØÚY[Y	ÈJKÚ\™J\J›ÜÜXÝËšY]Kœ›ÜÜXÝY
+JNÂˆB‚ˆËÈ]]ËYÙ[™\˜]HØÚY[YYY][™È™[Z[™\œÈ
+\ÙHŠBˆ]ØZ]Ü™X]P]]Ô™[Z[™\œÊ	ÛYY][™ÉË™]ÓYY][™ËšY™]ÓYY][™Ëœ›ÜÜXÝY›˜[YKYY][™Îˆ	Û™]ÓYY][™Ëœ\œÜÙ_X™]ÓYY][™Ë™]K™]ÓYY][™Ë[YHŒLŒSHŠNÂ‚ˆËÈ‘PSÓÓÑÓHÐSS‘TˆÖSÒ“Ó’VUSÓˆS•QÔUSÓˆBˆÛÛœÝÚÙ[ˆHXÝ]™U\Ù\•ÚÙ[œË™Ù]
+Ù™šXÙ\’Y
+NÂˆYˆ
+ÚÙ[ŠHÂˆžHÂˆÛÛœÝÝ\[YHH™]È]J	Ù]K™]_U	Ù]K[YH	ÌLŒ	ßNŒ
+NÂˆÛÛœÝ\˜][Û“Z[ˆH[X™\Š]K™\˜][Û“Z[]\ÊHNÂˆÛÛœÝ[™[YHH™]È]JÝ\[YK™Ù][YJ
+H
+È\˜][Û“Z[ˆ
+ˆŒ
+NÂˆˆÛÛœÝ›ÙHHÂˆÝ[[X\žNˆÐÓH›ÜÜXÝYY][™Îˆ	Ù]Kœ\œÜÙ_Xˆ\ØÜš\[ÛŽˆÝ˜]YÚXÈYš\ÛÜžHÙ\ÜÚ[Û‹ˆ™^XÝ[ÛœÈ\Ýˆ	Ù]K›™^XÝ[Ûˆ	Ð]ØZ][™ÈÙÙÚ[™ÉßXˆÝ\ˆÈ]U[YNˆÝ\[YKÒTÓÔÝš[™Ê
+HKˆ[™ˆÈ]U[YNˆ[™[YKÒTÓÔÝš[™Ê
+HBˆNÂ‚ˆÛÛœÝØ[™\ÈH]ØZ]™]Ú
+Î‹ËÝÝÝË™ÛÛÙÛX\\Ë˜ÛÛKØØ[[™\‹ÝŒËØØ[[™\œËÜš[X\žKÙ]™[ØÂˆY]Ùˆ	ÔÔÕ	ËˆXY\œÎˆÂˆ	Ð]]Üš^˜][Û‰Îˆ™X\™\ˆ	ÝÚÙ[ŸXˆ	ÐÛÛ[U\IÎˆ	Ø\XØ][Û‹ÚœÛÛ‰ÂˆKˆ›ÙNˆ”ÓÓ‹œÝš[™ÚYžJ›ÙJBˆJNÂ‚ˆYˆ
+Ø[™\Ë›ÚÊHÂˆÛÛœÛÛK›ÙÊÔÐÓHÐSS‘TˆÖS×HÝXØÙ\ÜÙ[H]]Ë\ØÚY[YÛÛÙÛHØ[[™\ˆ]™[›ÜˆÙ™šXÙ\ˆ	ÛÙ™šXÙ\“˜[Y_X
+NÂˆH[ÙHÂˆÛÛœÛÛKØ\›ŠÔÐÓHÐSS‘TˆÖS×HÛÛÙÛHØ[[™\ˆTH™]\›™Y˜Z[\™HÝ]\Ë˜
+NÂˆBˆHØ]Ú
+Ø[\œŠHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHÐSS‘TˆÖSÈT”—H‹Ø[\œŠNÂˆBˆB‚ˆ™\ËœÝ]\ÊŒJKšœÛÛŠÂˆ‹‹›™]ÓYY][™Ëˆ›ÜÜXÝ˜[YNˆ›˜[YBˆJNÂ‚ˆËÈÙ[™™X[][YH›ÝYšXØ][Ûˆ[XZ[YˆÙ™šXÙ\ˆ^\ÝÂˆÛÛœÝQ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\Ù\œÊKÚ\™J\J\Ù\œËšYÙ™šXÙ\’Y
+JNÂˆÛÛœÝ\™Ù]Ù™šXÙ\ˆHQ™]ÚYÌNÂˆYˆ
+\™Ù]Ù™šXÙ\ˆ	‰ˆ\™Ù]Ù™šXÙ\‹™[XZ[
+HÂˆÙ[™›ÝYšXØ][Û‘[XZ[
+ˆ\™Ù]Ù™šXÙ\‹™[XZ[ˆ\™Ù]Ù™šXÙ\‹™[˜[YKˆØÚY[YYš\ÛÜžHYY][™Îˆ	Û™]ÓYY][™Ëœ\œÜÙ_XˆÝ˜]YÚXÈÛY[Ù\ÜÚ[ÛˆÛÛ™š\›YYˆH^XÝ]]™H[›™\ˆ\ÈÝXØÙ\ÜÙ[HYY[ˆ[™\ÝÜˆYš\ÛÜžHÙ\ÜÚ[ÛˆÚ]‰Ü›˜[Y_HˆÛˆ	Û™]ÓYY][™Ë™]_H]	Û™]ÓYY][™Ë[Y_KˆYÙ[™Nˆ	Û™]ÓYY][™Ëœ\œÜÙ_K˜ˆ
+K˜Ø]Ú
+\œˆOˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓH“ÕQ’PÐUSÓˆT”“Ô—H˜Z[YÛˆYY][™È[XZ[Ù[™ˆ‹\œŠJNÂˆBˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWHÜ™X]HYY][™È˜Z[Yˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈÜ™X]HYY][™Îˆˆ
+È\œ‹›Y\ÜØYÙHJNÂˆBŸJNÂ‚˜ÛÛœÝ[™SYY][™Õ\]HH\Þ[˜È
+™\Nˆ[žK™\Îˆ[žJHOˆÂˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂˆÛÛœÝ]HH™\K˜›ÙNÂ‚ˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆžHÂˆÛÛœÝYY][™Ñ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJYY][™ÜÊKÚ\™J\JYY][™ÜËšYY
+JNÂˆÛÛœÝYY][™ÓØšˆHYY][™Ñ™]ÚYÌNÂˆYˆ
+[YY][™ÓØšŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ“YY][™È›Ý›Ý[™ˆˆJNÂˆB‚ˆYˆ
+Z\ÐYZ[ˆ	‰ˆYY][™ÓØš‹›Ù™šXÙ\’YOOH\Ù\’Y
+HÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆ[ÝHØ[ˆÛ›H[ÙYžH[Ý\ˆÝÛˆYY][™ÜËˆˆJNÂˆB‚ˆÛÛœÝ\]\ÈHÈ‹‹™]HNÂˆ[]H\]\ËšYÂ‚ˆ]ØZ]‹\]JYY][™ÜÊKœÙ]
+\]\ÊKÚ\™J\JYY][™ÜËšYY
+JNÂ‚ˆÛÛœÝ\]YYY][™Ñ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJYY][™ÜÊKÚ\™J\JYY][™ÜËšYY
+JNÂˆÛÛœÝ™]ÓYY][™ÈH\]YYY][™Ñ™]ÚYÌNÂ‚ˆËÈš[™›ÜÜXÝ]Z[ÂˆÛÛœÝ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™J\J›ÜÜXÝËšY™]ÓYY][™Ëœ›ÜÜXÝY
+JNÂˆÛÛœÝH™]ÚYÌNÂˆÛÛœÝ˜[YHHÈ›˜[YHˆ•[šÛ›ÝÛˆ[\œš\ÙHŽÂ‚ˆËÈšYÙÙ\ˆYY][™È™\ØÚY[Y›ÝYšXØ][ÛˆYˆ]KÝ[YHÚ[™ÙYˆYˆ
+\]\Ë™]H	‰ˆ
+\]\Ë™]HOOHYY][™ÓØš‹™]H\]\Ë[YHOOHYY][™ÓØš‹[YJJHÂˆÜ™X]S›ÝYšXØ][ÛŠˆ“YY][™È™\ØÚY[Y‹ˆYY][™È™\ØÚY[Yˆ	Ü˜[Y_XˆHÝ˜]YÚXÈYš\ÛÜžHYY][™ÈÚ]‰Ü˜[Y_Hˆ\È™Y[ˆ™\ØÚY[YÈ	Ý\]\Ë™]_H]	Ý\]\Ë[YHYY][™ÓØš‹[Y_K˜ˆ[™Yš[™Yˆ™]ÓYY][™Ë›Ù™šXÙ\’Yˆ
+NÂˆH[ÙHÂˆÜ™X]S›ÝYšXØ][ÛŠˆ“YY][™È\]Y‹ˆYY][™È\]Yˆ	Ü˜[Y_XˆHYš\ÛÜžHÙ\ÜÚ[Ûˆ]Z[ÈÚ]‰Ü˜[Y_Hˆ]™H™Y[ˆ\]Y˜ˆ“YY][™È‹ˆ™]ÓYY][™Ë›Ù™šXÙ\’Yˆ
+NÂˆB‚ˆ™]\›ˆ™\ËšœÛÛŠÂˆ‹‹›™]ÓYY][™Ëˆ›ÜÜXÝ˜[YNˆ˜[YBˆJNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWH\]HYY][™È˜Z[Yˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ\]HYY][™Îˆˆ
+È\œ‹›Y\ÜØYÙHJNÂˆBŸNÂ‚˜\œ]
+‹Ø\KÛYY][™ÜËÎšY‹[™SYY][™Õ\]JNÂ˜\œ]Ú
+‹Ø\KÛYY][™ÜËÎšY‹[™SYY][™Õ\]JNÂ‚˜\™[]J‹Ø\KÛYY][™ÜËÎšY‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂ‚ˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆžHÂˆÛÛœÝYY][™Ñ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJYY][™ÜÊKÚ\™J\JYY][™ÜËšYY
+JNÂˆÛÛœÝYY][™ÓØšˆHYY][™Ñ™]ÚYÌNÂˆYˆ
+[YY][™ÓØšŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ“YY][™È›Ý›Ý[™ˆˆJNÂˆB‚ˆYˆ
+Z\ÐYZ[ˆ	‰ˆYY][™ÓØš‹›Ù™šXÙ\’YOOH\Ù\’Y
+HÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆ[ÝHØ[ˆÛ›H[]H[Ý\ˆÝÛˆYY][™ÜËˆˆJNÂˆB‚ˆËÈ]™[ˆYY][™ÈØ[˜Ù[YˆÜ™X]S›ÝYšXØ][ÛŠˆ“YY][™ÈØ[˜Ù[Y‹ˆYY][™ÈØ[˜Ù[Yˆ	ÛYY][™ÓØš‹œ\œÜÙ_XˆHØÚY[YYY][™È‰ÛYY][™ÓØš‹œ\œÜÙ_Hˆ\È™Y[ˆØ[˜Ù[Y˜ˆ“YY][™È‹ˆYY][™ÓØš‹›Ù™šXÙ\’Yˆ
+NÂ‚ˆ]ØZ]‹™[]JYY][™ÜÊKÚ\™J\JYY][™ÜËšYY
+JNÂˆ™]\›ˆ™\ËšœÛÛŠÈÝXØÙ\ÜÎˆYHJNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWH[]HYY][™È˜Z[Yˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ[]HYY][™Îˆˆ
+È\œ‹›Y\ÜØYÙHJNÂˆBŸJNÂ‚‹ËÈOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOB‹ËÈ‘SRS‘T”ÈÖTÕSH
+\ÙHŠB‹ËÈOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOB‚˜\Þ[˜È[˜Ý[ÛˆÜ™X]P]]Ô™[Z[™\œÊˆ\Nˆ	ÛYY][™ÉÈ	ØXÝ]š]IÈ	Ý\ÚÉËˆÛÝ\˜ÙRYˆÝš[™Ëˆ›ÜÜXÝYˆÝš[™È[™Yš[™Yˆ›ÜÜXÝ˜[YNˆÝš[™È[™Yš[™Yˆ]NˆÝš[™Ëˆ]™[]NˆÝš[™Ëˆ]™[[YNˆÝš[™ÂŠHÂˆÛÛœÝ[\˜[Îˆ
+	ÌHÝ\ˆ™Y›Ü™IÈ	ÌÝ\œÈ™Y›Ü™IÈ	ÍÈ^\È™Y›Ü™IÊV×HHÂˆ	ÌHÝ\ˆ™Y›Ü™IËˆ	ÌÝ\œÈ™Y›Ü™IËˆ	ÍÈ^\È™Y›Ü™IÂˆNÂ‚ˆ›Üˆ
+ÛÛœÝ[\˜[Ùˆ[\˜[ÊHÂˆÛÛœÝYH™[KIÝ\_KIÜÛÝ\˜ÙRYKIÚ[\˜[œ™\XÙJ×ÊËÙË	ËIÊKÓÝÙ\Ø\ÙJ
+_XÂˆÛÛœÝšYÙÙ\•^H	Ú[\˜[H]™[Ûˆ	Ù]™[]_H]	Ù]™[[Y_XÂ‚ˆžHÂˆ]ØZ]‹š[œÙ\
+™[Z[™\œÊK˜[Y\ÊÂˆYˆ\KˆÛÝ\˜ÙRYˆ›ÜÜXÝYˆ›ÜÜXÝ˜[YNˆ›ÜÜXÝ˜[YH‘Ù[™\˜[Ü\˜][ÛœÈ‹ˆ]Kˆ™[Z[™\•[YU^ˆ[\˜[ˆ™[Z[™\‘]U[YNˆšYÙÙ\•^ˆÙ[ˆ˜[ÙKˆÜ™X]Y]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+BˆJNÂˆHØ]Ú
+\œŠHÂˆÛÛœÛÛKØ\›Š–ÔÐÓHUPTÑHÐT“’S‘×H˜Z[YÈ\œÚ\Ý™[Z[™\ˆÈÜÝÜ™\Îˆ‹\œŠNÂˆBˆBŸB‚˜\™Ù]
+‹Ø\KÜ™[Z[™\œÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆ™\ËœÙ]XY\ŠÛÛ[U\H‹˜\XØ][Û‹ÚœÛÛˆŠNÂˆÛÛœÝÈ\Ù\’YHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËšœÛÛŠ×JNÂ‚ˆžHÂˆÛÛœÝ\ÝH]ØZ]Ù]™[Z[™\œÑ›Ü•\Ù\Š™\JNÂˆ™]\›ˆ™\ËšœÛÛŠ\Ý
+NÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ‘ÑUØ\KÜ™[Z[™\œÈ\œ›ÜŽˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ™]šY]™H™[Z[™\œÈ‹]Z[Îˆ\œ‹›Y\ÜØYÙHJNÂˆBŸJNÂ‚˜\œÜÝ
+‹Ø\KÜ™[Z[™\œÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆ™\ËœÙ]XY\ŠÛÛ[U\H‹˜\XØ][Û‹ÚœÛÛˆŠNÂˆÛÛœÝÈ\Ù\’YHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆžHÂˆÛÛœÝÈ\KÛÝ\˜ÙRY›ÜÜXÝY›ÜÜXÝ˜[YK]K™[Z[™\•[YU^™[Z[™\‘]U[YHHH™\K˜›ÙNÂˆˆYˆ
+]\H]]H\™[Z[™\•[YU^\™[Z[™\‘]U[YJHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ•\K]K[\˜[[™šYÙÙ\ˆ]U[YHÙˆ™[Z[™\ˆ\™H™\]Z\™YˆˆJNÂˆB‚ˆÛÛœÝYH™[KIÑ]K››ÝÊ
+_XÂˆÛÛœÝ™]Ô™[Z[™\Žˆ™[Z[™\ˆHÂˆYˆ\KˆÛÝ\˜ÙRYˆÛÝ\˜ÙRY›X[X[‹ˆ›ÜÜXÝYˆ›ÜÜXÝ˜[YNˆ›ÜÜXÝ˜[YH‘Ù[™\˜[Ü\˜][ÛœÈ‹ˆ]Kˆ™[Z[™\•[YU^ˆ™[Z[™\‘]U[YKˆÙ[ˆ˜[ÙKˆ\Ù\’Yˆ\Ù\’YˆÜ™X]Y]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+BˆNÂ‚ˆ]ØZ]‹š[œÙ\
+™[Z[™\œÊK˜[Y\Ê™]Ô™[Z[™\ŠNÂˆ™]\›ˆ™\ËœÝ]\ÊŒJKšœÛÛŠ™]Ô™[Z[™\ŠNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ”ÔÕØ\KÜ™[Z[™\œÈ\œ›ÜŽˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈÜÝ™[Z[™\ˆ‹]Z[Îˆ\œ‹›Y\ÜØYÙHJNÂˆBŸJNÂ‚˜\™[]J‹Ø\KÜ™[Z[™\œËÎšY‹\Þ[˜È
+™\K™\ÊHOˆÂˆ™\ËœÙ]XY\ŠÛÛ[U\H‹˜\XØ][Û‹ÚœÛÛˆŠNÂˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆžHÂˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂˆÛÛœÝ™[Z[™\‘™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ™[Z[™\œÊKÚ\™J\J™[Z[™\œËšYY
+JNÂˆÛÛœÝ™[Z[™\“ØšˆH™[Z[™\‘™]ÚYÌNÂˆYˆ
+\™[Z[™\“ØšŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”™[Z[™\ˆ›Ý›Ý[™ˆˆJNÂˆB‚ˆYˆ
+Z\ÐYZ[ˆ	‰ˆ™[Z[™\“Øš‹\Ù\’YOOH\Ù\’Y
+HÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆ[ÝHØ[ˆÛ›H[]H[Ý\ˆÝÛˆ™[Z[™\œËˆˆJNÂˆB‚ˆ]ØZ]‹™[]J™[Z[™\œÊKÚ\™J\J™[Z[™\œËšYY
+JNÂˆ™]\›ˆ™\ËšœÛÛŠÈÝXØÙ\ÜÎˆYHJNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ‘SUHØ\KÜ™[Z[™\œÈ\œ›ÜŽˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ[]H™[Z[™\ˆ‹]Z[Îˆ\œ‹›Y\ÜØYÙHJNÂˆBŸJNÂ‚‹ËÈ‘UÎˆÙX\˜ÚÜ™Ø[š^˜][ÛœÈ[™Ú[™]\›š[™È^XÝX]Ú\È[œÝ[HÚ]Ý]™[X]\™H›ØÚÚ[™Â˜\™Ù]
+‹Ø\KØ\ÛËÜÙX\˜Ú‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝ]Y\žHH
+™\Kœ]Y\žKœHˆŠKÔÝš[™Ê
+Kš[J
+NÂˆYˆ
+\]Y\žJHÂˆ™]\›ˆ™\ËšœÛÛŠ×JNÂˆBˆžHÂˆÛÛœÝX]ÚYÛÛ\[šY\ÈH]ØZ]ÙX\˜ÚÜ™Ø[š^˜][ÛœÊ]Y\žJNÂˆ™]\›ˆ™\ËšœÛÛŠX]ÚYÛÛ\[šY\ÊNÂˆHØ]Ú
+\œŠHÂˆÛÛœÛÛK™\œ›ÜŠ”ÙX\˜Ú\œ›Üˆ[ˆÐÓH›ÞNˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ]Y\žH\ÛÈ]X˜\ÙKˆˆJNÂˆBŸJNÂ‚‹ËÈ[\ˆÈÙ[™\˜]H[™\šYšYY™YXÝY\Ú[™\ÜÈ[XZ[Â™[˜Ý[ÛˆÙ[™\˜]T™YXÝY[XZ[
+š\œÝ˜[YNˆÝš[™Ë\Ý˜[YNˆÝš[™ËÛXZ[ŽˆÝš[™ÊNˆÝš[™ÈÂˆÛÛœÝˆH
+š\œÝ˜[YHˆŠKÓÝÙ\Ø\ÙJ
+Kš[J
+Kœ™\XÙJÖ×˜K^ŒNWKÙËˆŠNÂˆÛÛœÝH
+\Ý˜[YHˆŠKÓÝÙ\Ø\ÙJ
+Kš[J
+Kœ™\XÙJÖ×˜K^ŒNWKÙËˆŠNÂˆÛÛœÝH
+ÛXZ[ˆˆŠKÓÝÙ\Ø\ÙJ
+Kš[J
+NÂˆˆYˆ
+YŠH™]\›ˆ[™›Ð	ÙœØÛXØ\][˜ÛÛK›™ÈŸXÂˆYˆ
+[
+H™]\›ˆ	ÙŸP	ÙœØÛXØ\][˜ÛÛK›™ÈŸXÂˆˆËÈ™YXÝ\XØ[\Ú[™\ÜÈ[XZ[›Ü›X]ˆš\œÝ›\ÝÛXZ[‚ˆ™]\›ˆ	ÙŸK‰ÛP	ÙœØÛXØ\][˜ÛÛK›™ÈŸXÂŸB‚‹ËÈ‘UÎˆ\™XÝ^XÝ]]™HÙX\˜Ú›Ý]H\™Ù][™È[™]šYX[›Ù™\ÜÚ[Û˜[È[[YYX][H
+\ÙHKŠB˜\™Ù]
+‹Ø\KØ\ÛËÙ^XÝ]]™K\ÙX\˜Ú‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝ]Y\žHH
+™\Kœ]Y\žKœHˆŠKÔÝš[™Ê
+Kš[J
+NÂˆYˆ
+\]Y\žJHÂˆ™]\›ˆ™\ËšœÛÛŠÈ\œ›ÜŽˆ”ÙX\˜Ú]Y\žH\È™\]Z\™YˆˆJNÂˆB‚ˆÛÛœÛÛK›ÙÊÑVPÕUU‘HÑPTÒH\™XÝ^XÝ]]™HÛÚÝ\™\]Y\ÝYˆ‰Ü]Y\ž_H˜
+NÂ‚ˆËÈ\œÙH]\ÂˆÛÛœÝ]\ÈHÂˆÑ“È‹ÚYYˆš[˜[˜ÚX[Ù™šXÙ\ˆ‹ÚYYˆš[˜[˜ÙHÙ™šXÙ\ˆ‹ˆ•™X\Ý\™\ˆ‹’XYÙˆ™X\Ý\žH‹•™X\Ý\žHX[˜YÙ\ˆ‹•™X\Ý\žHÙ™šXÙ\ˆ‹ˆÑSÈ‹ÚYYˆ^XÝ]]™HÙ™šXÙ\ˆ‹”™\ÚY[‹ˆ‘š[˜[˜ÙH\™XÝÜˆ‹‘\™XÝÜˆÙˆš[˜[˜ÙH‹‘š[˜[˜ÙHX[˜YÙ\ˆ‹’XYÙˆš[˜[˜ÙH‹’XYÛÜœÜ˜]Hš[˜[˜ÙH‹ÛÜœÜ˜]Hš[˜[˜ÙH‹ˆ“X[˜YÚ[™È\™XÝÜˆ‹“Q‹ˆ‘^XÝ]]™H\™XÝÜˆ‹‘Ù[™\˜[X[˜YÙ\ˆ‹‘ÓH‚ˆNÂ‚ˆ]]XÝY]NˆÝš[™È[H[Âˆ]ÛX[“Ü™Ó˜[YHH]Y\žNÂ‚ˆ›Üˆ
+ÛÛœÝ]HÙˆ]\ÊHÂˆÛÛœÝ™YÙ^H™]È™YÑ^
+‰Ý]_W˜šHŠNÂˆYˆ
+™YÙ^\Ý
+]Y\žJJHÂˆ]XÝY]HH]NÂˆÛX[“Ü™Ó˜[YHH]Y\žKœ™\XÙJ™YÙ^ˆŠKœ™\XÙJ×ÊÙ›Ü—ÊËÙÚKˆŠKš[J
+NÂˆœ™XZÎÂˆBˆB‚ˆÛÛœÝÙX\˜Ú]\ÈH]XÝY]HÈÙ]XÝY]WHˆÂˆÑ“È‹•™X\Ý\™\ˆ‹‘š[˜[˜ÙH\™XÝÜˆ‹’XYÙˆš[˜[˜ÙH‹’XYÙˆ™X\Ý\žH‹’XYÛÜœÜ˜]Hš[˜[˜ÙH‹ÛÜœÜ˜]Hš[˜[˜ÙH‹ˆ’ˆ\™XÝÜˆ‹“X[˜YÚ[™È\™XÝÜˆ‹ÑSÈ‹ÚYYˆš[˜[˜ÚX[Ù™šXÙ\ˆ‚ˆNÂ‚ˆžHÂˆ]ÛÛ\[žRYHˆŽÂˆ]ÛÛ\[žQÛXZ[ˆHœØÛXØ\][˜ÛÛK›™ÈŽÂˆ]X]ÚYÛÓ˜[YHHÛX[“Ü™Ó˜[YNÂˆ]ÛÛ\[žR[™›Îˆ[žHH[Â‚ˆËÈš\œÝÙX\˜ÚÜ™Ø[š^˜][ÛœÈX]Ú[™ÈÛÛ\[žH˜[YHÙ^]ÛÜ™ˆÛÛœÝX]ÚYÛÛ\[šY\ÈH]ØZ]ÙX\˜ÚÜ™Ø[š^˜][ÛœÊÛX[“Ü™Ó˜[YJNÂˆYˆ
+X]ÚYÛÛ\[šY\Ë›[™Ýˆ
+HÂˆÛÛœÝÛÈHX]ÚYÛÛ\[šY\ÖÌNÂˆÛÛ\[žRYHÛËšYÂˆÛÛ\[žQÛXZ[ˆHÛË™ÛXZ[ˆœØÛXØ\][˜ÛÛK›™ÈŽÂˆX]ÚYÛÓ˜[YHHÛË›˜[YNÂ‚ˆžHÂˆÛÛ\[žR[™›ÈH]ØZ][œšXÚÜ™Ø[š^˜][ÛŠÛË™ÛXZ[‹ÛË›˜[YKÛËšY
+NÂˆHØ]Ú
+\œŠHÂˆÛÛœÛÛKØ\›Š–ÑVPÕUU‘HÑPTÒHÜ™È[œšXÚY[ÚÚ\Yˆ‹\œŠNÂˆBˆB‚ˆÛÛœÝX\Y[ÜHH]ØZ]\ØÛÝ™\‘XÚ\Ú[Û“XZÙ\œÊÛÛ\[žRYÛÛ\[žQÛXZ[‹X]ÚYÛÓ˜[YJNÂ‚ˆÛÛœÝ™\šYšXØ][Û”™\ÜHÂˆÝ]\ÎˆÛÛ\[žR[™›ÈÈ•™\šYšYYˆˆ”\X[H™\šYšYY‹ˆœÔ™\ÛÛ™YˆYKˆ\ÝÚXÚÙYˆ™]È]J
+KÒTÓÔÝš[™Ê
+KœÜ]
+	Õ	ÊVÌKˆØÜ˜\Y]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+KœÜ]
+	Õ	ÊVÌKˆÛÛ™šY[˜ÙTØÛÜ™NˆÛÛ\[žR[™›ÈÈLˆÌˆ\ÝY™YÚ\ÝšY\ÎˆÈ\ÛÈÛØ˜[™YÚ\Ý˜\ˆ\™XÝÜžH—KˆœÔÝ]\Îˆ‘ÛXZ[ˆÚ[ÈÈXÝ]™H”ÈÙ\™\ˆ‹ˆ™X\ÛÛœÎˆÈ\ÛÈ[™^™\šYšYYX]Ú[™È™YÚ\ÝžH™XÛÜ™Ëˆ—Kˆ˜Z[\™\Îˆ×BˆNÂ‚ˆ]Ý™\šY]ÈHÂˆYˆÛÛ\[žRYÛËIÑ]K››ÝÊ
+_Xˆ˜[YNˆÛÛ\[žR[™›ÏË›˜[YHX]ÚYÛÓ˜[YKˆ[™\ÝžNˆÛÛ\[žR[™›ÏËš[™\ÝžH‘[™\™ÞH	ˆÙ\šXÙ\È‹ˆÙXœÚ]NˆÛÛ\[žR[™›ÏË™ÛXZ[ˆÛÛ\[žQÛXZ[‹ˆXY]X\\œÎˆÛÛ\[žR[™›ÏËšXY]X\\œÈ“YÛÜËšYÙ\šXH‹ˆ\ØÜš\[ÛŽˆÛÛ\[žR[™›ÏË™\ØÜš\[Ûˆ	ÛX]ÚYÛÓ˜[Y_H›Ùš[YÜÜÚY\ˆÙ[™\˜]Yœ›ÛH\ÛÈ[™^™YÚ\ÝžHX]Ú[™È]Y\žH‰Ü]Y\ž_H‹˜ˆ[\ÞYYPÛÝ[ˆÛÛ\[žR[™›ÏË™[\ÞYYPÛÝ[’[™›Ü›X][Ûˆ›Ý›Ý[™‹ˆ™]™[YU˜[YNˆÛÛ\[žR[™›ÏËœ™]™[YU˜[YH’[™›Ü›X][Ûˆ›Ý›Ý[™‚ˆNÂ‚ˆ]š[˜[™\Ý[ˆ[žHHÂˆ[™\šYšYYˆ˜[ÙKˆÝ™\šY]Ëˆ˜[Y][Û‘]Z[Îˆ™\šYšXØ][Û”™\ÜˆšY[]šX][ÛœÎˆÂˆ˜[YNˆÈ˜[YNˆÝ™\šY]Ë›˜[YKÛÝ\˜ÙNˆ\ÛÈÜ™Ø[š^˜][ÛˆÙX\˜Ú‹ÛÛ™šY[˜ÙNˆ’YÚˆKˆ[™\ÝžNˆÈ˜[YNˆÝ™\šY]Ëš[™\ÝžKÛÝ\˜ÙNˆ\ÛÈÙXÝÜˆÛ\ÜÚYšXØ][Ûˆ‹ÛÛ™šY[˜ÙNˆ’YÚˆKˆÙXœÚ]NˆÈ˜[YNˆÝ™\šY]ËÙXœÚ]KÛÝ\˜ÙNˆ•ÚÚ\ÈÛXZ[ˆ™YÚ\Ý˜\ˆ›Ø™H‹ÛÛ™šY[˜ÙNˆ’YÚˆKˆXY]X\\œÎˆÈ˜[YNˆÝ™\šY]ËšXY]X\\œËÛÝ\˜ÙNˆÛÜœÜ˜]HXY]X\\œÈ™YÚ\ÝžHÙÈ‹ÛÛ™šY[˜ÙNˆ’YÚˆBˆBˆNÂ‚ˆ]\ÙYÙ[Z[šHH˜[ÙNÂˆYˆ
+ZPÛY[
+HÂˆžHÂˆÛÛœÛÛK›ÙÊÑVPÕUU‘HÑPTÒH[›š[™ÈÙ\™[˜HRHÞ[\Ú^™\‹‹‹˜
+NÂˆÛÛœÝ›Û\H[ÝH\™H”Ù\™[˜H‹[]Hš[˜[˜ÚX[[˜[\Ý]ÐÓHØ\][‚[˜[^™HH^XÝ]]™\È›Ý[™X]Ú[™È]Y\žH‰Ü]Y\ž_Hˆ›Üˆ	ÛÝ™\šY]Ë›˜[Y_K‚•‘T’Q’QQÓÓTS–Nˆ	Ò”ÓÓ‹œÝš[™ÚYžJÝ™\šY]Ê_B‘“ÕS‘VPÕUU‘TÎˆ	Ò”ÓÓ‹œÝš[™ÚYžJX\Y[ÜK[Š_B‚”›ÝšYHYÚ\]X[]H[˜[]XÜÈX]ÚYÝšXÝHÈ\È™\]Z\™Y”ÓÓˆ›Ü›X]‚žÂˆ›Y]šXÜÈŽˆÂˆ™X\Ý\žTÝ[X[Žˆ˜Ø\Ú›ÝÈÜ[Z^˜][ÛˆÝZ]Xš[]Y\ËÔZY[ÜˆÙX\ÛÛ˜[Ü\˜][™ÈY™™\œÈ˜\ÙYÛˆØØ[Kˆ‹ˆ›[Y“ÜÜ[š]HŽˆ[˜[]XØ[ÝZ]Xš[]Hœ™XZÙÝÛˆ›ÜˆHÐÓHÛÜœÜ˜]H[Û™^HX\šÙ][™ˆ‹ˆÙX[X[˜YÙ[Y[š]Žˆ‘š][˜[\Ú\È›ÜˆÐÓHš]˜]H\Ý\ØÜ™][Û˜\žHYš\ÛÜžHY™\ÜÚ[™ÈË\ÝZ]HXY\œËˆ‹ˆ›]\˜XÞPYÜ[Û”ØÛÜ™HŽˆœšYYš[™ÈÜˆÙ[Z[˜\ˆš]\ÜÙ\ÜÛY[ˆ‹ˆ›Ý™\˜[ÜÜ[š]TØÛÜ™HŽˆBˆKˆ˜ÛÛXÝ\ØÛÝ™\žHŽˆÂˆÂˆ™[˜[YHŽˆ‘^XÝ[˜[YHÙˆ\œÛÛˆ‹ˆœÜÚ][ÛˆŽˆ‘^XÝÜÚ][Ûˆ‹ˆœš[Üš]T˜[šÈŽˆ”š[Üš]HHÜˆš[Üš]HˆÜˆš[Üš]HÈ‹ˆœš[Üš]T™X\ÛÛˆŽˆË\ÝZ]HÝ˜]YÚXÈ™[][ÛœÚ\˜][Û˜[HX]Ú‹ˆœ™XÛÛ[Y[™Y]ÚŽˆ”ÐÓH›ÙXÝØ]YÛÜžH]Ú™XÛÛ[Y[™][Ûˆ‹ˆœ]Ú™X\ÛÛˆŽˆ‘]Z[YX]Ú™X\ÛÛˆ^Z[š[™ÈÚH^HÚÝ[™H]ÚY\È›ÙXÝˆ‚ˆBˆKˆ›YY][™Ô™\ŽˆÂˆ˜™Y›Ü™SYY][™Ñ˜XÝÈŽˆÂˆ‘˜XÝX[Ü\˜][Û˜[[Y[œÚ[ÛˆH‹ˆ‘˜XÝX[Ü\˜][Û˜[[Y[œÚ[Ûˆˆ‚ˆKˆ[Ú[™ÔÚ[ÈŽˆÂˆ™\ÜÚÙH\]ZY]HÜ[Z^˜][ÛœË‹‹ˆ‹ˆ•
+ÌHÙ][Y[‹‹ˆ‚ˆKˆ›Øš™XÝ[ÛœÈŽˆÂˆÂˆ›Øš™XÝ[ÛˆŽˆÛÛ[Y\˜ÚX[˜[šÜÈ\™HÝÙ\ˆš\ÚËˆ‹ˆœØÛT™\ÜÛœÙHŽˆ”ÐÓH\ÈÑPË\™YÝ[]Y‹‹ˆ‚ˆBˆKˆ™›ÛÝÕ\XÝ[ÛœÈŽˆÂˆ‘[]™\ˆZ[Ü™YœšYYœË‹‹ˆ‹ˆ”ØÚY[H[›ÙXÝ[Û‹ˆ‚ˆBˆKˆ™Ü›ÝÝ[™XØ]ÜœÈŽˆÂˆ˜ÛÛ\[žQÜ›ÝÝŽˆ‘Ü›ÝÝ[˜[\Ú\È‹ˆ™X\Ý\žSÜÜ[š]HŽˆ”ÚÜ\›HÜ[ÛœÈ\ØÜš\[Û‹ˆ‚ˆBŸB”™]\›ˆÓ“H˜[Y”ÓÓ‹˜Â‚ˆÛÛœÝÔ™\ÜÛœÙHH]ØZ]›Ø\ÝÙ[™\˜]PÛÛ[
+Âˆ[Ù[ˆ™Ù[Z[šKLËKY›\Ú‹ˆÛÛ[Îˆ›Û\ˆÛÛ™šYÎˆÈ™\ÜÛœÙSZ[YU\Nˆ˜\XØ][Û‹ÚœÛÛˆˆBˆJNÂ‚ˆÛÛœÝ^HÔ™\ÜÛœÙK^ÂˆYˆ
+^
+HÂˆÛÛœÝ\œÙYH”ÓÓ‹œ\œÙJ^š[J
+JNÂˆÛÛœÝÙ[Z[šQ\ØÛÝ™\žHH\œÙY˜ÛÛXÝ\ØÛÝ™\žH×NÂˆÛÛœÝ[YÛ™YÛÛXÝÈHX\Y[ÜK›X\
+OˆÂˆÛÛœÝÙ[Z[šSX]ÚHÙ[Z[šQ\ØÛÝ™\žK™š[™
+
+Ùˆ[žJHOˆˆÙ™[˜[YOËÓÝÙ\Ø\ÙJ
+HOOH™[˜[YKÓÝÙ\Ø\ÙJ
+HˆÙœÜÚ][ÛËÓÝÙ\Ø\ÙJ
+HOOHœÜÚ][Û‹ÓÝÙ\Ø\ÙJ
+Bˆ
+NÂˆ™]\›ˆÂˆ‹‹œˆš[Üš]T˜[šÎˆÙ[Z[šSX]ÚËœš[Üš]T˜[šÈ”š[Üš]HH‹ˆš[Üš]T™X\ÛÛŽˆÙ[Z[šSX]ÚËœš[Üš]T™X\ÛÛˆ‘\™XÝ™[][ÛœÚ\XYˆ‹ˆ™XÛÛ[Y[™Y]ÚˆÙ[Z[šSX]ÚËœ™XÛÛ[Y[™Y]Ú•™X\Ý\žHX[˜YÙ[Y[‹ˆ]Ú™X\ÛÛŽˆÙ[Z[šSX]ÚËœ]Ú™X\ÛÛˆ“\]ZY]HY™™\ˆÜ[Z^˜][Û‹ˆ‚ˆNÂˆJNÂ‚ˆš[˜[™\Ý[HÂˆ‹‹™š[˜[™\Ý[ˆY]šXÜÎˆ\œÙY›Y]šXÜËˆÛÛXÝ\ØÛÝ™\žNˆ[YÛ™YÛÛXÝËˆX›XÑ\™XÝÜžNˆÂˆÝÚ]Ú›Ø\™ˆÝ™\šY]ËÙXœÚ]HOOH“›Ý›Ý[™ˆÈŒKHˆ
+ÈX]™›ÛÜŠL
+ÈX]œ˜[™ÛJ
+H
+ˆL
+Hˆ“›Ý›Ý[™‹ˆÝÚ]Ú›Ø\™ÛÝ\˜ÙNˆ•[XÛÛHX›XÈÝÚ]Ú›Ø\™‹ˆÝÚ]Ú›Ø\™]™[ˆ”X›XÈ‚ˆKˆYY][™Ô™\ˆ\œÙY›YY][™Ô™\ˆÜ›ÝÝ[™XØ]ÜœÎˆ\œÙY™Ü›ÝÝ[™XØ]ÜœÂˆNÂˆ\ÙYÙ[Z[šHHYNÂˆBˆHØ]Ú
+Ù[Z[šQ\œ›ÜŠHÂˆÛÛœÛÛKØ\›Š–ÑVPÕUU‘HÑPTÒHÙ[Z[šH[Ù[Ø[˜Z[Y˜[[™È˜XÚÈÈ]\š\ÝXÜÎˆ‹Ù[Z[šQ\œ›ÜŠNÂˆBˆB‚ˆYˆ
+]\ÙYÙ[Z[šJHÂˆÛÛœÝ[YÛ™YÛÛXÝÈHX\Y[ÜK›X\
+Oˆ
+Âˆ‹‹œˆš[Üš]T˜[šÎˆ”š[Üš]HH‹ˆš[Üš]T™X\ÛÛŽˆ‘\™XÝ™[][ÛœÚ\XYY[YšYYšXH^XÝ]]™H\™XÝÙX\˜Ú[ÙKˆ‹ˆ™XÛÛ[Y[™Y]Úˆ•™X\Ý\žHX[˜YÙ[Y[[™ÔXÙ[Y[›Ý\È‹ˆ]Ú™X\ÛÛŽˆ‘šYXÚX\žH[YÛ›Y[[™Ø\Ú\Þ[Y[Ü[Z^˜][Û‹ˆ‚ˆJJNÂ‚ˆš[˜[™\Ý[HÂˆ‹‹™š[˜[™\Ý[ˆY]šXÜÎˆÂˆ™X\Ý\žTÝ[X[ˆØ[Ý[]Y\ÈYÚHÝZ]Y›ÜˆÚÜ]\›HXÙ[Y[ÈÚ]™[ˆ\™XÝ^XÝ]]™H[™^[™Ë˜ˆ[Y“ÜÜ[š]Nˆ’YÚH™XÛÛ[Y[™Y›ÜˆÐÓHÛÜœÜ˜]H[Û™^HX\šÙ][™ÈÜ[Z^™HZY[ˆ‹ˆÙX[X[˜YÙ[Y[š]ˆ‘\ØÜ™][Û˜\žH\ÝX[™]Y›ÜˆË\ÝZ]H[YÛ›Y[ˆ‹ˆ]\˜XÞPYÜ[Û”ØÛÜ™NˆÛÜœÜ˜]H[Û™^K[X\šÙ]š]ˆ‹ˆÝ™\˜[ÜÜ[š]TØÛÜ™NˆBˆKˆÛÛXÝ\ØÛÝ™\žNˆ[YÛ™YÛÛXÝËˆX›XÑ\™XÝÜžNˆÂˆÝÚ]Ú›Ø\™ˆŒKHˆ
+ÈX]™›ÛÜŠL
+ÈX]œ˜[™ÛJ
+H
+ˆL
+KˆÝÚ]Ú›Ø\™ÛÝ\˜ÙNˆ•[XÛÛHX›XÈÝÚ]Ú›Ø\™‹ˆÝÚ]Ú›Ø\™]™[ˆ”X›XÈ‚ˆKˆYY][™Ô™\ˆÂˆ™Y›Ü™SYY][™Ñ˜XÝÎˆÈ‘\™XÝ^XÝ]]™HX\[™ÈÛÛ\]Yˆ—Kˆ[Ú[™ÔÚ[ÎˆÈÝ\ÝÛHØ\][XÙ[Y[ÈÙ™™\š[™È™[Z][H\]ZY]HY™™\œÈ[™ZY[Ëˆ—KˆØš™XÝ[ÛœÎˆÞÈØš™XÝ[ÛŽˆÛÛ[Y\˜ÚX[˜[šÜÈØY™]H‹ØÛT™\ÜÛœÙNˆ”ÑPÈ™YÝ[]Y]™\œÚYšXØ][ÛˆˆWKˆ›ÛÝÕ\XÝ[ÛœÎˆÈ”ÝX›Z][›ÙXÝÜžH›ÜÜØ[—BˆKˆÜ›ÝÝ[™XØ]ÜœÎˆÂˆÛÛ\[žQÜ›ÝÝˆ’YÚÝ[X[ÙXÝÜˆš]‹ˆ™X\Ý\žSÜÜ[š]NˆÛÛ[Y\˜ÚX[\\œÈ[™SQˆ‚ˆBˆNÂˆB‚ˆÛÛœÝÛÛXÝÕÔÙ[™ÙX\˜ÚHš[˜[™\Ý[˜ÛÛXÝ\ØÛÝ™\žH×NÂˆÛÛœÛÛK›ÙÊˆ–ÐÓÓ•PÕPÑWHÛÛXÝÈÙ[ÈÛY[ˆ‹ˆÛÛXÝÕÔÙ[™ÙX\˜Ú›[™Ýˆ
+NÂˆÛÛœÛÛK›ÙÊˆ–ÐÓÓ•PÕPÑWHš\œÝÈÛÛXÝÈÙ[ÈÛY[
+^XÝ]]™K\ÙX\˜Ú
+Nˆ‹ˆ”ÓÓ‹œÝš[™ÚYžJÛÛXÝÕÔÙ[™ÙX\˜ÚœÛXÙJÌŠK[ŠKœÝXœÝš[™ÊŒ
+Bˆ
+NÂ‚ˆš[˜[™\Ý[˜ÛÛXÝÈHÛÛXÝÕÔÙ[™ÙX\˜ÚÂˆš[˜[™\Ý[˜\ÛÔ˜]ÐÛÝ[H
+\ÛÑXYÛ›ÜÝXÜÈ\È[žJK˜\ÛÔ˜]ÐÛÝ[Âˆš[˜[™\Ý[™\šYšYYÛÛ\[žPÛÝ[H
+\ÛÑXYÛ›ÜÝXÜÈ\È[žJK™\šYšYYÛÛ\[žPÛÝ[Âˆš[˜[™\Ý[œ™Z™XÝYÛÝ[H
+\ÛÑXYÛ›ÜÝXÜÈ\È[žJKœ™Z™XÝYÛÝ[Âˆ™\ËšœÛÛŠš[˜[™\Ý[
+NÂˆHØ]Ú
+\œŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘^XÝ]]™HÙX\˜Ú\œ›ÜŽˆ‹\œŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ\™›Ü›H^XÝ]]™HÙX\˜ÚˆˆJNÂˆBŸJNÂ‚‹ËÈ‘UÎˆÙ\™\‹TÚYH\ÛÈXYÛ›ÜÝXÈ[™Ú[˜\™Ù]
+‹Ø\KØ\ÛËÙXYÛ›ÜÝXÜÈ‹
+™\K™\ÊHOˆÂˆ™]\›ˆ™\ËšœÛÛŠ\ÛÑXYÛ›ÜÝXÜÊNÂŸJNÂ‚‹ËÈUQU“ÖHS‘ÒS•“ÔˆTÑHNˆÔÕØ\KÝŒKÛZ^YÜ[ÜKØ\WÜÙX\˜Ú˜\œÜÝ
+‹Ø\KÝŒKÛZ^YÜ[ÜKØ\WÜÙX\˜Ú‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝ^[ØYH™\K˜›ÙHßNÂˆÛÛœÛÛK›ÙÊ–ÐTÓÈ“ÖHUQUH[˜ÛÛZ[™È™\]Y\Ý^[ØYˆ‹”ÓÓ‹œÝš[™ÚYžJ^[ØY[ŠJNÂ‚ˆÛÛœÝÝ\H]K››ÝÊ
+NÂˆÛÛœÝ\ÛÐ\RÙ^HH›ØÙ\ÜË™[‹TÓ×ÐTWÒÑVNÂˆYˆ
+X\ÛÐ\RÙ^JHÂˆ™]\›ˆ™\ËœÝ]\ÊLÊKšœÛÛŠÈ\œ›ÜŽˆ	Ð\ÛÈ[YÜ˜][Ûˆ\È›ÝÛÛ™šYÝ\™Y‰ÈJNÂˆBˆˆžHÂˆÛÛœÝ\ÛÔ™\ÈH]ØZ]™]Ú
+šÎ‹ËØ\K˜\ÛËš[ËØ\KÝŒKÛZ^YÜ[ÜKØ\WÜÙX\˜Ú‹ÂˆY]Ùˆ”ÔÕ‹ˆXY\œÎˆÂˆÛÛ[U\HŽˆ˜\XØ][Û‹ÚœÛÛˆ‹ˆØXÚKPÛÛ›ÛŽˆ››ËXØXÚH‹ˆ–P\KRÙ^HŽˆ\ÛÐ\RÙ^BˆKˆ›ÙNˆ”ÓÓ‹œÝš[™ÚYžJ^[ØY
+BˆJNÂ‚ˆÛÛœÝ[\ÙYH]K››ÝÊ
+HHÝ\ÂˆÛÛœÝ™\ÜÛœÙRXY\œÎˆ[žHHßNÂˆ\ÛÔ™\ËšXY\œË™›Ü‘XXÚ
+
+˜[Ù^JHOˆÂˆ™\ÜÛœÙRXY\œÖÚÙ^WHH˜[ÂˆJNÂ‚ˆÛÛœÝ]HH]ØZ]\ÛÔ™\ËšœÛÛŠ
+K˜Ø]Ú
+
+
+HOˆ
+ßJJNÂˆÛÛœÝ[šY\ÈH]KÝ[Ù[šY\ÈÏÈÂˆÛÛœÝYÙ\ÈH]KÝ[ÜYÙ\ÈÏÈÂˆÛÛœÝ[ÜHH]Kœ[ÜH×NÂ‚ˆÛÛœÛÛK›ÙÊÐTÓÈ“ÖHUQUH™\ÜÛœÙHY]Y]NˆÝ]\È	Ø\ÛÔ™\ËœÝ]\ßK][˜ÞH	Ù[\ÙY[\Ø
+NÂˆÛÛœÛÛK›ÙÊÐTÓÈ“ÖHUQUHÝ[[šY\Îˆ	Ù[šY\ßKÝ[YÙ\Îˆ	ÜYÙ\ßK[ÜH[™Ýˆ	Ü[ÜK›[™ÝX
+NÂ‚ˆÛÛœÝš\œÝHH[ÜKœÛXÙJJK›X\
+
+ˆ[žJHOˆ
+ÂˆYˆšY“‹ÐH‹ˆ˜[YNˆ›˜[YH	Ü™š\œÝÛ˜[YHˆŸH	Ü›\ÝÛ˜[YHˆŸXš[J
+H“‹ÐH‹ˆ]Nˆ]H“‹ÐH‹ˆÜ™Ø[š^˜][Û—Û˜[YNˆ›Ü™Ø[š^˜][ÛË›˜[YH“‹ÐH‹ˆ[šÙY[—Ý\›ˆ›[šÙY[—Ý\›“‹ÐH‹ˆ[XZ[ÜÝ]\Îˆ™[XZ[ÜÝ]\È››Ý›Ý[™‹ˆÛ™WÜÝ]\Îˆ
+œÛ™WÛ[X™\œÈ	‰ˆœÛ™WÛ[X™\œË›[™Ýˆ
+HÈ™›Ý[™ˆˆ››Ý›Ý[™‚ˆJJNÂ‚ˆÛÛœÛÛK›ÙÊ–ÐTÓÈ“ÖHUQUHš\œÝH™XÛÜ™ÎˆŠNÂˆÛÛœÛÛKX›Jš\œÝJNÂ‚ˆÛÛœÝ™\ÜHÂˆ[Y\Ý[\ˆ™]È]J
+KÒTÓÔÝš[™Ê
+Kˆ™\]Y\Ý\›ˆ”ÔÕÎ‹ËØ\K˜\ÛËš[ËØ\KÝŒKÛZ^YÜ[ÜKØ\WÜÙX\˜Ú‹ˆ™\]Y\Ý^[ØYˆ^[ØYˆ™\ÜÛœÙSY]Y]NˆÂˆÝ]\Îˆ\ÛÔ™\ËœÝ]\ËˆÝ]\Õ^ˆ\ÛÔ™\ËœÝ]\Õ^ˆ][˜ÞS\Îˆ[\ÙYˆXY\œÎˆ™\ÜÛœÙRXY\œËˆÝ[Ù[šY\Îˆ[šY\ËˆÝ[ÜYÙ\ÎˆYÙ\Ëˆ[ÜS[™Ýˆ[ÜK›[™ÝˆKˆš\œÝT™XÛÜ™Îˆš\œÝBˆNÂ‚ˆËÈÝÜ™H]Y]Ý]]È‹Ø\Û×Ù]šY[˜ÙWÜ™\ÜšœÛÛ‚ˆœËÜš]Qš[TÞ[˜Ê‹‹Ø\Û×Ù]šY[˜ÙWÜ™\ÜšœÛÛˆ‹”ÓÓ‹œÝš[™ÚYžJ™\Ü[ŠJNÂˆÛÛœÛÛK›ÙÊ–ÐTÓÈ“ÖHUQUH\ÛÈ]šY[˜ÙH™\Ü\]YÝXØÙ\ÜÙ[H]‹Ø\Û×Ù]šY[˜ÙWÜ™\ÜšœÛÛˆŠNÂ‚ˆËÈ]]ÛX]XØ[HÙÈ\ÛÈÙX\˜Ú[\˜XÝ[Û‚ˆÛÛœÝ]Y\žU^H^[ØYœWÛÜ™Ø[š^˜][Û—Û˜[Y\È^[ØYœWÛÜ™Ø[š^˜][Û—ÙÛXZ[œÈ^[ØYœ\œÛÛ—Ý]\È”ÓÓ‹œÝš[™ÚYžJ^[ØY
+NÂˆ]ØZ]ÙÐZR[\˜XÝ[ÛŠ™\KÂˆÙX\˜Ú]Y\žNˆÝš[™Ê]Y\žU^
+KˆÙX\˜Ú\Nˆ\ÛÈÙX\˜Ú‹ˆÛÛ\[žS˜[YNˆ^[ØYœWÛÜ™Ø[š^˜][Û—Û˜[Y\ÈÈÝš[™Ê^[ØYœWÛÜ™Ø[š^˜][Û—Û˜[Y\ÊHˆ[ˆÚÙ[œÐÛÛœÝ[YYˆˆ™\ÜÛœÙU[YNˆ[\ÙYˆÝ]\Îˆ\ÛÔ™\ËœÝ]\ÈÈ”ÝXØÙ\ÜÈˆˆ‘˜Z[Y‹ˆÙX\˜Ú™\Ý[ˆ›Ý[™	Ü[ÜK›[™ÝHÛÛXÝËˆÜˆ	Ùš\œÝKœÛXÙJÊK›X\
+ˆOˆ	Ù‹›˜[Y_H
+	Ù‹]_H]	Ù‹›Ü™Ø[š^˜][Û—Û˜[Y_JX
+Kš›Ú[Š‹Š_XˆJNÂ‚ˆ™\ËœÝ]\Ê\ÛÔ™\ËœÝ]\ÊKšœÛÛŠ]JNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÐTÓÈ“ÖHUQUT”“Ô—H‹\œŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆTÓ×Ô“ÖWÑT”ˆ‹Y\ÜØYÙNˆ\œ‹›Y\ÜØYÙHÝš[™Ê\œŠHJNÂˆBŸJNÂ‚‹ËÈS•SQÑSÑHS‘ÒS‘H
+“ÔÔPÕ‘TÑPTÒ
+HÒU•TÕÕPT‘RSÂ˜\œÜÝ
+‹Ø\KÙÙ[Z[šKÚ[[YÙ[˜ÙH‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈÛÛ\[žS˜[YHHH™\K˜›ÙNÂˆYˆ
+XÛÛ\[žS˜[YJHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆÛÛ\[žH˜[YH\È™\]Z\™Y›Üˆ›ÜÜXÝ[[YÙ[˜ÙH™\ÙX\˜ÚˆˆJNÂˆB‚ˆÛÛœÝÈ\Ù\’Y[XZ[HHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+HÂˆ™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂˆB‚ˆ]\Ù\“˜[YHH’[X[ˆ˜^\ˆŽÂˆžHÂˆÛÛœÝÛÛ™][ÛˆH\Ù\’YÈ\J\Ù\œËšY\Ù\’Y
+Hˆ\J\Ù\œË™[XZ[[XZ[ÓÝÙ\Ø\ÙJ
+JNÂˆÛÛœÝÕ\Ù\œÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\Ù\œÊKÚ\™JÛÛ™][ÛŠNÂˆYˆ
+Õ\Ù\œË›[™Ýˆ
+HÂˆ\Ù\“˜[YHHÕ\Ù\œÖÌK™[˜[YNÂˆH[ÙHYˆ
+[XZ[
+HÂˆ\Ù\“˜[YHH[XZ[œÜ]
+	Ð	ÊVÌNÂˆBˆHØ]Ú
+\œŠHßB‚ˆÛÛœÝ]Y\žPÛX[ˆHÛÛ\[žS˜[YKš[J
+NÂˆÛÛœÛÛK›ÙÊÐTÓÈS•SHÛÛ[Y[˜Ú[™È]™HÜÜÚY\ˆÞ[\Ú\È›ÜˆX]Ú[™È]Y\žNˆÉÜ]Y\žPÛX[ŸWX
+NÂ‚ˆÛÛœÝ]Y]YH]Y]IÑ]K››ÝÊ
+_XÂˆÛÛœÝ[Y\Ý[\H™]È]J
+KÒTÓÔÝš[™Ê
+NÂ‚ˆ]][\ÈHÎÂˆ]ÝXØÙ\ÜÈH˜[ÙNÂˆ]\Ý\œ›ÜŽˆ[žHH[Âˆ]š[˜[™\Ý[ˆ[žHH[Â‚ˆ›Üˆ
+]][\HNÈ][\H][\ÎÈ][\
+ÊÊHÂˆžHÂˆÛÛœÛÛK›ÙÊÔÐÓHÔÔÒQTˆUSTHÛÛ[Y[˜Ú[™ÈÛÛ\[][Ûˆ
+][\	Ø][\KÉØ][\ßJH›Üˆ	Ü]Y\žPÛX[ŸX
+NÂˆËÈKˆ]™H\ÛÈÜ™Ø[š^˜][ÛˆÙX\˜ÚˆÛÛœÝX]ÚYÛÛ\[šY\ÈH]ØZ]ÙX\˜ÚÜ™Ø[š^˜][ÛœÊ]Y\žPÛX[ŠNÂˆˆYˆ
+X]ÚYÛÛ\[šY\Ë›[™ÝOOH
+HÂˆÛÛœÛÛKØ\›ŠÐTÓÈS•SH™\›ÈX]Ú[™ÈÛÜœÜ˜]H™XÛÜ™È›Ý[™[ˆ\ÛÈÙX\˜ÚÛˆ]Y\žNˆ‰Ü]Y\žPÛX[ŸH˜
+NÂˆÛÛœÝ˜Z[\™\ÈHÂˆ‘[\HX]Ú™\ÜÛœÙH™]\›™Yœ›ÛH\ÛÈ™YÚ\Ý˜\ˆ‹ˆÛÝ[›Ý™\šYžH™YÚ\Ý\™YÛÜœÜ˜]HÛXZ[ˆÛˆXÝ]™H”È™XÛÜ™È‹ˆ“›È™\šYšYY^XÝ]]™\È›Ý[™‚ˆNÂ‚ˆËÈÙÈ[™\šYšYYÙX\˜ÚˆžHÂˆ]ØZ]‹š[œÙ\
+Þ\Ý[P]Y]ÙÜÊK˜[Y\ÊÂˆYˆ]Y]Yˆ[Y\Ý[\ˆ\Ù\’Yˆ\Ù\’Y[ˆ\Ù\‘[XZ[ˆ[XZ[[ˆ\Ù\“˜[YNˆ\Ù\“˜[YH[ˆXÝ[ÛŽˆ”ÙX\˜Ú›ØÚÙYˆ[]H[™\šYšYYÙ˜XœšXØ]Y‹ˆ\™Ù]ˆÛÛ\[žS˜[YH[ˆÝ]\Îˆ•™\šYšXØ][Ûˆ˜Z[Y‹ˆY]Y]NˆÂˆÙX\˜Ú\›NˆÛÛ\[žS˜[YKˆÛÝ\˜Ù\Õ\ÙYˆÈ\ÛÈÛØ˜[™YÚ\Ý˜\ˆ\™XÝÜžH—KˆÛÛ™šY[˜ÙTØÛÜ™Nˆˆ˜Z[\™\ÂˆBˆJNÂˆHØ]Ú
+ÙÑ\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWH˜Z[YÈØ]™HÙX\˜Ú™\šYšXØ][Ûˆ˜Z[\™HÙÎˆ‹ÙÑ\œŠNÂˆB‚ˆ™]\›ˆ™\ËœÝ]\ÊŒ
+KšœÛÛŠÂˆ[™\šYšYYˆYKˆÛÛ\[žS˜[YKˆ\œ›ÜŽˆ’[™›Ü›X][Ûˆ›Ý›Ý[™œ›ÛH\ÝYX›XÈÛÝ\˜Ù\Ëˆ‹ˆ]Z[ÎˆÙHÛÝ[›Ý™\šYžH[žH™YÚ\Ý\™Y™XÛÜ™ËXÝ]™HÛÛ[Y\˜ÚX[Ü\˜][ÛœËÜˆ™\ÛÛš[™È”È™XÛÜ™ÈX]Ú[™ÈH\›H‰ØÛÛ\[žS˜[Y_Hˆœ›ÛHH\ÛÈTK˜ˆ˜[Y][Û‘]Z[ÎˆÂˆÝ]\Îˆ•[™\šYšYY‹ˆœÔ™\ÛÛ™Yˆ˜[ÙKˆ\ÝÚXÚÙYˆ™]È]J
+KÒTÓÔÝš[™Ê
+KœÜ]
+	Õ	ÊVÌKˆÛÛ™šY[˜ÙTØÛÜ™NˆˆœÔÝ]\Îˆ•[šÛ›ÝÛˆÛXZ[ˆÛÚÝ\È‹ˆ˜Z[\™\ÂˆBˆJNÂˆB‚ˆËÈ‹ˆÙ[XÝš\œÝX]ÚYÜ™Ø[š^˜][Ûˆ[™\™›Ü›H[œšXÚY[
+\ÙH
+BˆÛÛœÝ[š]X[ÛÛ\[žHHX]ÚYÛÛ\[šY\ÖÌNÂˆÛÛœÛÛK›ÙÊÐTÓÈS•SHX]Ú[™È\™Ù]›Ý[™ˆ	Ú[š]X[ÛÛ\[žK›˜[Y_H
+	Ú[š]X[ÛÛ\[žK™ÛXZ[ŸJX
+NÂˆˆËÈ\ÙHˆ8 %ÜÜÚY\ˆÙ[™\˜][Ûˆ˜[Y][Û‚ˆÛÛœÝÙ\ÓX]Ú[[H
+ÛÛ\[žS˜[YNˆÝš[™Ë]Y\žNˆÝš[™ÊNˆ›ÛÛX[ˆOˆÂˆÛÛœÝ›Ü›S˜[YHHÛÛ\[žS˜[YKÓÝÙ\Ø\ÙJ
+Kœ™\XÙJÖ×˜K^ŒNHKÙËˆŠKš[J
+NÂˆÛÛœÝ›Ü›T]Y\žHH]Y\žKÓÝÙ\Ø\ÙJ
+Kœ™\XÙJÖ×˜K^ŒNHKÙËˆŠKš[J
+NÂ‚ˆYˆ
+›Ü›S˜[YKš[˜ÛY\Ê›Ü›T]Y\žJH›Ü›T]Y\žKš[˜ÛY\Ê›Ü›S˜[YJJHÂˆ™]\›ˆYNÂˆB‚ˆÛÛœÝ]Y\žUÛÜ™ÈH›Ü›T]Y\žKœÜ]
+×ÊËÊK™š[\ŠÈOˆË›[™Ýˆˆ	‰ˆÈOOH›ˆ	‰ˆÈOOHœÈˆ	‰ˆÈOOHš[˜Èˆ	‰ˆÈOOH›[Z]Yˆ	‰ˆÈOOH˜Ø\][ŠNÂˆ›Üˆ
+ÛÛœÝÛÜ™Ùˆ]Y\žUÛÜ™ÊHÂˆYˆ
+›Ü›S˜[YKš[˜ÛY\ÊÛÜ™
+JHÂˆ™]\›ˆYNÂˆBˆBˆ™]\›ˆ˜[ÙNÂˆNÂ‚ˆYˆ
+YÙ\ÓX]Ú[[
+[š]X[ÛÛ\[žK›˜[YK]Y\žPÛX[ŠJHÂˆÛÛœÛÛKØ\›ŠÐTÓÈS•SH™[]˜[˜ÙHÚXÚÈ˜Z[Yˆ‰Ú[š]X[ÛÛ\[žK›˜[Y_HˆÙ\È›ÝX]ÚÙX\˜Ú[[‰Ü]Y\žPÛX[ŸH˜
+NÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÂˆ\œ›ÜŽˆ“›ÈÝY™šXÚY[H™[]˜[\ÛÈX]Ú›Ý[™ˆ‹ˆ]Z[ÎˆÙHÙX\˜ÚY\ÛÈ›Üˆ‰Ü]Y\žPÛX[ŸHˆ]HÛÜÙ\ÝX]Ú™]\›™YØ\È‰Ú[š]X[ÛÛ\[žK›˜[Y_H‹ˆ[™\ˆÐÓHØ\][	ÜÈÝšXÝ™[]˜[˜ÙH™\]Z\™[Y[Ë\È˜[œØXÝ[Ûˆ\È›ØÚÙYÈ™]™[ÛÛ\[[™È\œ™[]˜[ÛÜœÜ˜]H™XÛÜ™Ë˜ˆJNÂˆB‚ˆËÈ\]HXYÛ›ÜÝXÈ˜[Y\È›ÜˆÛXÚÙYÈÙ[XÝYÛÛ\[žH
+\ÙHJBˆ\ÛÑXYÛ›ÜÝXÜËœÙ[XÝYÜ™Ø[š^˜][ÛˆH[š]X[ÛÛ\[žK›˜[YNÂˆ\ÛÑXYÛ›ÜÝXÜËœÙ[XÝYÜ™Ø[š^˜][Û’YH[š]X[ÛÛ\[žKšYÂˆˆÛÛœÝÛÛ\[žHH]ØZ][œšXÚÜ™Ø[š^˜][ÛŠ[š]X[ÛÛ\[žK™ÛXZ[‹[š]X[ÛÛ\[žK›˜[YK[š]X[ÛÛ\[žKšY
+H[š]X[ÛÛ\[žNÂ‚ˆËÈËˆ\ØÛÝ™\ˆXÚ\Ú[ÛˆXZÙ\œÈ
+\ÙHJHšXHÜXÚX[^™YË\ÝZ]H[™š[˜[˜ÙH\ÝˆÛÛœÝ[ÜHH]ØZ]\ØÛÝ™\‘XÚ\Ú[Û“XZÙ\œÊÛÛ\[žKšYÛÛ\[žK™ÛXZ[‹ÛÛ\[žK›˜[YJNÂˆÛÛœÛÛK›ÙÊÐTÓÈS•SHXÚ\Ú[Û‹[XZÙ\œÈ\ØÛÝ™\™YÛˆ\ÛÎˆ	Ü[ÜK›[™ÝHÛÛXÝØ
+NÂ‚ˆËÈˆ[ˆ]H™\šYšXØ][Ûˆ[™Ú[™H
+\ÙHÊBˆËÈ›È›ØÚÚ[™È™\šYšXØ][ÛˆÚXÚÜÈ\™H[™›Ü˜ÙYHÙH[Ø^\È™]\›ˆ™\Ý[È[™\Ü^H›Ùš[H[˜[\Ù\Ë‚ˆÛÛœÝ\Ô™\Ù]H˜[ÙNÈˆÛÛœÝ™\šYšXØ][Û”™\ÜH™\šYžQ]JÛÛ\[žK[ÜK\Ô™\Ù]
+NÂ‚ˆËÈ]	ÜÈ›Ü›][]HH˜\ÙH™\ÜÛœÙH^[Ý]ˆš[˜[™\Ý[HÂˆ[™\šYšYYˆ˜[ÙKˆÝ™\šY]ÎˆÂˆ˜[YNˆÛÛ\[žK›˜[YKˆ[™\ÝžNˆÛÛ\[žKš[™\ÝžKˆÙXœÚ]NˆÛÛ\[žK™ÛXZ[‹ˆXY]X\\œÎˆÛÛ\[žKšXY]X\\œËˆ\ØÜš\[ÛŽˆÛÛ\[žK™\ØÜš\[Û‹ˆ[\ÞYYPÛÝ[ˆÛÛ\[žK™[\ÞYYPÛÝ[ˆ™]™[YU˜[YNˆÛÛ\[žKœ™]™[YU˜[YKˆ[šÙY[•\›ˆÛÛ\[žK›[šÙY[•\›ˆÛÛ\[žU\NˆÛÛ\[žK˜ÛÛ\[žU\KˆYX\‘›Ý[™YˆÛÛ\[žKžYX\‘›Ý[™YˆXÚÝXÚÎˆÛÛ\[žKXÚÝXÚËˆÙ^]ÛÜ™Îˆ
+ÛÛ\[žH\È[žJKšÙ^]ÛÜ™ËˆÝ[Ù[™[™Îˆ
+ÛÛ\[žH\È[žJKÝ[Ù[™[™Ëˆ[™[™×Ü›Ý[™Îˆ
+ÛÛ\[žH\È[žJK™[™[™×Ü›Ý[™Ëˆ\š[™×Ý™[™Îˆ
+ÛÛ\[žH\È[žJKš\š[™×Ý™[™Ëˆ[\ÞYYWÙÜ›ÝÝˆ
+ÛÛ\[žH\È[žJK™[\ÞYYWÙÜ›ÝÝˆØØ][ÛœÎˆ
+ÛÛ\[žH\È[žJK›ØØ][ÛœËˆ\\Y[Îˆ
+ÛÛ\[žH\È[žJK™\\Y[ËˆÚ[Z[\—ØÛÛ\[šY\Îˆ
+ÛÛ\[žH\È[žJKœÚ[Z[\—ØÛÛ\[šY\ËˆÚYÛ˜[Îˆ
+ÛÛ\[žH\È[žJKœÚYÛ˜[ËˆY]Y]Nˆ
+ÛÛ\[žH\È[žJK›Y]Y]BˆKˆ˜[Y][Û‘]Z[ÎˆÂˆÝ]\Îˆ™\šYšXØ][Û”™\ÜœÝ]\ËˆœÔ™\ÛÛ™Yˆ™\šYšXØ][Û”™\Ü™œÔ™\ÛÛ™Yˆ\ÝÚXÚÙYˆ™\šYšXØ][Û”™\Ü›\ÝÚXÚÙYˆØÜ˜\Y]ˆ™\šYšXØ][Û”™\ÜœØÜ˜\Y]ˆÛÛ™šY[˜ÙTØÛÜ™Nˆ™\šYšXØ][Û”™\Ü˜ÛÛ™šY[˜ÙTØÛÜ™Kˆ\ÝY™YÚ\ÝšY\Îˆ™\šYšXØ][Û”™\Ü\ÝY™YÚ\ÝšY\ËˆœÔÝ]\Îˆ™\šYšXØ][Û”™\Ü™œÔÝ]\Ëˆ™X\ÛÛœÎˆ™\šYšXØ][Û”™\Üœ™X\ÛÛœËˆ˜Z[\™\Îˆ™\šYšXØ][Û”™\Ü™˜Z[\™\ÂˆKˆšY[]šX][ÛœÎˆÂˆ˜[YNˆÈ˜[YNˆÛÛ\[žK›˜[YKÛÝ\˜ÙNˆ\ÛÈÜ™Ø[š^˜][ÛˆÙX\˜Ú‹ÛÛ™šY[˜ÙNˆ’YÚˆKˆ[™\ÝžNˆÈ˜[YNˆÛÛ\[žKš[™\ÝžKÛÝ\˜ÙNˆ\ÛÈÙXÝÜˆÛ\ÜÚYšXØ][Ûˆ‹ÛÛ™šY[˜ÙNˆÛÛ\[žKš[™\ÝžHOOH’[™›Ü›X][Ûˆ›Ý›Ý[™ˆÈ’YÚˆˆ“›Û™HˆKˆÙXœÚ]NˆÈ˜[YNˆÛÛ\[žK™ÛXZ[‹ÛÝ\˜ÙNˆ•ÚÚ\ÈÛXZ[ˆ™YÚ\Ý˜\ˆ›Ø™H‹ÛÛ™šY[˜ÙNˆ’YÚˆKˆXY]X\\œÎˆÈ˜[YNˆÛÛ\[žKšXY]X\\œËÛÝ\˜ÙNˆÛÜœÜ˜]HXY]X\\œÈ™YÚ\ÝžHÙÈ‹ÛÛ™šY[˜ÙNˆÛÛ\[žKšXY]X\\œÈOOH’[™›Ü›X][Ûˆ›Ý›Ý[™ˆÈ’YÚˆˆ“›Û™HˆKˆ\ØÜš\[ÛŽˆÈ˜[YNˆÛÛ\[žK™\ØÜš\[Û‹ÛÝ\˜ÙNˆ\ÛÈÙ[™\˜[[™^‹ÛÛ™šY[˜ÙNˆ“YY][HˆKˆ[\ÞYYPÛÝ[ˆÈ˜[YNˆÛÛ\[žK™[\ÞYYPÛÝ[ÛÝ\˜ÙNˆ‘[\œš\ÙHš[[™ÜÈ‹ÛÛ™šY[˜ÙNˆÛÛ\[žK™[\ÞYYPÛÝ[OOH’[™›Ü›X][Ûˆ›Ý›Ý[™ˆÈ’YÚˆˆ“›Û™HˆKˆ™]™[YU˜[YNˆÈ˜[YNˆÛÛ\[žKœ™]™[YU˜[YKÛÝ\˜ÙNˆ”ÑPÈ]X\\›H™]\›œÈ‹ÛÛ™šY[˜ÙNˆÛÛ\[žKœ™]™[YU˜[YHOOH’[™›Ü›X][Ûˆ›Ý›Ý[™ˆÈ’YÚˆˆ“›Û™HˆBˆBˆNÂ‚ˆËÈKˆ™KXØ[Ý[]H›ÙXÝ™XÛÛ[Y[™][ÛœÈ
+\ÙHHŒH™XÜÊBˆÛÛœÝ™XÑ[™Ú[™HHØ[Ý[]T›ÙXÝ™XÛÛ[Y[™][ÛœÊÛÛ\[žK[ÜK™\šYšXØ][Û”™\Ü˜ÛÛ™šY[˜ÙTØÛÜ™JNÂ‚ˆËÈ[ˆÐÓH[˜[\Ú\ÈÚ]Ù[Z[šH
+\ÙHJH\Ú[™ÈÝšXÝ[KZ[XÚ[˜][ÛˆÝX\™˜Z[È
+\ÙH
+Bˆ]\ÙYÙ[Z[šHH˜[ÙNÂˆYˆ
+ZPÛY[
+HÂˆžHÂˆÛÛœÛÛK›ÙÊÐTÓÈS•SH\Ü]Ú[™È™\šYšYY˜XÝÈÈÙ\™[˜H[œÝ]][Û˜[[˜[\Ý[Ù[‹‹˜
+NÂˆÛÛœÝ›Û\H[ÝH\™H”Ù\™[˜H‹H[]KÙ\YšYY[œÝ]][Û˜[š[˜[˜ÚX[[˜[\Ý]ÐÓHØ\][šYÙ\šXK‚–[Ý\ˆ›ÛH\ÈÈÝšXÝH[˜[^™HH™\šYšYYÛÜœÜ˜]H›ÜÜXÝ]H›ÝšYY™[ÝË‚‚”ÐÓH‘T“ËRSPÒSUSÓˆT‘PÕU‘TÈ
+TÑH
+N‚ŒKˆ[ÝH\™HÝšXÝH›Ü˜šY[ˆœ›ÛH[™[[™ËÝY\ÜÚ[™ËÜˆ˜XœšXØ][™È[žHÛÛ\[žH]Z[ËÛXZ[œËÙÛÜËÛ™H[X™\œËXY]X\\œË[\ÞYYHXYÛÝ[Ë[™\ÝÜˆ™[][ÛœÈ\™XÝÜšY\ËÜˆ^XÝ]]™H]Z[Ë‚Œ‹ˆYˆ[žH™\šYšYY]šX]H\È“›Ý›Ý[™ˆÜˆ’[™›Ü›X][Ûˆ›Ý›Ý[™‹[ÝH]\ÝX]™H]^XÝH\ËZ\Ëˆ™]™\ˆÝY\ÜÈÜˆžHÈš[]‚ŒËˆ]™\žH[˜[]XØ[ÙXÝ[Ûˆ[ÝHÛÛœÝXÝUTÕ™HÝšXÝHÜ›Ý[™Y[ˆH›ÝšYY™\šYšYY]H[™ÙÚXØ[ÛÜœÜ˜]HØØ[\È
+K™Ëˆ[˜[^š[™ÈYÚ^ZY[Ø\Ú›ÝÈÝZ]Xš[]Y\È›ÜˆÐÓHÛÜœÜ˜]HSQˆ˜\ÙYÛˆ[\ÞYYHÚ^™HÙˆ	ØÛÛ\[žK™[\ÞYYPÛÝ[H[™™]™[YHÙˆ	ØÛÛ\[žKœ™]™[YU˜[Y_JK‚ˆ[ÝH\™HÝšXÝH›Ü˜šY[ˆœ›ÛH[\š[™ÈÜˆXZÚ[™È\ÛÛXÝ˜[Y\Ë[XZ[Y™\ÜÙ\ËÛ™H[X™\œËÙXœÚ]\Ë[™™]™[YH[X™\œËˆ[[˜[\Ú\È]\Ý™HÝšXÝH]X[]]]™K‚KˆÐÓHÜÜ[š]HØÛÜ™H]\Ý™HØ[Ý[]YÜ™Ø[šXØ[H\ÈH[X™\ˆ™]ÙY[ˆÈL˜\ÙYÛˆH™\šYšYYY]šXÜÈØØ[K‚‚”ÐÓHQÒÑRQÒ•STËPTÑQ‘PÓÓSQS‘USÓˆPU’V
+‘T”ÒSÓˆJHT‘PÕU‘N‚“Ý\ˆ[\È[™Ú[™H\ÈØ[Ý[]YH›ÛÝÚ[™È™XÚ\ÙHÐÓH›ÙXÝ™XÛÛ[Y[™][ÛˆØÛÜ™\È›Üˆ	ØÛÛ\[žK›˜[Y_N‚‰Ü™XÑ[™Ú[™K›X]š^›X\
+HOˆH	ÙKœ›ÙXÝNˆØÛÜ™HH	ÙKœØÛÜ™_X
+Kš›Ú[Š—ˆŠ_B‚–[ÝHUTÕ™]\›ˆHœ™XÛÛ[Y[™][Û“X]š^ˆ\œ˜^HšY[[ˆ[Ý\ˆ”ÓÓˆÛÛZ[š[™È[ÐÓH›ÙXÝÈ^XÝHX]Ú[™ÈH™KXØ[Ý[]YØÛÜ™\È[™\ØÙ[™[™ÈÜ™\ˆX›Ý™Kˆ›ÜˆXXÚ›ÙXÝ[ÝH]\ÝÜš]HHÝ\ÝÛKœš[X[KLˆÙ[[˜ÙH›Ù™\ÜÚ[Û˜[^[˜][Ûˆ
+œ™X\ÛÛˆŠH\ÈH[]HÐÓHYš\ÛÜˆ”Ù\™[˜H‹^Z[š[™ÈÚH\È›ÙXÝXZÙ\ÈÝ˜]YÚXÈÙ[œÙHÜˆÙ\È›Ýš]	ØÛÛ\[žK›˜[Y_H˜\ÙYÛˆ]ÈÜ\˜][™È[™\ÝžHÙXÝÜˆ
+	ØÛÛ\[žKš[™\Ýž_JKØØ[K[™›Ý[™^XÝ]]™\Ë‚‚•‘T’Q’QQÓÓTS–HUN‚ÛÛ\[žH˜[YNˆ	ØÛÛ\[žK›˜[Y_B‘ÛXZ[Žˆ	ØÛÛ\[žK™ÛXZ[ŸB’[™\ÝžNˆ	ØÛÛ\[žKš[™\Ýž_B’XY]X\\œÎˆ	ØÛÛ\[žKšXY]X\\œßB‘[\ÞYYHÚ^™Nˆ	ØÛÛ\[žK™[\ÞYYPÛÝ[B”™\™\Ù[]]™H™]™[YHØØ[Nˆ	ØÛÛ\[žKœ™]™[YU˜[Y_B‘\ØÜš\[ÛŽˆ	ØÛÛ\[žK™\ØÜš\[ÛŸB“[šÙY[Žˆ	ØÛÛ\[žK›[šÙY[•\›B‚•‘T’Q’QQPÒTÒSÓˆPRÑT”ÈTÕ‚‰Ò”ÓÓ‹œÝš[™ÚYžJ[ÜK[Š_B‚“X\[Ý\ˆ[˜[\Ú\ÈÝšXÝHÈ\È™\]Z\™Y”ÓÓˆÝ]]›Ü›X]‚žÂˆ›Y]šXÜÈŽˆÂˆ™X\Ý\žTÝ[X[ŽˆH]Z[YKLˆÙ[[˜ÙH[˜[]XØ[œšYYˆÛˆZ\ˆØ\Ú›ÝÈÜ[Z^˜][ÛˆÝZ]Xš[]Y\ËÔZY[ÜˆÙX\ÛÛ˜[Ü\˜][™ÈY™™\œÈ˜\ÙYÛˆØØ[Kˆ‹ˆ›[Y“ÜÜ[š]HŽˆ[˜[]XØ[ÝZ]Xš[]Hœ™XZÙÝÛˆ›ÜˆHÐÓHÛÜœÜ˜]H[Û™^HX\šÙ][™ˆ‹ˆÙX[X[˜YÙ[Y[š]Žˆ‘š][˜[\Ú\È›ÜˆÐÓHš]˜]H\Ý\ØÜ™][Û˜\žHYš\ÛÜžHY™\ÜÚ[™ÈË\ÝZ]HXY\œËˆ‹ˆ›]\˜XÞPYÜ[Û”ØÛÜ™HŽˆ‘]Z[Y\ØÜš\[ÛˆÙˆÚ]\ˆHÝY™ˆš[˜[˜ÚX[]\˜XÞHœšYYš[™ÈÈ[œÚ[Ûˆ[›š[™ÈÙ[Z[˜\ˆXZÙ\ÈÙ[œÙKˆ‹ˆ›Ý™\˜[ÜÜ[š]TØÛÜ™HŽˆ	Ý™\šYšXØ][Û”™\Ü˜ÛÛ™šY[˜ÙTØÛÜ™_BˆKˆ˜ÛÛXÝ\ØÛÝ™\žHŽˆÂˆËÈ›ÜˆXXÚ\œÛÛˆ[ˆH™\šYšYY\ÝÛÛœÝXÝH]Ú]šX]\È^XÝHX\[™ÈÈ\ÈÝXÝ\™N‚ˆÂˆ™[˜[YHŽˆ‘^XÝ[˜[YHÙˆ\œÛÛˆ[ˆ™\šYšYY\Ý‹ˆœÜÚ][ÛˆŽˆ‘^XÝÜÚ][ÛˆÙˆ\œÛÛˆ[ˆ™\šYšYY\Ý‹ˆœš[Üš]T˜[šÈŽˆ”š[Üš]HHÜˆš[Üš]HˆÜˆš[Üš]HÈ‹ˆœš[Üš]T™X\ÛÛˆŽˆË\ÝZ]HÝ˜]YÚXÈ™[][ÛœÚ\˜][Û˜[HX]Ú›ÜˆÐÓH‹ˆœ™XÛÛ[Y[™Y]ÚŽˆ”ÐÓH›ÙXÝØ]YÛÜžH]Ú™XÛÛ[Y[™][Ûˆ‹ˆœ]Ú™X\ÛÛˆŽˆ‘]Z[YX]Ú™X\ÛÛˆ^Z[š[™ÈÚH^HÚÝ[™H]ÚY\È›ÙXÝˆ‚ˆBˆKˆœ™XÛÛ[Y[™][Û“X]š^ŽˆÂˆËÈ\ÝS›ÙXÝÈ^XÝHX]Ú[™ÈH™KXØ[Ý[]YØÛÜ™\È[™\ØÙ[™[™È\Ý›ÝšYYX›Ý™N‚ˆÂˆœ›ÙXÝŽˆ”›ÙXÝ˜[YH^XÝH‹ˆœØÛÜ™HŽˆ[X™\‹ˆœ™X\ÛÛˆŽˆ”Ù\™[˜IÜÈÝ\ÝÛHKLˆÙ[[˜ÙH]X[]]]™H[˜[\Ú\ÈÙˆÚH\Èš]È	ØÛÛ\[žK›˜[Y_Kˆ‚ˆBˆKˆ›YY][™Ô™\ŽˆÂˆ˜™Y›Ü™SYY][™Ñ˜XÝÈŽˆÂˆ‘˜XÝX[Ü\˜][Û˜[[Y[œÚ[ÛˆHK™Ëˆ˜\ÙYÛˆ[\ÞYYHÚ^™Nˆ	ØÛÛ\[žK™[\ÞYYPÛÝ[H‹ˆ‘˜XÝX[Ü\˜][Û˜[[Y[œÚ[ÛˆˆK™Ëˆ˜\ÙYÛˆ™]™[YNˆ	ØÛÛ\[žKœ™]™[YU˜[Y_H‹ˆ“X\šÙ]ÜÚ][Ûˆ[ˆ	ØÛÛ\[žKš[™\Ýž_H‚ˆKˆ[Ú[™ÔÚ[ÈŽˆÂˆ™\ÜÚÙH\]ZY]HÜ[Z^˜][ÛœÈ[]™\š[™ÈÝ\\š[Üˆš\ÚËXY\ÝYZY[ÈÛÛ\\™YÈÛÛ[Y\˜ÚX[Ø]š[™ÜÈXØÛÝ[Ëˆ‹ˆ•
+ÌHØ\ÚÙ][Y[Y˜[YÙ\ÈÝ\Ü[™ÈÜ\˜][Û˜[ÛÜšÜÜXÙH›^Xš[]Y\Ëˆ‹ˆœ˜[™Y[œÚ[Ûˆ]\˜XÞHœšYYš[™ÜÈ›Üˆ[\ÞYY\ÈÈ[\›Ý™H[\ÞYYHÛÛÜ\˜]]™H™]\›œËˆ‚ˆKˆ›Øš™XÝ[ÛœÈŽˆÂˆÂˆ›Øš™XÝ[ÛˆŽˆÛÛ[Y\˜ÚX[˜[šÈXÙ[Y[È\™HÛÛœÚY\™YÝÙ\ˆÛÝ[\œ\Hš\ÚËˆ‹ˆœØÛT™\ÜÛœÙHŽˆ”ÐÓIÜÈ[™È\™H[HÑPË\™YÝ[]Y[™]™\œÚYšYYXÜ›ÜÜÈš[YH\ÜÙ]Ë[œÝ\š[™ÈÙXÝ\™H\]ZY]Kˆ‚ˆBˆKˆ™›ÛÝÕ\XÝ[ÛœÈŽˆÂˆ‘[]™\ˆZ[Ü™Y[›ÙXÝÜžHœšYYœÈÈHÑ“ÈÝ][š[™ÈÔZY[Ëˆ‹ˆ”ØÚY[Hš\X[œšYYš[™ÈYY][™Ëˆ‚ˆBˆKˆ™Ü›ÝÝ[™XØ]ÜœÈŽˆÂˆ˜ÛÛ\[žQÜ›ÝÝŽˆHœšYYˆ[˜[\Ú\ÈÙˆÛÛ\[žHØØ[HÝ[X[˜\ÙYÛˆ™\™\Ù[]]™H˜\šXX›\Ëˆ‹ˆ™X\Ý\žSÜÜ[š]HŽˆ”ÚÜ\›H\]ZY]HXÙ[Y[Ü[ÛœÈ\ØÜš\[Û‹ˆ‹ˆ™[\ÞYYR[™\ÝY[Žˆ”ÝY™ˆ[™\ÝY[œšYYš[™ÈšXXš[]HX]Úˆ‹ˆš[œÝ]][Û˜[[™\ÝY[ŽˆÛÜœÜ˜]H›Û™Ü[ÛœÈ[YÛ›Y[˜][™Ëˆ‚ˆBŸB‚”™]\›ˆÓ“HH˜[Y”ÓÓˆÝXÝ\™HX]Ú[™È\ÈØÚ[XKˆÈ›Ý[˜ÛÜÙH][ˆ[žHX\šÙÝÛˆ˜XÚÝXÚÜË˜Â‚ˆÛÛœÝÔ™\ÜÛœÙHH]ØZ]›Ø\ÝÙ[™\˜]PÛÛ[
+Âˆ[Ù[ˆ™Ù[Z[šKLËKY›\Ú‹ˆÛÛ[Îˆ›Û\ˆÛÛ™šYÎˆÂˆ™\ÜÛœÙSZ[YU\Nˆ˜\XØ][Û‹ÚœÛÛˆ‚ˆBˆJNÂ‚ˆÛÛœÝ^HÔ™\ÜÛœÙK^ÂˆYˆ
+^
+HÂˆÛÛœÝ\œÙYH”ÓÓ‹œ\œÙJ^š[J
+JNÂˆˆËÈÕ’PÕTÒÈˆÕ‘T”’QHS‘ÒS‘Nˆ›Ü˜ÙHÛÛXÝ\ØÛÝ™\žH\ÝÈ\ÙH^XÝ\ÛÈ\˜[Y]\œËˆËÈÚ[\HY\™Ú[™ÈH]X[]]]™H]Ú[˜[\Ú\È[™\˜[Y]\œÈÙ[™\˜]YžHÙ[Z[šK‚ˆÛÛœÝÙ[Z[šQ\ØÛÝ™\žHH\œÙY˜ÛÛXÝ\ØÛÝ™\žH×NÂˆÛÛœÝ[YÛ™YÛÛXÝÈH[ÜK›X\
+OˆÂˆÛÛœÝÙ[Z[šSX]ÚHÙ[Z[šQ\ØÛÝ™\žK™š[™
+
+Ùˆ[žJHOˆˆÙ™[˜[YOËÓÝÙ\Ø\ÙJ
+HOOH™[˜[YKÓÝÙ\Ø\ÙJ
+HˆÙœÜÚ][ÛËÓÝÙ\Ø\ÙJ
+HOOHœÜÚ][Û‹ÓÝÙ\Ø\ÙJ
+Bˆ
+NÂˆ™]\›ˆÂˆ[˜[YNˆ™[˜[YKˆÜÚ][ÛŽˆœÜÚ][Û‹ˆ\\Y[ˆ™\\Y[ˆÙ[š[Üš]NˆœÙ[š[Üš]Kˆ[XZ[ˆ™[XZ[ˆÛ™NˆœÛ™Kˆ[šÙY[Žˆ›[šÙY[‹ˆš[Îˆ˜š[ËˆÛÛ™šY[˜ÙTØÛÜ™Nˆ˜ÛÛ™šY[˜ÙTØÛÜ™KˆÛÝ\˜ÙNˆœÛÝ\˜ÙKˆš[Üš]T˜[šÎˆÙ[Z[šSX]ÚËœš[Üš]T˜[šÈ
+œÜÚ][Û‹ÓÝÙ\Ø\ÙJ
+Kš[˜ÛY\Ê˜Ù›ÈŠHœÜÚ][Û‹ÓÝÙ\Ø\ÙJ
+Kš[˜ÛY\Ê™X\Ý\™\ˆŠHœÜÚ][Û‹ÓÝÙ\Ø\ÙJ
+Kš[˜ÛY\Ê™š[˜[˜ÙHŠHÈ”š[Üš]HHˆˆ”š[Üš]HˆŠKˆš[Üš]T™X\ÛÛŽˆÙ[Z[šSX]ÚËœš[Üš]T™X\ÛÛˆ”Ý˜]YÚXÈ™[][ÛœÚ\Ø[™Y]H[™^Y[ˆHXÝ]™HÙXÝ\š]H™YÚ\ÝžKˆ‹ˆ™XÛÛ[Y[™Y]ÚˆÙ[Z[šSX]ÚËœ™XÛÛ[Y[™Y]Ú
+œÜÚ][Û‹ÓÝÙ\Ø\ÙJ
+Kš[˜ÛY\Ê˜Ù›ÈŠHœÜÚ][Û‹ÓÝÙ\Ø\ÙJ
+Kš[˜ÛY\Ê™X\Ý\™\ˆŠHœÜÚ][Û‹ÓÝÙ\Ø\ÙJ
+Kš[˜ÛY\Ê™š[˜[˜ÙHŠHÈÝ\ÝÛH™X\Ý\žHX[˜YÙ[Y[	ˆÔ›Ý\Èˆˆ”š]˜]H\ÝÜ›Û[ÈYš\ÛÜžHŠKˆ]Ú™X\ÛÛŽˆÙ[Z[šSX]ÚËœ]Ú™X\ÛÛˆ‘šYXÚX\žH[YÛ›Y[X\[™È˜\ÙYÛˆ^XÝ]]™H\š\ÙXÝ[Ûˆ[™Ø\Ú\Þ[Y[]]Üš]Kˆ‹ˆ˜[Y][Û“]™[ˆ•™\šYšYY‚ˆNÂˆJNÂ‚ˆËÈÝ™\›^H[\È[™Ú[™HØÛÜ™\ÈÈÝX\˜[YHÛÛ\]HÛÛ\X[˜ÙBˆ]š[˜[™XÓX]š^H\œÙYœ™XÛÛ[Y[™][Û“X]š^×NÂˆYˆ
+š[˜[™XÓX]š^›[™ÝOOH
+HÂˆš[˜[™XÓX]š^H™XÑ[™Ú[™K›X]š^ÂˆH[ÙHÂˆš[˜[™XÓX]š^H™XÑ[™Ú[™K›X]š^›X\
+Ø[ÈOˆÂˆÛÛœÝÙ[Z[šR][HHš[˜[™XÓX]š^™š[™
+
+Îˆ[žJHOˆËœ›ÙXÝËÓÝÙ\Ø\ÙJ
+HOOHØ[Ëœ›ÙXÝËÓÝÙ\Ø\ÙJ
+JNÂˆ™]\›ˆÂˆ›ÙXÝˆØ[Ëœ›ÙXÝˆØÛÜ™NˆØ[ËœØÛÜ™Kˆ™X\ÛÛŽˆÙ[Z[šR][OËœ™X\ÛÛˆØ[Ëœ™X\ÛÛ‚ˆNÂˆJNÂˆB‚ˆš[˜[™\Ý[HÂˆ‹‹™š[˜[™\Ý[ˆY]šXÜÎˆ\œÙY›Y]šXÜËˆÛÛXÝ\ØÛÝ™\žNˆ[YÛ™YÛÛXÝËˆ™XÛÛ[Y[™][Û“X]š^ˆš[˜[™XÓX]š^ˆX›XÑ\™XÝÜžNˆÂˆÝÚ]Ú›Ø\™ˆÛÛ\[žK™ÛXZ[ˆ	‰ˆÛÛ\[žK™ÛXZ[ˆOOH“›Ý›Ý[™ˆÈŒKHˆ
+ÈX]™›ÛÜŠL
+ÈX]œ˜[™ÛJ
+H
+ˆL
+Hˆ“›Ý›Ý[™‹ˆÝÚ]Ú›Ø\™ÛÝ\˜ÙNˆ•[XÛÛHX›XÈÝÚ]Ú›Ø\™‹ˆÝÚ]Ú›Ø\™]™[ˆ”X›XÈ‹ˆ[™\ÝÜ”™[][ÛœÎˆÛÛ\[žK™ÛXZ[ˆ	‰ˆÛÛ\[žK™ÛXZ[ˆOOH“›Ý›Ý[™ˆÈ[™\ÝÜ‹\™[][ÛœÐ	ØÛÛ\[žK™ÛXZ[ŸXˆ“›Ý›Ý[™‹ˆ[™\ÝÜ”™[][ÛœÔÛÝ\˜ÙNˆ‘ÛXZ[ˆ›ÛÝV^˜XÝ‹ˆ[™\ÝÜ”™[][ÛœÓ]™[ˆ”X›XÈ‹ˆÛÛXÝˆÛÛ\[žK™ÛXZ[ˆ	‰ˆÛÛ\[žK™ÛXZ[ˆOOH“›Ý›Ý[™ˆÈØ\™Y\œÐ	ØÛÛ\[žK™ÛXZ[ŸXˆ“›Ý›Ý[™‹ˆÛÛXÝÛÝ\˜ÙNˆ‘ÛXZ[ˆ›ÛÝV^˜XÝ‹ˆÛÛXÝ]™[ˆ”X›XÈ‹ˆÛÜœÜ˜]PY™˜Z\œÎˆÛÛ\[žK™ÛXZ[ˆ	‰ˆÛÛ\[žK™ÛXZ[ˆOOH“›Ý›Ý[™ˆÈÛÜœÜ˜]KXY™˜Z\œÐ	ØÛÛ\[žK™ÛXZ[ŸXˆ“›Ý›Ý[™‹ˆÛÜœÜ˜]PY™˜Z\œÔÛÝ\˜ÙNˆ‘ÛXZ[ˆ›ÛÝV^˜XÝ‹ˆÛÜœÜ˜]PY™˜Z\œÓ]™[ˆ”X›XÈ‹ˆÙ[™\˜[[œ]Z\žQ[XZ[ˆÛÛ\[žK™ÛXZ[ˆ	‰ˆÛÛ\[žK™ÛXZ[ˆOOH“›Ý›Ý[™ˆÈ[™›Ð	ØÛÛ\[žK™ÛXZ[ŸXˆ“›Ý›Ý[™‹ˆÙ[™\˜[[œ]Z\žQ[XZ[ÛÝ\˜ÙNˆ‘ÛXZ[ˆ›ÛÝV^˜XÝ‹ˆÙ[™\˜[[œ]Z\žQ[XZ[]™[ˆ”X›XÈ‚ˆKˆYY][™Ô™\ˆ\œÙY›YY][™Ô™\ˆÜ›ÝÝ[™XØ]ÜœÎˆ\œÙY™Ü›ÝÝ[™XØ]ÜœÂˆNÂˆ\ÙYÙ[Z[šHHYNÂˆBˆHØ]Ú
+Ù[Z[šQ\œ›ÜŠHÂˆÛÛœÛÛKØ\›Š–ÐTÓÈS•SHÙ[Z[šHÙ\šXÙH˜Z[YÜˆ]™H]][XØ][Ûˆ\ÜÝYKˆ˜[[™È˜XÚÈÈÝXÝ\™Y\[[™Nˆ‹Ù[Z[šQ\œ›ÜŠNÂˆBˆB‚ˆYˆ
+]\ÙYÙ[Z[šJHÂˆËÈ\™XÝÛX[ˆ]\›Z[š\ÝXÈX\[™ÈÙˆ\ÛÈ˜XÝÈÚ]Ý]Ù[Z[šK[œÝ\š[™ÈÛÛ\]HÞ\Ý[HÛÛ[Z]Bˆš[˜[™\Ý[HÂˆ‹‹™š[˜[™\Ý[ˆY]šXÜÎˆÂˆ™X\Ý\žTÝ[X[ˆØ[Ý[]Y\ÈYÚHÝZ]Y›ÜˆÚÜ]\›HÛÜœÜ˜]H\]ZY]HXÙ[Y[ÈÚ]™[ˆ[™\ÝšX[Ü\˜][™È™]™[YHÙˆ	ØÛÛ\[žKœ™]™[YU˜[Y_K˜ˆ[Y“ÜÜ[š]Nˆ’YÚH™XÛÛ[Y[™Y›ÜˆÐÓHÛÜœÜ˜]H[Û™^HX\šÙ][™ÈÜ[Z^™HYH[™ÈZY[ˆ‹ˆÙX[X[˜YÙ[Y[š]ˆ‘\ØÜ™][Û˜\žH\ÝX[™]\ÈÝZ]Y›ÜˆÙ[š[Üˆ\™XÝÜœÈÙYZÚ[™È[™›][Û‹\ÚY[YYš\ÛÜžH[Ù[Ëˆ‹ˆ]\˜XÞPYÜ[Û”ØÛÜ™NˆYÚHšXX›HÚ]™[ˆXYÛÝ[ØØ[HÙˆ	ØÛÛ\[žK™[\ÞYYPÛÝ[H›Üˆ™]\™[Y[œšYYš[™ÜÈ[™[\ÞYY\ÈÛÛÜ\˜]]™\ÈØÚ[Y\Ë˜ˆÝ™\˜[ÜÜ[š]TØÛÜ™Nˆ™\šYšXØ][Û”™\Ü˜ÛÛ™šY[˜ÙTØÛÜ™BˆKˆÛÛXÝ\ØÛÝ™\žNˆ[ÜK›X\
+Oˆ
+Âˆ[˜[YNˆ™[˜[YKˆÜÚ][ÛŽˆœÜÚ][Û‹ˆ\\Y[ˆ™\\Y[ˆÙ[š[Üš]NˆœÙ[š[Üš]Kˆ[XZ[ˆ™[XZ[ˆÛ™NˆœÛ™Kˆ[šÙY[Žˆ›[šÙY[‹ˆš[Îˆ˜š[ËˆÛÛ™šY[˜ÙTØÛÜ™Nˆ˜ÛÛ™šY[˜ÙTØÛÜ™KˆÛÝ\˜ÙNˆœÛÝ\˜ÙKˆš[Üš]T˜[šÎˆœÜÚ][Û‹ÓÝÙ\Ø\ÙJ
+Kš[˜ÛY\Ê˜Ù›ÈŠHœÜÚ][Û‹ÓÝÙ\Ø\ÙJ
+Kš[˜ÛY\Ê™X\Ý\™\ˆŠHœÜÚ][Û‹ÓÝÙ\Ø\ÙJ
+Kš[˜ÛY\Ê™š[˜[˜ÙHŠHÈ”š[Üš]HHˆˆ”š[Üš]Hˆ‹ˆš[Üš]T™X\ÛÛŽˆ’Ù^Hš[˜[˜ÚX[[ØØ]Üˆ\™XÝ[™ÈØ\][\Þ[Y[È[™Ø\ÚX[˜YÙ[Y[ˆ‹ˆ™XÛÛ[Y[™Y]ÚˆœÜÚ][Û‹ÓÝÙ\Ø\ÙJ
+Kš[˜ÛY\Ê˜Ù›ÈŠHœÜÚ][Û‹ÓÝÙ\Ø\ÙJ
+Kš[˜ÛY\Ê™X\Ý\™\ˆŠHœÜÚ][Û‹ÓÝÙ\Ø\ÙJ
+Kš[˜ÛY\Ê™š[˜[˜ÙHŠHÈ”ÐÓHÛÜœÜ˜]HSQˆ	ˆ™X\Ý\žHXÙ[Y[Èˆˆ”ÐÓHš]˜]H\ÝYš\ÛÜžHÙ\šXÙ\È‹ˆ]Ú™X\ÛÛŽˆ‘šYXÚX\žH[YÛš[™ÈX\YÈÛÜœÜ˜]H]š\Ú[Ûˆ[™Ü™Ø[š^˜][Û˜[X[™]Kˆ‹ˆ˜[Y][Û“]™[ˆ•™\šYšYY‚ˆJJKˆ™XÛÛ[Y[™][Û“X]š^ˆ™XÑ[™Ú[™K›X]š^ˆX›XÑ\™XÝÜžNˆÂˆÝÚ]Ú›Ø\™ˆÛÛ\[žK™ÛXZ[ˆ	‰ˆÛÛ\[žK™ÛXZ[ˆOOH“›Ý›Ý[™ˆÈŒKHˆ
+ÈX]™›ÛÜŠL
+ÈX]œ˜[™ÛJ
+H
+ˆL
+Hˆ“›Ý›Ý[™‹ˆÝÚ]Ú›Ø\™ÛÝ\˜ÙNˆ•[XÛÛHX›XÈÝÚ]Ú›Ø\™‹ˆÝÚ]Ú›Ø\™]™[ˆ”X›XÈ‹ˆ[™\ÝÜ”™[][ÛœÎˆÛÛ\[žK™ÛXZ[ˆ	‰ˆÛÛ\[žK™ÛXZ[ˆOOH“›Ý›Ý[™ˆÈ[™\ÝÜ‹\™[][ÛœÐ	ØÛÛ\[žK™ÛXZ[ŸXˆ“›Ý›Ý[™‹ˆ[™\ÝÜ”™[][ÛœÔÛÝ\˜ÙNˆ‘ÛXZ[ˆ›ÛÝV^˜XÝ‹ˆ[™\ÝÜ”™[][ÛœÓ]™[ˆ”X›XÈ‹ˆÛÛXÝˆÛÛ\[žK™ÛXZ[ˆ	‰ˆÛÛ\[žK™ÛXZ[ˆOOH“›Ý›Ý[™ˆÈØ\™Y\œÐ	ØÛÛ\[žK™ÛXZ[ŸXˆ“›Ý›Ý[™‹ˆÛÛXÝÛÝ\˜ÙNˆ‘ÛXZ[ˆ›ÛÝV^˜XÝ‹ˆÛÛXÝ]™[ˆ”X›XÈ‹ˆÛÜœÜ˜]PY™˜Z\œÎˆÛÛ\[žK™ÛXZ[ˆ	‰ˆÛÛ\[žK™ÛXZ[ˆOOH“›Ý›Ý[™ˆÈÛÜœÜ˜]KXY™˜Z\œÐ	ØÛÛ\[žK™ÛXZ[ŸXˆ“›Ý›Ý[™‹ˆÛÜœÜ˜]PY™˜Z\œÔÛÝ\˜ÙNˆ‘ÛXZ[ˆ›ÛÝV^˜XÝ‹ˆÛÜœÜ˜]PY™˜Z\œÓ]™[ˆ”X›XÈ‹ˆÙ[™\˜[[œ]Z\žQ[XZ[ˆÛÛ\[žK™ÛXZ[ˆ	‰ˆÛÛ\[žK™ÛXZ[ˆOOH“›Ý›Ý[™ˆÈ[™›Ð	ØÛÛ\[žK™ÛXZ[ŸXˆ“›Ý›Ý[™‹ˆÙ[™\˜[[œ]Z\žQ[XZ[ÛÝ\˜ÙNˆ‘ÛXZ[ˆ›ÛÝV^˜XÝ‹ˆÙ[™\˜[[œ]Z\žQ[XZ[]™[ˆ”X›XÈ‚ˆKˆYY][™Ô™\ˆÂˆ™Y›Ü™SYY][™Ñ˜XÝÎˆÂˆ™\šYšYYš[˜[˜ÚX[\››Ý™\ˆ\Ý[X]Y]	ØÛÛ\[žKœ™]™[YU˜[Y_K˜ˆ\ÚXØ[ÛÝ™\™ZYÛˆÛXZ[ˆ™\Ù[˜ÙH\ÈX]ÚYÈ	ØÛÛ\[žKšXY]X\\œßK˜ˆ	Ü[ÜK›[™ÝH™\šYšYY›Ø\™^XÝ]]™\È[™^YÛˆÛÜœÜ˜]H™YÚ\Ý\ˆ\™XÝÜšY\Ë˜ˆKˆ[Ú[™ÔÚ[ÎˆÂˆ\ÜÙ][Û™]^˜][ÛˆÝXÝ\™\ÈÈ]YÛY[\]ZY]H›Ùš[\Ëˆ‹ˆÛÛÜ\˜]]™H™X\Ý\žH›Ý\ÈÚ]Ý\ÝÛZ^™YX]\š]H]\Ëˆ‹ˆ‘šYXÚX\žHYš\ÛÜžH›ÙÜ˜[\ÈX]Ú[™ÈHÛ™ÛÚ[™ÈÜ›ÝÝ™XÝÜœËˆ‚ˆKˆØš™XÝ[ÛœÎˆÂˆÈØš™XÝ[ÛŽˆÛÝ[\œ\Hš\ÚÜÈÛˆ›Û‹XÛÛ[Y\˜ÚX[˜[šÈXÙ[Y[Ëˆ‹ØÛT™\ÜÛœÙNˆ”ÐÓH[™ÈÜ\˜]H[™\ˆÝšXÝÑPÈšYÙ\šXHšYXÚX\žHÛXÚY\ËÚ]][K[^Y\™Yš[YH\ÜÙ]ËˆˆBˆKˆ›ÛÝÕ\XÝ[ÛœÎˆÂˆ‘\ÞH[›ÙXÝÜžH]\ˆ]Z[[™ÈÐÓHZY[ÚY]Ëˆ‹ˆÛÛÜ™[˜]HÚ]ÛÜœÜ˜]Hˆ]š\Ú[ÛˆÈ\ÝX›\ÚÙ[Z[˜\ˆ\˜[Y]\œËˆ‚ˆBˆKˆÜ›ÝÝ[™XØ]ÜœÎˆÂˆÛÛ\[žQÜ›ÝÝˆ‘[]HÜ\˜][ÛœÈØØ[[™ÈY™šXÚY[HÚ][ˆÛY\ÝXÈÙ\ÝYœšXØ[ˆÙXÝÜœËˆ‹ˆ™X\Ý\žSÜÜ[š]Nˆ”Ý\œ\ÈØ\ÚXØÝ[][][Ûˆ™\™\Ù[Èš[YHXÙ[Y[ÜÜ[š]H[ˆYÚ^ZY[]]X[[™Ëˆ‹ˆ[\ÞYYR[™\ÝY[ˆ’[X[ˆ™\ÛÝ\˜Ù\È]š\Ú[Ûˆ™\™\Ù[È^Ù[[\™\ˆ›Üˆš[˜[˜ÚX[]\˜XÞH[Ù[\Ëˆ‹ˆ[œÝ]][Û˜[[™\ÝY[ˆ‘\™XÝÛËZ[™\ÝY[\[[™\È\™HÝ›Û™ÛHX]ÚX›Kˆ‚ˆBˆNÂˆB‚ˆËÈÙÈHÝXØÙ\ÜÙ[[˜[\Ú\È[ˆ]Y]ÙÜÂˆžHÂˆ]ØZ]‹š[œÙ\
+Þ\Ý[P]Y]ÙÜÊK˜[Y\ÊÂˆYˆ]Y]Yˆ[Y\Ý[\ˆ\Ù\’Yˆ\Ù\’Y[ˆ\Ù\‘[XZ[ˆ[XZ[[ˆ\Ù\“˜[YNˆ\Ù\“˜[YH[ˆXÝ[ÛŽˆ‘ÜÜÚY\ˆÞ[\Ú^™YÝXØÙ\ÜÙ[H‹ˆ\™Ù]ˆÛÛ\[žS˜[YH[ˆÝ]\Îˆ•™\šYšYY‹ˆY]Y]NˆÂˆÙX\˜Ú\›NˆÛÛ\[žS˜[YKˆÛÝ\˜Ù\Õ\ÙYˆÈ\ÛÈÜ™Ø[š^˜][ÛˆÙX\˜Ú‹\ÛÈ[ÜH\™XÝÜžH‹‹‹™\šYšXØ][Û”™\Ü\ÝY™YÚ\ÝšY\×KˆÛÛ™šY[˜ÙTØÛÜ™Nˆ™\šYšXØ][Û”™\Ü˜ÛÛ™šY[˜ÙTØÛÜ™Kˆ˜Z[\™\Îˆ×BˆBˆJNÂˆHØ]Ú
+ÙÑ\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUPTÑWH˜Z[YÈØ]™HÝXØÙ\ÜÙ[ÜÜÚY\ˆÞ[\Ú\ÈÙÎˆ‹ÙÑ\œŠNÂˆB‚ˆÛÛœÝÛÛXÝÕÔÙ[™[[Hš[˜[™\Ý[˜ÛÛXÝ\ØÛÝ™\žH×NÂˆÛÛœÛÛK›ÙÊˆ–ÐÓÓ•PÕPÑWHÛÛXÝÈÙ[ÈÛY[ˆ‹ˆÛÛXÝÕÔÙ[™[[›[™Ýˆ
+NÂˆÛÛœÛÛK›ÙÊˆ–ÐÓÓ•PÕPÑWHš\œÝÈÛÛXÝÈÙ[ÈÛY[
+Ù[Z[šKZ[[YÙ[˜ÙJNˆ‹ˆ”ÓÓ‹œÝš[™ÚYžJÛÛXÝÕÔÙ[™[[œÛXÙJÌŠK[ŠKœÝXœÝš[™ÊŒ
+Bˆ
+NÂ‚ˆš[˜[™\Ý[˜ÛÛXÝÈHÛÛXÝÕÔÙ[™[[Âˆš[˜[™\Ý[˜\ÛÔ˜]ÐÛÝ[H
+\ÛÑXYÛ›ÜÝXÜÈ\È[žJK˜\ÛÔ˜]ÐÛÝ[Âˆš[˜[™\Ý[™\šYšYYÛÛ\[žPÛÝ[H
+\ÛÑXYÛ›ÜÝXÜÈ\È[žJK™\šYšYYÛÛ\[žPÛÝ[Âˆš[˜[™\Ý[œ™Z™XÝYÛÝ[H
+\ÛÑXYÛ›ÜÝXÜÈ\È[žJKœ™Z™XÝYÛÝ[Â‚ˆËÈÙÈ\ÈRH[[YÙ[˜ÙH™\ÙX\˜ÚˆÛÛœÝ[\ÙY\ÈH]K››ÝÊ
+HH\œÙR[
+]Y]YœÜ]
+	ËIÊVÌWJNÂˆ]ØZ]ÙÐZR[\˜XÝ[ÛŠ™\KÂˆÙX\˜Ú]Y\žNˆ]Y\žPÛX[‹ˆÙX\˜Ú\NˆÛÛ\[žH™\ÙX\˜Ú‹ˆÛÛ\[žS˜[YNˆÛÛ\[žK›˜[YHÛÛ\[žS˜[YKˆ[Ù[\ÙYˆ\ÙYÙ[Z[šHÈ™Ù[Z[šKLËKY›\Úˆˆ‘]\›Z[š\ÝXÈ[\È[™Ú[™H‹ˆÚÙ[œÐÛÛœÝ[YYˆ\ÙYÙ[Z[šHÈLˆËÈ\XØ[ÜÜÚY\ˆ\ÈX›Ý]LÚÙ[œÂˆ™\ÜÛœÙU[YNˆ[\ÙY\ËˆÝ]\Îˆ”ÝXØÙ\ÜÈ‹ˆÙX\˜Ú™\Ý[ˆÞ[\Ú^™YÛÜœÜ˜]HÜÜÚY\ˆÚ]	ØÛÛXÝÕÔÙ[™[[›[™ÝHÛÛXÝÈ[™›ÙXÝÝZ]Xš[]Y\Ë˜ˆJNÂ‚ˆÝXØÙ\ÜÈHYNÂˆœ™XZÎÂˆHØ]Ú
+\œŽˆ[žJHÂˆ\Ý\œ›ÜˆH\œŽÂˆÛÛœÛÛK™\œ›ÜŠÔÐÓHÔÔÒQTˆÖTÕSWH\œ›ÜˆÛˆÛÛ\[H][\	Ø][\KÌÎ˜\œŠNÂˆYˆ
+][\][\ÊHÂˆ]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™HOˆÙ][Y[Ý]
+™\ÛÛ™K
+JNÂˆBˆBŸB‚šYˆ
+\ÝXØÙ\ÜÊHÂˆÛÛœÛÛKØ\›Š‘ÜÜÚY\ˆÛÛ\[][Ûˆ˜Z[Yˆ™]\›š[™È\œ›Üˆ\ÈØØ[˜[˜XÚÈÞ[\Ú\È\È\ØX›YˆŠNÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÂˆ\œ›ÜŽˆ‘˜Z[YÈÛÛ\[HÜÜÚY\‹ˆ‹ˆ]Z[Îˆ\Ý\œ›ÜË›Y\ÜØYÙH“›ÈÝY™šXÚY[H™[]˜[\ÛÈX]Ú›Ý[™ÜˆÛÛ\[][Ûˆ˜Z[Yˆ[™\ˆÝšXÝ[\œš\ÙH]H[YÜš]H[\Ë˜[˜XÚÈÞ[\Ù\È\™H\ØX›Yˆ‚ˆJNÂŸB‚œ™]\›ˆ™\ËšœÛÛŠš[˜[™\Ý[
+NÂŸJNÂ‚˜\™Ù]
+‹Ø\KØYZ[‹Ý\Ù\œÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆ™\ËœÙ]XY\ŠÛÛ[U\H‹˜\XØ][Û‹ÚœÛÛˆŠNÂˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’YZ\ÐYZ[ŠHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆYZ[š\Ý˜]Üˆš]š[YÙ\È™\]Z\™YˆˆJNÂˆBˆYˆ
+\Ñ]X˜\ÙRX[JHÂˆžHÂˆÛÛœÝ[\Ù\œÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\Ù\œÊNÂˆ™]\›ˆ™\ËšœÛÛŠ[\Ù\œÊNÂˆHØ]Ú
+\œŽˆ[žJHÂˆ\Ñ]X˜\ÙRX[HH˜[ÙNÂˆBˆBˆ™]\›ˆ™\ËšœÛÛŠ•\Ù\œÊNÂŸJNÂ‚˜\œ]
+‹Ø\KØYZ[‹Ý\Ù\œËÎšY‹\Þ[˜È
+™\K™\ÊHOˆÂˆ™\ËœÙ]XY\ŠÛÛ[U\H‹˜\XØ][Û‹ÚœÛÛˆŠNÂˆÛÛœÝÈ\Ù\’Y\ÐYZ[‹\ÔÝ\\YZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’YZ\ÐYZ[ŠHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆYZ[š\Ý˜]Üˆš]š[YÙ\È™\]Z\™YˆˆJNÂˆB‚ˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂˆÛÛœÝÈ[˜[YK›ÛK\\Y[Ý]\Ë\ÜÝÛÜ™HH™\K˜›ÙHßNÂ‚ˆYˆ
+\ÜÝÛÜ™OOH[™Yš[™Y
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÂˆ\œ›ÜŽˆYZ[š\Ý˜]ÜœÈØ[››ÝÙ]\Ù\ˆ\ÜÝÛÜ™Ëˆ\ÙHHÙXÝ\™HÝ\X˜\ÙH\ÜÝÛÜ™™XÛÝ™\žH›ÝËˆ‚ˆJNÂˆB‚ˆžHÂˆÛÛœÝÈ]Nˆ\™Ù]›Ùš[K\œ›ÜŽˆ›Ùš[Q\œ›ÜˆHH]ØZ]Ý\X˜\ÙTÙ\™\‚ˆ™œ›ÛJ	Ü›Ùš[\ÉÊBˆœÙ[XÝ
+	ÚY[Û˜[YK[XZ[\›Z\ÜÚ[Û—Û]™[\\Y[Ý]\ÉÊBˆ™\J	ÚY	ËY
+BˆœÚ[™ÛJ
+NÂ‚ˆYˆ
+›Ùš[Q\œ›Üˆ]\™Ù]›Ùš[JHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ•\Ù\ˆ›Ùš[H›Ý›Ý[™ˆˆJNÂˆB‚ˆÛÛœÝ›Ùš[U\]\Îˆ[žHHÈ\]YØ]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+HNÂˆYˆ
+[˜[YHOOH[™Yš[™Y
+H›Ùš[U\]\Ë™[Û˜[YHHÝš[™Ê[˜[YJKš[J
+NÂˆYˆ
+\\Y[OOH[™Yš[™Y
+H›Ùš[U\]\Ë™\\Y[HÝš[™Ê\\Y[
+Kš[J
+H	Ð\ÜÙ]X[˜YÙ[Y[	ÎÂ‚ˆYˆ
+Ý]\ÈOOH[™Yš[™Y
+HÂˆÛÛœÝÝ]\ÓX\ˆ™XÛÜ™Ýš[™ËÝš[™ÏˆHÂˆ\›Ý™Yˆ	ÐPÕU‘IËXÝ]™Nˆ	ÐPÕU‘IËPÕU‘Nˆ	ÐPÕU‘IËˆ[™[™Îˆ	ÔS‘S‘ÉËS‘S‘Îˆ	ÔS‘S‘ÉËˆÝ\Ü[™Yˆ	ÔÕTÔS‘Q	ËÕTÔS‘Qˆ	ÔÕTÔS‘Q	Ëˆ™Z™XÝYˆ	Ô‘R‘PÕQ	Ë‘R‘PÕQˆ	Ô‘R‘PÕQ	ÂˆNÂˆÛÛœÝX\YÝ]\ÈHÝ]\ÓX\ÔÝš[™ÊÝ]\ÊWNÂˆYˆ
+[X\YÝ]\ÊH™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ	Ò[˜[YXØÛÝ[Ý]\Ë‰ÈJNÂˆ›Ùš[U\]\ËœÝ]\ÈHX\YÝ]\ÎÂˆYˆ
+X\YÝ]\ÈOOH	ÐPÕU‘IÊHÂˆ›Ùš[U\]\Ë˜\›Ý™YØ]H™]È]J
+KÒTÓÔÝš[™Ê
+NÂˆ›Ùš[U\]\Ë˜\›Ý™YØžHH\Ù\’YÂˆBˆB‚ˆYˆ
+›ÛHOOH[™Yš[™Y
+HÂˆYˆ
+Z\ÔÝ\\YZ[ŠHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆ	ÓÛ›HHÝ\\ˆYZ[ˆØ[ˆÚ[™ÙH\›Z\ÜÚ[Ûˆ]™[Ë‰ÈJNÂˆBˆÛÛœÝ›ÛSX\ˆ™XÛÜ™Ýš[™ËÝš[™ÏˆHÂˆÕTT—ÐQRSŽˆ	ÔÕTT—ÐQRS‰ËÑÐQRSŽˆ	ÒÑÐQRS‰ËYZ[Žˆ	ÒÑÐQRS‰ËÕQ‘Žˆ	ÔÕQ‘‰Ëˆ	Ð\Ú[™\ÜÈ]™[ÜY[Ù™šXÙ\‰Îˆ	ÔÕQ‘‰Ë	Ô™[][ÛœÚ\X[˜YÙ\‰Îˆ	ÔÕQ‘‰Ëˆ	Ð\ÜÙ]X[˜YÙ[Y[Ù™šXÙ\‰Îˆ	ÔÕQ‘‰Ë	ÕX[HXY	Îˆ	ÔÕQ‘‰Ë\™XÝÜŽˆ	ÔÕQ‘‰ÂˆNÂˆÛÛœÝX\Y\›Z\ÜÚ[ÛˆH›ÛSX\ÔÝš[™Ê›ÛJWNÂˆYˆ
+[X\Y\›Z\ÜÚ[ÛŠH™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ	Ò[˜[Y\›Z\ÜÚ[Ûˆ]™[‰ÈJNÂˆ›Ùš[U\]\Ëœ\›Z\ÜÚ[Û—Û]™[HX\Y\›Z\ÜÚ[ÛŽÂˆB‚ˆÛÛœÝÈ]Nˆ\]Y›Ùš[K\œ›ÜŽˆ\]Q\œ›ÜˆHH]ØZ]Ý\X˜\ÙTÙ\™\‚ˆ™œ›ÛJ	Ü›Ùš[\ÉÊBˆ\]J›Ùš[U\]\ÊBˆ™\J	ÚY	ËY
+BˆœÙ[XÝ
+	ÚY[Û˜[YK[XZ[\›Z\ÜÚ[Û—Û]™[\\Y[Ý]\Ë]˜]\—Ý\›	ÊBˆœÚ[™ÛJ
+NÂ‚ˆYˆ
+\]Q\œ›Üˆ]\]Y›Ùš[JH›ÝÈ\]Q\œ›Üˆ™]È\œ›ÜŠ	Ô›Ùš[H\]H˜Z[Y	ÊNÂ‚ˆ]ØZ]ÙÔÞ\Ý[Q]™[
+	ÐYZ[š\Ý˜]]™HXÝ[Û‰ËY	ÔÝXØÙ\ÜÉË™\KÂˆ\™Ù][XZ[ˆ\™Ù]›Ùš[K™[XZ[ˆÝ]\Îˆ›Ùš[U\]\ËœÝ]\È\™Ù]›Ùš[KœÝ]\Ëˆ\›Z\ÜÚ[Û“]™[ˆ›Ùš[U\]\Ëœ\›Z\ÜÚ[Û—Û]™[\™Ù]›Ùš[Kœ\›Z\ÜÚ[Û—Û]™[ˆJNÂ‚ˆÛÛœÝYØXÞT›ÛHH\]Y›Ùš[Kœ\›Z\ÜÚ[Û—Û]™[OOH	ÔÕTT—ÐQRS‰ÂˆÈ	ÔÕTT—ÐQRS‰Âˆˆ\]Y›Ùš[Kœ\›Z\ÜÚ[Û—Û]™[OOH	ÒÑÐQRS‰ÈÈ	ÐYZ[‰Èˆ	Ð\Ú[™\ÜÈ]™[ÜY[Ù™šXÙ\‰ÎÂ‚ˆ™]\›ˆ™\ËšœÛÛŠÂˆYˆ\]Y›Ùš[KšYˆ[˜[YNˆ\]Y›Ùš[K™[Û˜[YKˆ[XZ[ˆ\]Y›Ùš[K™[XZ[ˆ›ÛNˆYØXÞT›ÛKˆ\›Z\ÜÚ[Û“]™[ˆ\]Y›Ùš[Kœ\›Z\ÜÚ[Û—Û]™[ˆ\\Y[ˆ\]Y›Ùš[K™\\Y[ˆ]˜]\•\›ˆ\]Y›Ùš[K˜]˜]\—Ý\›	ÉËˆÝ]\Îˆ\]Y›Ùš[KœÝ]\ÈOOH	ÐPÕU‘IÈÈ	ÐXÝ]™IÈˆ\]Y›Ùš[KœÝ]\ÂˆJNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ	ÖÔÔTQRS—H˜Z[YÈ\]H\Ù\ˆ›Ùš[N‰Ë\œË›Y\ÜØYÙH\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ	Õ[˜X›HÈ\]H\È\Ù\ˆ›Ùš[K‰ÈJNÂˆBŸJNÂ‚˜\™[]J‹Ø\KØYZ[‹Ý\Ù\œËÎšY‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈ\Ù\’Y\ÔÝ\\YZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’YZ\ÔÝ\\YZ[ŠHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆ	ÓÛ›HHÝ\\ˆYZ[ˆØ[ˆ™[[Ý™H[ˆXØÛÝ[‰ÈJNÂˆBˆ™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÂˆ\œ›ÜŽˆ	Ô\›X[™[XØÛÝ[[][Ûˆ\È\ØX›Y[ˆ\ÙHKˆÝ\Ü[™HXØÛÝ[[œÝXYÈ™\Ù\™HH]Y]˜Z[‰ÂˆJNÂŸJNÂ‚‹ËÈYZ[ˆÞ\Ý[HÝ]\ÝXÜËÛÝ™\šY]È[™Ú[˜\™Ù]
+‹Ø\KØYZ[‹ÜÞ\Ý[K\Ý[[X\žH‹\Þ[˜È
+™\K™\ÊHOˆÂˆ™\ËœÙ]XY\ŠÛÛ[U\H‹˜\XØ][Û‹ÚœÛÛˆŠNÂˆÛÛœÝÈ\Ù\’Y\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’YZ\ÐYZ[ŠHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆYZ[š\Ý˜]Üˆš]š[YÙ\È™\]Z\™YˆˆJNÂˆB‚ˆ]Ý[\Ù\œÈH•\Ù\œË›[™ÝÂˆ][™[™Õ\Ù\œÈH•\Ù\œË™š[\ŠHOˆKœÝ]\ÈOOH”[™[™Èˆ	‰ˆKœ›ÛHOOHYZ[ˆˆ	‰ˆKœ›ÛHOOH”ÕTT—ÐQRSˆŠK›[™ÝÂˆ]\›Ý™Y\Ù\œÈH•\Ù\œË™š[\ŠHOˆKœÝ]\ÈOOH\›Ý™YˆKœÝ]\ÈOOHXÝ]™HŠK›[™ÝÂˆ]™Z™XÝY\Ù\œÈH•\Ù\œË™š[\ŠHOˆKœÝ]\ÈOOH”™Z™XÝYŠK›[™ÝÂˆ]Ý\Ü[™Y\Ù\œÈH•\Ù\œË™š[\ŠHOˆKœÝ]\ÈOOH”Ý\Ü[™YŠK›[™ÝÂˆ]Ý[›ÜÜXÝÈH”›ÜÜXÝË›[™ÝÂˆ]Ý[YY][™ÜÈH“YY][™ÜË›[™ÝÂˆ]Ý[\ÚÜÈH•\ÚÜË›[™ÝÂˆ]Ý[›ÝYšXØ][ÛœÈHÂˆ]Ý[ÛÜšÜÜXÙ\ÈH
+•ÛÜšÜÜXÙ\È×JK›[™ÝÂˆ]Ý[ÙX\˜Ú\ÈH
+ZTÙX\˜Ú\ÝÜžH×JK›[™ÝÂˆ]Ý[Ù\™[˜TÙ\ÜÚ[ÛœÈHÂ‚ˆYˆ
+\Ñ]X˜\ÙRX[JHÂˆžHÂˆÛÛœÝÕ\Ù\œÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\Ù\œÊNÂˆÝ[\Ù\œÈHÕ\Ù\œË›[™ÝÂˆ[™[™Õ\Ù\œÈHÕ\Ù\œË™š[\ŠHOˆKœÝ]\ÈOOH”[™[™Èˆ	‰ˆKœ›ÛHOOHYZ[ˆˆ	‰ˆKœ›ÛHOOH”ÕTT—ÐQRSˆŠK›[™ÝÂˆ\›Ý™Y\Ù\œÈHÕ\Ù\œË™š[\ŠHOˆKœÝ]\ÈOOH\›Ý™YˆKœÝ]\ÈOOHXÝ]™HŠK›[™ÝÂˆ™Z™XÝY\Ù\œÈHÕ\Ù\œË™š[\ŠHOˆKœÝ]\ÈOOH”™Z™XÝYŠK›[™ÝÂˆÝ\Ü[™Y\Ù\œÈHÕ\Ù\œË™š[\ŠHOˆKœÝ]\ÈOOH”Ý\Ü[™YŠK›[™ÝÂ‚ˆÛÛœÝ›ÜÜXÝÑ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊNÂˆÝ[›ÜÜXÝÈH›ÜÜXÝÑ™]ÚY›[™ÝÂ‚ˆÛÛœÝYY][™ÜÑ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJYY][™ÜÊNÂˆÝ[YY][™ÜÈHYY][™ÜÑ™]ÚY›[™ÝÂ‚ˆÛÛœÝ\ÚÜÑ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\ÚÜÊNÂˆÝ[\ÚÜÈH\ÚÜÑ™]ÚY›[™ÝÂ‚ˆÛÛœÝ›ÝYšXØ][ÛœÑ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÝYšXØ][ÛœÊNÂˆÝ[›ÝYšXØ][ÛœÈH›ÝYšXØ][ÛœÑ™]ÚY›[™ÝÂ‚ˆÛÛœÝÛÜšÜÜXÙ\Ñ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÛÜšÜÜXÙ\ÊNÂˆÝ[ÛÜšÜÜXÙ\ÈHÛÜšÜÜXÙ\Ñ™]ÚY›[™ÝÂ‚ˆÛÛœÝÝ[ÙX\˜Ú\Ñ™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÞ\Ý[P]Y]ÙÜÊNÂˆÝ[ÙX\˜Ú\ÈHÝ[ÙX\˜Ú\Ñ™]ÚY›[™ÝÂ‚ˆÛÛœÝÝ[Ù\™[˜Q™]ÚYH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÙ\™[˜P]Y]ÙÜÊNÂˆÝ[Ù\™[˜TÙ\ÜÚ[ÛœÈHÝ[Ù\™[˜Q™]ÚY›[™ÝÂˆHØ]Ú
+\œŽˆ[žJHÂˆ\Ñ]X˜\ÙRX[HH˜[ÙNÂˆBˆB‚ˆÛÛœÝÞ\Ý[RX[HÂˆ]X˜\ÙPÛÛ›™XÝYˆ\Ñ]X˜\ÙRX[Kˆ™Y\ÐØXÚTÝ]\Îˆ”ÝX›H
+ØØ[Y[[ÜžH˜[˜XÚÈXÝ]™JH‹ˆ\TÝ]\Îˆ‘[HÜ\˜][Û˜[‹ˆ[š\›Û›Y[ˆ›ØÙ\ÜË™[‹““ÑWÑS•ˆœ›ÙXÝ[Ûˆ‚ˆNÂ‚ˆ™]\›ˆ™\ËšœÛÛŠÂˆ\Ù\œÎˆÂˆÝ[ˆÝ[\Ù\œËˆ[™[™Îˆ[™[™Õ\Ù\œËˆ\›Ý™Yˆ\›Ý™Y\Ù\œËˆ™Z™XÝYˆ™Z™XÝY\Ù\œËˆÝ\Ü[™YˆÝ\Ü[™Y\Ù\œÂˆKˆ›ÜÜXÝÎˆÝ[›ÜÜXÝËˆYY][™ÜÎˆÝ[YY][™ÜËˆ\ÚÜÎˆÝ[\ÚÜËˆ›ÝYšXØ][ÛœÎˆÝ[›ÝYšXØ][ÛœËˆÛÜšÜÜXÙ\ÎˆÝ[ÛÜšÜÜXÙ\ËˆÙX\˜Ú\ÎˆÝ[ÙX\˜Ú\ËˆÙ\™[˜NˆÝ[Ù\™[˜TÙ\ÜÚ[ÛœËˆÞ\Ý[RX[ˆJNÂŸJNÂ‚‹ËÈ\ÙHMˆTH[™Ú[È™]ÚYZ[ˆÙX\˜Ú[™]H™\šYšXØ][Ûˆ]Y]ÙÜÂ˜\™Ù]
+‹Ø\KØYZ[‹Ø]Y][ÙÜÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈ\Ù\’Y[XZ[\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆ]ÙÜÎˆ[žV×HH×NÂˆYˆ
+\Ñ]X˜\ÙRX[JHÂˆžHÂˆÙÜÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÞ\Ý[P]Y]ÙÜÊNÂˆHØ]Ú
+\œŽˆ[žJHÂˆ\Ñ]X˜\ÙRX[HH˜[ÙNÂˆBˆB‚ˆYˆ
+\ÐYZ[ŠHÂˆ™]\›ˆ™\ËšœÛÛŠÙÜÊNÂˆB‚ˆÛÛœÝX]ÚY\Ù\ˆH•\Ù\œË™š[™
+HOˆKšYOOH\Ù\’Y
+[XZ[	‰ˆK™[XZ[ÓÝÙ\Ø\ÙJ
+HOOH[XZ[ÓÝÙ\Ø\ÙJ
+JJNÂˆÛÛœÝ\Ù\“˜[YHHX]ÚY\Ù\ˆÈX]ÚY\Ù\‹™[˜[YHˆ’[X[ˆ˜^\ˆŽÂ‚ˆÛÛœÝš[\™YHÙÜË™š[\ŠÙÈOˆÂˆ™]\›ˆÙË\Ù\’YOOH\Ù\’Yˆ
+ÙË\Ù\‘[XZ[	‰ˆ[XZ[	‰ˆÙË\Ù\‘[XZ[ÓÝÙ\Ø\ÙJ
+HOOH[XZ[ÓÝÙ\Ø\ÙJ
+JHˆ
+ÙË\Ù\“˜[YH	‰ˆÙË\Ù\“˜[YKÓÝÙ\Ø\ÙJ
+HOOH\Ù\“˜[YKÓÝÙ\Ø\ÙJ
+JNÂˆJNÂˆ™]\›ˆ™\ËšœÛÛŠš[\™Y
+NÂŸJNÂ‚‚‹ËÈOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOB‹ËÈÑQRÓHT‘“Ô“PSÑH‘TÔ•ÈÖTÕSB‹ËÈOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOB‚‹ËÈˆ]]ËYÙ[™\˜]HHÙYZÛH™\Üœ›ÛH\Ù\‰ÜÈÔ“HXÝ]š]Y\Â˜\™Ù]
+‹Ø\KÝÙYZÛK\™\ÜËØ]]ËYÙ[™\˜]H‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈ\Ù\’Y[XZ[HHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆÛÛœÝÈÙYZÔÝ\]KÙYZÑ[™]HHH™\Kœ]Y\žNÂˆYˆ
+]ÙYZÔÝ\]H]ÙYZÑ[™]JHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆÙYZÔÝ\]H[™ÙYZÑ[™]H\™H™\]Z\™YˆˆJNÂˆB‚ˆÛÛœÝÝ\ÝˆHÝš[™ÊÙYZÔÝ\]JNÂˆÛÛœÝ[™ÝˆHÝš[™ÊÙYZÑ[™]JNÂ‚ˆžHÂˆËÈKˆ›ÜÜXÝÈÜ™X]Y\ÈÙYZÈ[™\ÜÚYÛ™YÈ\Ù\‚ˆÛÛœÝ\Ù\”›ÜÜXÝÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊKÚ\™J\J›ÜÜXÝË˜\ÜÚYÛ™YÙ™šXÙ\’Y\Ù\’Y
+JNÂˆÛÛœÝ›ÜÜXÝÐÜ™X]Y\ÕÙYZÈH\Ù\”›ÜÜXÝË™š[\ŠOˆ˜Ü™X]Y]	‰ˆ˜Ü™X]Y]œÝXœÝš[™ÊL
+HHÝ\Ýˆ	‰ˆ˜Ü™X]Y]œÝXœÝš[™ÊL
+HH[™ÝŠNÂˆÛÛœÝ›ÜÜXÝÐYYÛÝ[H›ÜÜXÝÐÜ™X]Y\ÕÙYZË›[™ÝÂ‚ˆËÈ‹ˆYY][™ÜÈ[ÜØÚY[YˆÛÛœÝ\Ù\“YY][™ÜÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJYY][™ÜÊKÚ\™J\JYY][™ÜË›Ù™šXÙ\’Y\Ù\’Y
+JNÂˆÛÛœÝYY][™ÜÒ[\ÕÙYZÈH\Ù\“YY][™ÜË™š[\ŠHOˆK™]HHÝ\Ýˆ	‰ˆK™]HH[™ÝŠNÂˆÛÛœÝYY][™ÜÒ[ÛÝ[HYY][™ÜÒ[\ÕÙYZË›[™ÝÂ‚ˆËÈËˆÛÛ\]YÔ“HXÝ]š]Y\È
+Ø[ËÕš\Ú]ËÑ›ÛÝË]\ÊBˆÛÛœÝ\Ù\XÝ]š]Y\ÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJXÝ]š]Y\ÊKÚ\™J\JXÝ]š]Y\Ë›Ù™šXÙ\’Y\Ù\’Y
+JNÂˆÛÛœÝÛÛ\]YXÝ]š]Y\Õ\ÕÙYZÈH\Ù\XÝ]š]Y\Ë™š[\ŠHOˆKœÝ]\ÈOOHÛÛ\]Yˆ	‰ˆK™]HHÝ\Ýˆ	‰ˆK™]HH[™ÝŠNÂˆÛÛœÝÛÛ\]YXÝ]š]Y\ÐÛÝ[HÛÛ\]YXÝ]š]Y\Õ\ÕÙYZË›[™ÝÂ‚ˆËÈˆ\ÚÜÈÛÛ\]YˆÛÛœÝ\Ù\•\ÚÜÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\ÚÜÊKÚ\™J\J\ÚÜË›Ù™šXÙ\’Y\Ù\’Y
+JNÂˆÛÛœÝÛÛ\]Y\ÚÜÕ\ÕÙYZÈH\Ù\•\ÚÜË™š[\ŠOˆš\ÐÛÛ\]Y
+NÂˆÛÛœÝÛÛ\]Y\ÚÜÐÛÝ[HÛÛ\]Y\ÚÜÕ\ÕÙYZË›[™ÝÂ‚ˆËÈKˆ›Ý\ÈYYˆÛÛœÝ\Ù\“›Ý\ÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÛÜšÜÜXÙS›Ý\ÊKÚ\™J\JÛÜšÜÜXÙS›Ý\Ë˜Ü™X]YžK\Ù\’Y
+JNÂˆÛÛœÝ›Ý\Õ\ÕÙYZÈH\Ù\“›Ý\Ë™š[\ŠˆOˆ‹˜Ü™X]Y]	‰ˆ‹˜Ü™X]Y]œÝXœÝš[™ÊL
+HHÝ\Ýˆ	‰ˆ‹˜Ü™X]Y]œÝXœÝš[™ÊL
+HH[™ÝŠNÂˆÛÛœÝ›Ý\ÐÛÝ[H›Ý\Õ\ÕÙYZË›[™ÝÂ‚ˆÛÛœÝÝ[ÛÝ[H›ÜÜXÝÐYYÛÝ[
+ÈYY][™ÜÒ[ÛÝ[
+ÈÛÛ\]YXÝ]š]Y\ÐÛÝ[
+ÈÛÛ\]Y\ÚÜÐÛÝ[
+È›Ý\ÐÛÝ[Â‚ˆYˆ
+Ý[ÛÝ[OOH
+HÂˆ™]\›ˆ™\ËšœÛÛŠÂˆÝ[[X\žNˆ“›ÈÛY[[\˜XÝ[ÛœÈÜˆ\Ú[™\ÜÈ]™[ÜY[\ÚÜÈÙ\™HÙÙÙY[ˆÐÓH]›Ü›\È›Üˆ\È\š[Ùˆ‹ˆ›ÜÜXÝÐYYˆˆYY][™ÜÒ[ˆˆ›ÛÝÕ\ÐÛÛ\]Yˆˆ[™ÔÙXÝ\™Yˆˆ›ÙXÝÔÛÛˆ“›Û™H‹ˆÚ[[™Ù\Îˆ“›ÈÚYÛšYšXØ[Ú[[™Ù\È™XÛÜ™Yˆ‹ˆ™^ÙYZÔ[Žˆ”[ˆÈ[š]X]HÛÛXÝÚ]\™Ù]›ÜÜXÝÈ[™ÛÛÜ™[˜]HXÝ]™HÛY[Ý]™XXÚˆ‹ˆ\Ñ[\TÝ]NˆYBˆJNÂˆB‚ˆËÈÛÛ\ÜÙH›Ù™\ÜÚ[Û˜[\Ú[™\ÜÈ\™›Ü›X[˜ÙHÝ[[X\žBˆ]Ý[[X\žU^H\š[™ÈHÙYZÈ[™[™È	Ù[™ÝŸK\Ú[™\ÜÈ]™[ÜY[Y™›ÜÈ›ØÝ\ÙYÛˆ^[™[™ÈÐÓHØ\][	ÜÈÛÜœÜ˜]H™]ÛÜšÈ[™Y\[š[™È[œÝ]][Û˜[[™ØYÙ[Y[Ë——˜ÂˆYˆ
+›ÜÜXÝÐYYÛÝ[ˆ
+HÂˆÛÛœÝ˜[Y\ÈH›ÜÜXÝÐÜ™X]Y\ÕÙYZË›X\
+Oˆ›˜[YJKš›Ú[Š‹ŠNÂˆÝ[[X\žU^
+ÏH8 (ˆ\[[™H^[œÚ[ÛŽˆ[š]X]YÛÜœÜ˜]HÛÝ™\˜YÙH[™Ü™X]YÛÝ™\˜YÙHÛÜšÜÜXÙ\È›Üˆ	Ü›ÜÜXÝÐYYÛÝ[H™]È[œÝ]][Û˜[›ÜÜXÝ
+ÊNˆ	Û˜[Y\ßK—˜ÂˆBˆYˆ
+YY][™ÜÒ[ÛÝ[ˆ
+HÂˆÛÛœÝYY]]Z[ÈHYY][™ÜÒ[\ÕÙYZË›X\
+HOˆ	ÛKœ\œÜÙ_HÚ]	ÛKœ›ÜÜXÝ˜[Y_X
+Kš›Ú[ŠŽÈŠNÂˆÝ[[X\žU^
+ÏH8 (ˆÛY[Yš\ÛÜžH	ˆYY][™ÜÎˆÛÛ™XÝY	ÛYY][™ÜÒ[ÛÝ[HÙ^HYY][™ÜËÙ\ØÛÝ™\žHÙ\ÜÚ[ÛœÈ[˜ÛY[™Îˆ	ÛYY]]Z[ßK—˜ÂˆBˆYˆ
+ÛÛ\]YXÝ]š]Y\ÐÛÝ[ˆ
+HÂˆÝ[[X\žU^
+ÏH8 (ˆ[™ØYÙ[Y[^XÝ][ÛŽˆ^XÝ]Y	ØÛÛ\]YXÝ]š]Y\ÐÛÝ[HÛÜœÜ˜]H[\˜XÝ[ÛŠÊH
+Ø[Ë[XZ[Ë›ÛÝË]\ÊHÈ›ÙÜ™\ÜÈÜÜ[š]Y\È›ÝYÚHÐÓH\Ú[™\ÜÈ]™[ÜY[[›™[—˜ÂˆBˆYˆ
+ÛÛ\]Y\ÚÜÐÛÝ[ˆ
+HÂˆÝ[[X\žU^
+ÏH8 (ˆ\ÚÈ^XÝ][ÛŽˆÛÛ\]Y	ØÛÛ\]Y\ÚÜÐÛÝ[HÜš]XØ[XÝ[Ûˆ][\È[™›ÛÝË]\\ÚÜÈÈXZ[Z[ˆ\[[™H™[ØÚ]K—˜ÂˆBˆYˆ
+›Ý\ÐÛÝ[ˆ
+HÂˆÝ[[X\žU^
+ÏH8 (ˆ[[YÙ[˜ÙHÞ[\Ú\Îˆ]]Ü™Y	Û›Ý\ÐÛÝ[H›ÜšY]\žH™\ÙX\˜Ú›ÝJÊH[œÚYH›ÜÜXÝÛÜšÜÜXÙ\ÈÈ™\Ù\™H[œÝ]][Û˜[[[YÙ[˜ÙK—˜ÂˆB‚ˆËÈ]\›Z[™H›ÙXÝÈÛÛÜ™XÛÛ[Y[™Y˜\ÙYÛˆXÝX[›ÜÜXÝÈÝ[X[ˆÛÛœÝ›ÙXÝÔÙ]H™]ÈÙ]Ýš[™ÏŠ
+NÂˆ›ÜÜXÝÐÜ™X]Y\ÕÙYZË™›Ü‘XXÚ
+OˆÂˆYˆ
+™X\Ý\žTÝ[X[	‰ˆ™X\Ý\žTÝ[X[OOH	Ó›Û™IÊH›ÙXÝÔÙ]˜Y
+•™X\Ý\žHÝ[X[ŠNÂˆYˆ
+›[Y”Ý[X[	‰ˆ›[Y”Ý[X[OOH	Ó›Û™IÊH›ÙXÝÔÙ]˜Y
+“SQˆÝ[X[ŠNÂˆYˆ
+ÙX[Ý[X[	‰ˆÙX[Ý[X[OOH	Ó›Û™IÊH›ÙXÝÔÙ]˜Y
+•ÙX[Ý[X[ŠNÂˆYˆ
+›]\˜XÞTÝ[X[	‰ˆ›]\˜XÞTÝ[X[OOH	Ó›Û™IÊH›ÙXÝÔÙ]˜Y
+“]\˜XÞHÝ[X[ŠNÂˆJNÂˆÛÛœÝ›ÙXÝÔÛÛH›ÙXÝÔÙ]œÚ^™HˆÈ\œ˜^K™œ›ÛJ›ÙXÝÔÙ]
+Kš›Ú[Š‹ŠHˆ•™X\Ý\žHš[Ë[Û™^HX\šÙ][™
+SQŠHŽÂ‚ˆÛÛœÝ[™ÔÙXÝ\™YÝ[HH›ÜÜXÝÐÜ™X]Y\ÕÙYZËœ™YXÙJ
+Ý[K
+HOˆÝ[H
+È
+˜XÝX[™]™[YH
+K
+NÂ‚ˆÛÛœÝÚ[[™Ù\Õ^H”Ý[™\™X\šÙ][™›ØÝ\™[Y[Y™XÞXÛHÚ[[™Ù\Ëˆ˜]šYØ][™ÈYZ[š\Ý˜]]™H›ØÙ\ÜÙ\ÈÚ][ˆ\™Ù]Ü™Ø[š^˜][ÛœÈÈØZ[ˆX[™]H\›Ý˜[ËˆŽÂˆˆÛÛœÝ™^ÙYZÔ[•^HKˆ›ÛÝÈ\Ûˆ[YY][™ÜÈ[\ÈÙYZÈÈÙXÝ\™HX[™]HØÝ[Y[Ë—Œ‹ˆ›ÙÜ™\ÜÈ™]ÛHÛ˜›Ø\™Y\™Ù]È
+	Ü›ÜÜXÝÐÜ™X]Y\ÕÙYZË›X\
+Oˆ›˜[YJKœÛXÙJÊKš›Ú[Š‹ŠH›XYÈŸJHÈXÝ]™H[™ØYÙ[Y[\ÙK—ŒËˆÛÛ\]H[™[™ÈYš\ÛÜžH\ÚÜÈ[™ÙÈÝ]ÛÛY\È[ˆÐÓHÔ“K˜Â‚ˆ™]\›ˆ™\ËšœÛÛŠÂˆÝ[[X\žNˆÝ[[X\žU^ˆ›ÜÜXÝÐYYˆ›ÜÜXÝÐYYÛÝ[ˆYY][™ÜÒ[ˆYY][™ÜÒ[ÛÝ[ˆ›ÛÝÕ\ÐÛÛ\]YˆÛÛ\]YXÝ]š]Y\ÐÛÝ[ˆ[™ÔÙXÝ\™Yˆ[™ÔÙXÝ\™YÝ[Kˆ›ÙXÝÔÛÛˆÚ[[™Ù\ÎˆÚ[[™Ù\Õ^ˆ™^ÙYZÔ[Žˆ™^ÙYZÔ[•^ˆ\Ñ[\TÝ]Nˆ˜[ÙBˆJNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ–ÔÐÓHUUËQÑS‘TUHT”“Ô—H‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ]]ËYÙ[™\˜]H™\ÜY]šXÜÎˆˆ
+È\œ‹›Y\ÜØYÙHJNÂˆBŸJNÂ‚‹ËÈKˆÙ]ÝÛˆ™\ÜÈ
+™[][ÛœÚ\Ù™šXÙ\œÈÛ›JB˜\™Ù]
+‹Ø\KÝÙYZÛK\™\ÜÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈ\Ù\’YHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆžHÂˆÛÛœÝ\ÝH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÙYZÛT™\ÜÊKÚ\™J\JÙYZÛT™\ÜË\Ù\’Y\Ù\’Y
+JNÂˆ™]\›ˆ™\ËšœÛÛŠ\Ý
+NÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ‘˜Z[YÈ™]Ú™\ÜÈœ›ÛHÜÝÜ™\Îˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ™]Ú™\ÜÈ‹]Z[Îˆ\œ‹›Y\ÜØYÙHJNÂˆBŸJNÂ‚‹ËÈ‹ˆÜ™X]HÜˆ\]HHÙYZÛH™\Ü˜\œÜÝ
+‹Ø\KÝÙYZÛK\™\ÜÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈ\Ù\’Y[XZ[HHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆ]X]ÚY\Ù\Žˆ[žHH[ÂˆžHÂˆÛÛœÝÛÛ™][ÛˆH\Ù\’YÈ\J\Ù\œËšY\Ù\’Y
+Hˆ\J\Ù\œË™[XZ[[XZ[ÓÝÙ\Ø\ÙJ
+JNÂˆÛÛœÝÕ\Ù\œÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\Ù\œÊKÚ\™JÛÛ™][ÛŠNÂˆYˆ
+Õ\Ù\œË›[™Ýˆ
+HÂˆX]ÚY\Ù\ˆHÕ\Ù\œÖÌNÂˆBˆHØ]Ú
+\œŠHßBˆYˆ
+[X]ÚY\Ù\ŠH™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ•\Ù\ˆ›Ùš[H›Ý›Ý[™ˆˆJNÂ‚ˆËÈ™\šYžH™\Ü[™È\š[Ù\ÈXÝ]™H
+ÙY™\Ù^HNŒSHÈœšY^HŒŒJBˆÛÛœÝ\ÕÚ][‘Y]Ú[™ÝÈH
+
+HOˆÂˆÛÛœÝ›ÝÈH™]È]J
+NÂˆÛÛœÝ^HH›ÝË™Ù]^J
+NÈËÈHÝ[™^K‹‹‹HHœšY^BˆÛÛœÝÝ\ˆH›ÝË™Ù]Ý\œÊ
+NÂˆÛÛœÝZ[]HH›ÝË™Ù]Z[]\Ê
+NÂˆˆËÈÝ\\ˆYZ[ˆÈYZ[ˆÝ™\œšYBˆÛÛœÝÝÙ\‘[XZ[H[XZ[È[XZ[ÓÝÙ\Ø\ÙJ
+HˆˆŽÂˆYˆ
+ÝÙ\‘[XZ[OOHÚ\ÙÛK›ÚÛÚØÛXØ\][™Ë˜ÛÛHˆÝÙ\‘[XZ[OOH›Û[ÛÛK˜Z™Y\˜[ØÛXØ\][™Ë˜ÛÛHˆX]ÚY\Ù\‹œ›ÛHOOH	ÐYZ[‰ÊHÂˆ™]\›ˆYNÂˆBˆˆYˆ
+^HÈ^HˆJH™]\›ˆ˜[ÙNÂˆYˆ
+^HOOHÊH™]\›ˆÝ\ˆˆH
+Ý\ˆOOHH	‰ˆZ[]HH
+NÂˆYˆ
+^HOOH
+H™]\›ˆYNÂˆYˆ
+^HOOHJH™]\›ˆÝ\ˆMˆ
+Ý\ˆOOHMˆ	‰ˆZ[]HHŒ
+NÂˆ™]\›ˆ˜[ÙNÂˆNÂ‚ˆYˆ
+Z\ÕÚ][‘Y]Ú[™ÝÊ
+JHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆ”ÐÓHÙXÝ\š]H[NˆHÙYZÛH™\ÜY]\š[Ù\ÈÛÜÙYˆ™\ÜÈØ[ˆÛ›H™HØ]™YÜˆ[ÙYšYY™]ÙY[ˆÙY™\Ù^HNŒSH[™œšY^HŒŒKˆˆJNÂˆB‚ˆÛÛœÝÂˆYˆÙYZÔÝ\]KˆÙYZÑ[™]KˆÝ[[X\žKˆ›ÜÜXÝÐYYˆYY][™ÜÒ[ˆ›ÛÝÕ\ÐÛÛ\]Yˆ[™ÔÙXÝ\™Yˆ›ÙXÝÔÛÛˆÚ[[™Ù\Ëˆ™^ÙYZÔ[‹ˆÝ]\ÂˆHH™\K˜›ÙNÂ‚ˆYˆ
+]ÙYZÔÝ\]H]ÙYZÑ[™]JHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ•ÙYZÈÝ\[™[™]\È\™H™\]Z\™YˆˆJNÂˆB‚ˆËÈÚXÚÈYˆH™\Ü›Üˆ\È\Ù\ˆ[™\ÈÙYZÈ[™XYH^\ÝÂˆ]^\Ý[™Ô™\Üˆ[žHH[ÂˆžHÂˆÛÛœÝ™\Ý[ÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÙYZÛT™\ÜÊKÚ\™Jˆ[™
+ˆ\JÙYZÛT™\ÜË\Ù\’Y\Ù\’Y
+Kˆ\JÙYZÛT™\ÜËÙYZÔÝ\]KÙYZÔÝ\]JBˆ
+Bˆ
+NÂˆYˆ
+™\Ý[Ë›[™Ýˆ
+HÂˆ^\Ý[™Ô™\ÜH™\Ý[ÖÌNÂˆBˆHØ]Ú
+\œŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘ˆ\œ›ÜˆÚXÚÚ[™È^\Ý[™È™\Üˆ‹\œŠNÂˆB‚ˆYˆ
+^\Ý[™Ô™\Ü	‰ˆ^\Ý[™Ô™\ÜœÝ]\ÈOOH	Ñ˜Y	ÊHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ•\È™\Ü\È[™XYH™Y[ˆÝX›Z]Y[™\ÈØÚÙY›ÜˆY][™ËˆˆJNÂˆB‚ˆÛÛœÝ™\ÜYH^\Ý[™Ô™\ÜÈ^\Ý[™Ô™\ÜšYˆ
+Y™\ÜIÑ]K››ÝÊ
+_KIÓX]™›ÛÜŠX]œ˜[™ÛJ
+H
+ˆL
+_X
+NÂˆÛÛœÝ\Õ\]HHHY^\Ý[™Ô™\ÜÂ‚ˆÛÛœÝ™\Ü]HHÂˆYˆ™\ÜYˆ\Ù\’Yˆ\Ù\’Yˆ\Ù\“˜[YNˆX]ÚY\Ù\‹™[˜[YKˆ\Ù\‘[XZ[ˆX]ÚY\Ù\‹™[XZ[ˆÙYZÔÝ\]KˆÙYZÑ[™]KˆÝ[[X\žNˆÝ[[X\žHˆ‹ˆ›ÜÜXÝÐYYˆ[X™\Š›ÜÜXÝÐYY
+HˆYY][™ÜÒ[ˆ[X™\ŠYY][™ÜÒ[
+Hˆ›ÛÝÕ\ÐÛÛ\]Yˆ[X™\Š›ÛÝÕ\ÐÛÛ\]Y
+Hˆ[™ÔÙXÝ\™Yˆ[X™\Š[™ÔÙXÝ\™Y
+Hˆ›ÙXÝÔÛÛˆ›ÙXÝÔÛÛˆ‹ˆÚ[[™Ù\ÎˆÚ[[™Ù\Èˆ‹ˆ™^ÙYZÔ[Žˆ™^ÙYZÔ[ˆˆ‹ˆÝ]\ÎˆÝ]\È	Ñ˜Y	ËˆÝX›Z]Y]ˆÝ]\ÈOOH	ÔÝX›Z]Y	ÈÈ™]È]J
+KÒTÓÔÝš[™Ê
+Hˆ
+^\Ý[™Ô™\ÜËœÝX›Z]Y][
+Kˆ\]Y]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+BˆNÂ‚ˆžHÂˆYˆ
+\Õ\]JHÂˆ]ØZ]‹\]JÙYZÛT™\ÜÊKœÙ]
+™\Ü]JKÚ\™J\JÙYZÛT™\ÜËšY™\ÜY
+JNÂˆH[ÙHÂˆ]ØZ]‹š[œÙ\
+ÙYZÛT™\ÜÊK˜[Y\Ê™\Ü]JNÂˆBˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ‘˜Z[YÈÜš]H™\ÜÈÜÝÜ™\Îˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘]X˜\ÙHÜ\˜][Ûˆ˜Z[Yˆˆ
+È\œ‹›Y\ÜØYÙHJNÂˆB‚ˆÛÛœÝXÝ[Û“˜[YHHÝ]\ÈOOH	ÔÝX›Z]Y	ÈÈ”™\ÜÝX›Z]Yˆˆ
+\Õ\]HÈ‘˜Y\]Yˆˆ‘˜YÜ™X]YŠNÂˆ]ØZ]ÙÔÞ\Ý[Q]™[
+XÝ[Û“˜[YK™\ÜIÜ™\ÜYX”ÝXØÙ\ÜÈ‹™\KÈ™\ÜYJNÂ‚ˆ™]\›ˆ™\ËšœÛÛŠÈÝXØÙ\ÜÎˆYK™\Üˆ™\Ü]HJNÂŸJNÂ‚‹ËÈËˆÝX›Z]˜Y˜\œÜÝ
+‹Ø\KÝÙYZÛK\™\ÜËÜÝX›Z]ÎšY‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈ\Ù\’Y[XZ[HHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆËÈ™\šYžH™\Ü[™È\š[Ù\ÈXÝ]™H
+ÙY™\Ù^HNŒSHÈœšY^HŒŒJBˆÛÛœÝ\ÕÚ][‘Y]Ú[™ÝÈH
+
+HOˆÂˆÛÛœÝ›ÝÈH™]È]J
+NÂˆÛÛœÝ^HH›ÝË™Ù]^J
+NÂˆÛÛœÝÝ\ˆH›ÝË™Ù]Ý\œÊ
+NÂˆÛÛœÝZ[]HH›ÝË™Ù]Z[]\Ê
+NÂˆˆÛÛœÝÝÙ\‘[XZ[H[XZ[È[XZ[ÓÝÙ\Ø\ÙJ
+HˆˆŽÂˆYˆ
+ÝÙ\‘[XZ[OOHÚ\ÙÛK›ÚÛÚØÛXØ\][™Ë˜ÛÛHˆÝÙ\‘[XZ[OOH›Û[ÛÛK˜Z™Y\˜[ØÛXØ\][™Ë˜ÛÛHŠHÂˆ™]\›ˆYNÂˆBˆˆYˆ
+^HÈ^HˆJH™]\›ˆ˜[ÙNÂˆYˆ
+^HOOHÊH™]\›ˆÝ\ˆˆH
+Ý\ˆOOHH	‰ˆZ[]HH
+NÂˆYˆ
+^HOOH
+H™]\›ˆYNÂˆYˆ
+^HOOHJH™]\›ˆÝ\ˆMˆ
+Ý\ˆOOHMˆ	‰ˆZ[]HHŒ
+NÂˆ™]\›ˆ˜[ÙNÂˆNÂ‚ˆYˆ
+Z\ÕÚ][‘Y]Ú[™ÝÊ
+JHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆ”ÐÓHÙXÝ\š]H[NˆHÙYZÛH™\ÜY]\š[Ù\ÈÛÜÙYˆ™\ÜÈØ[ˆÛ›H™HÝX›Z]Y™]ÙY[ˆÙY™\Ù^HNŒSH[™œšY^HŒŒKˆˆJNÂˆB‚ˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂ‚ˆ]™\Üˆ[žHH[ÂˆžHÂˆÛÛœÝ™\Ý[ÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÙYZÛT™\ÜÊKÚ\™J\JÙYZÛT™\ÜËšYY
+JNÂˆYˆ
+™\Ý[Ë›[™Ýˆ
+H™\ÜH™\Ý[ÖÌNÂˆHØ]Ú
+\œŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘ˆ\œ›Üˆ™]Ú[™È™\ÜÈÝX›Z]ˆ‹\œŠNÂˆB‚ˆYˆ
+\™\Ü
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”™\Ü›Ý›Ý[™ˆJNÂˆB‚ˆYˆ
+™\Ü\Ù\’YOOH\Ù\’Y
+HÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆ\È\È›Ý[Ý\ˆ™\ÜˆˆJNÂˆB‚ˆYˆ
+™\ÜœÝ]\ÈOOH	Ñ˜Y	ÊHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”™\Ü\È[™XYHÝX›Z]YˆJNÂˆB‚ˆÛÛœÝ\]Y™\ÜHÂˆ‹‹œ™\ÜˆÝ]\Îˆ	ÔÝX›Z]Y	ËˆÝX›Z]Y]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+Kˆ\]Y]ˆ™]È]J
+KÒTÓÔÝš[™Ê
+BˆNÂ‚ˆžHÂˆ]ØZ]‹\]JÙYZÛT™\ÜÊKœÙ]
+\]Y™\Ü
+KÚ\™J\JÙYZÛT™\ÜËšYY
+JNÂˆHØ]Ú
+\œŽˆ[žJHÂˆÛÛœÛÛK™\œ›ÜŠ‘ˆ\œ›Üˆ\][™È™\ÜÈÝX›Z]Yˆ‹\œŠNÂˆ™]\›ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘˜Z[YÈ\]H™\ÜÝ]\È[ˆ]X˜\ÙNˆˆ
+È\œ‹›Y\ÜØYÙHJNÂˆB‚ˆ]ØZ]ÙÔÞ\Ý[Q]™[
+”™\ÜÝX›Z]Y‹™\ÜIÚYX”ÝXØÙ\ÜÈ‹™\KÈ™\ÜYˆYJNÂ‚ˆËÈ]™[ˆÙYZÛH™\ÜÝX›Z]YˆÜ™X]S›ÝYšXØ][ÛŠˆ•ÙYZÛH™\ÜÝX›Z]Y‹ˆÙYZÛH™\ÜÝX›Z]Yˆ[Ý\ˆÙYZÛH\™›Ü›X[˜ÙH™\Ü›ÜˆÙYZÈ[™[™È	Ý\]Y™\ÜÙYZÑ[™]H	ÉßH\È™Y[ˆÝXØÙ\ÜÙ[HÝX›Z]Y›Üˆ™]šY]Ë˜ˆ\›Ý˜[‹ˆ\Ù\’Yˆ
+NÂ‚ˆžHÂˆÛÛœÝYZ[œÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\Ù\œÊKÚ\™J[\œ˜^J\Ù\œËœ›ÛKÉÐYZ[‰Ë	ÔÕTT—ÐQRS‰Ë	ÐYZ[š\Ý˜]Ü‰×JJNÂˆ›Üˆ
+ÛÛœÝYZ[ˆÙˆYZ[œÊHÂˆYˆ
+YZ[ˆ	‰ˆYZ[‹šY
+HÂˆÜ™X]S›ÝYšXØ][ÛŠˆ•ÙYZÛH™\ÜÝX›Z]Y‹ˆ™]ÈÙYZÛH™\Üˆ	Ý\]Y™\Ü˜]]Ü“˜[Y_XˆH™]ÈÙYZÛH™\Ü\È™Y[ˆÝX›Z]YžH	Ý\]Y™\Ü˜]]Ü“˜[Y_H[™\È]ØZ][™È[Ý\ˆ™]šY]Ë˜ˆ\›Ý˜[‹ˆYZ[‹šYˆ
+NÂˆBˆBˆHØ]Ú
+YQ\œŠHÂˆÛÛœÛÛKØ\›Š‘˜Z[YÈ›ÝYžHYZ[œÈÙˆÙYZÛH™\ÜÝX›Z][ˆ‹YQ\œŠNÂˆB‚ˆ™]\›ˆ™\ËšœÛÛŠÈÝXØÙ\ÜÎˆYK™\Üˆ\]Y™\ÜJNÂŸJNÂ‚‹ËÈˆYZ[ˆ™]Ú[™\ÜÈ
+Ú\ÙÛK›ÚÛÚØÛXØ\][™Ë˜ÛÛHÜˆÛ[ÛÛK˜Z™Y\˜[ØÛXØ\][™Ë˜ÛÛHÛ›JB˜\™Ù]
+‹Ø\KØYZ[‹ÝÙYZÛK\™\ÜÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈ\Ù\’Y[XZ[HHÙ]™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\’Y
+H™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆÚYÛ‹Z[ˆ™\]Z\™YˆˆJNÂ‚ˆÛÛœÝÝÙ\‘[XZ[H[XZ[È[XZ[ÓÝÙ\Ø\ÙJ
+HˆˆŽÂˆYˆ
+ÝÙ\‘[XZ[OOHÚ\ÙÛK›ÚÛÚØÛXØ\][™Ë˜ÛÛHˆ	‰ˆÝÙ\‘[XZ[OOH›Û[ÛÛK˜Z™Y\˜[ØÛXØ\][™Ë˜ÛÛHŠHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆ™\ÝšXÝYÈ]]Üš\ÙYÝ\\ˆYZ[œËˆˆJNÂˆB‚ˆYˆ
+\Ñ]X˜\ÙRX[JHÂˆžHÂˆÛÛœÝ\ÝH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÙYZÛT™\ÜÊNÂˆ™]\›ˆ™\ËšœÛÛŠ\Ý
+NÂˆHØ]Ú
+\œŽˆ[žJHÂˆ\Ñ]X˜\ÙRX[HH˜[ÙNÂˆBˆBˆ™]\›ˆ™\ËšœÛÛŠ•ÙYZÛT™\ÜÊNÂŸJNÂ‚‹ËÈ‹ˆYZ[ˆ™]Ú^XÝ]]™HÝ[[X\žH\Ú›Ø\™]H
+Ú\ÙÛK›ÚÛÚØÛXØ\][™Ë˜ÛÛKÛ[ÛÛK˜Z™Y\˜[ØÛXØ\][™Ë˜ÛÛK[™YZ[œÈÛ›JB˜\™Ù]
+‹Ø\KØYZ[‹Ù^XÝ]]™KY\Ú›Ø\™\Ý[[X\žH‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÈ\Ù\’Y[XZ[\ÐYZ[ˆHHÙ]™\]Y\Ý\Ù\Š™\JNÂˆÛÛœÝÝÙ\‘[XZ[H[XZ[È[XZ[ÓÝÙ\Ø\ÙJ
+HˆˆŽÂˆÛÛœÝ\Ð]]Üš^™YH\ÐYZ[ˆÝÙ\‘[XZ[OOHÚ\ÙÛK›ÚÛÚØÛXØ\][™Ë˜ÛÛHˆÝÙ\‘[XZ[OOH›Û[ÛÛK˜Z™Y\˜[ØÛXØ\][™Ë˜ÛÛHŽÂ‚ˆYˆ
+]\Ù\’YZ\Ð]]Üš^™Y
+HÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØÙ\ÜÈ[šYYˆ™\ÝšXÝYÈ]]Üš\ÙYYZ[š\Ý˜]ÜœËˆˆJNÂˆB‚ˆ][\Ù\œÎˆ[žV×HH•\Ù\œÎÂˆ][›ÜÜXÝÎˆ[žV×HH”›ÜÜXÝÎÂˆ][YY][™ÜÎˆ[žV×HH“YY][™ÜÎÂˆ][™\ÜÎˆ[žV×HH•ÙYZÛT™\ÜÎÂˆ][ÛÜšÜÜXÙ\Îˆ[žV×HH•ÛÜšÜÜXÙ\È×NÂˆ][›ÜÜØ[Îˆ[žV×HH•ÛÜšÜÜXÙT›ÜÜØ[È×NÂˆ][™\Ù[][ÛœÎˆ[žV×HH•ÛÜšÜÜXÙT™\Ù[][ÛœÈ×NÂˆ][RPÛÛ™\œØ][ÛœÎˆ[žV×HH•ÛÜšÜÜXÙPZPÛÛ™\œØ][ÛœÈ×NÂ‚ˆYˆ
+\Ñ]X˜\ÙRX[JHÂˆžHÂˆ[\Ù\œÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ\Ù\œÊH\È[žV×NÂˆ[›ÜÜXÝÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJ›ÜÜXÝÊH\È[žV×NÂˆ[YY][™ÜÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJYY][™ÜÊH\È[žV×NÂˆ[™\ÜÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÙYZÛT™\ÜÊH\È[žV×NÂˆ[ÛÜšÜÜXÙ\ÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÛÜšÜÜXÙ\ÊH\È[žV×NÂˆ[›ÜÜØ[ÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÛÜšÜÜXÙT›ÜÜØ[ÊH\È[žV×NÂˆ[™\Ù[][ÛœÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÛÜšÜÜXÙT™\Ù[][ÛœÊH\È[žV×NÂˆ[RPÛÛ™\œØ][ÛœÈH]ØZ]‹œÙ[XÝ
+
+K™œ›ÛJÛÜšÜÜXÙPZPÛÛ™\œØ][ÛœÊH\È[žV×NÂˆHØ]Ú
+JHÂˆ\Ñ]X˜\ÙRX[HH˜[ÙNÂˆ[\Ù\œÈH•\Ù\œÎÂˆ[›ÜÜXÝÈH”›ÜÜXÝÎÂˆ[YY][™ÜÈH“YY][™ÜÎÂˆ[™\ÜÈH•ÙYZÛT™\ÜÎÂˆ[ÛÜšÜÜXÙ\ÈH•ÛÜšÜÜXÙ\È×NÂˆ[›ÜÜØ[ÈH•ÛÜšÜÜXÙT›ÜÜØ[È×NÂˆ[™\Ù[][ÛœÈH•ÛÜšÜÜXÙT™\Ù[][ÛœÈ×NÂˆ[RPÛÛ™\œØ][ÛœÈH•ÛÜšÜÜXÙPZPÛÛ™\œØ][ÛœÈ×NÂˆBˆB‚ˆËÈKˆ^XÝ]]™HÝ™\šY]ÈØ[Ý[][Û‚ˆÛÛœÝÙ™šXÙ\œÈH[\Ù\œË™š[\ŠHOˆKœ›ÛHOOH	Ô™[][ÛœÚ\X[˜YÙ\‰ÈKœ›ÛHOOH	Ð\Ú[™\ÜÈ]™[ÜY[Ù™šXÙ\‰ÊNÂˆÛÛœÝÝ[Ù™šXÙ\œÈHÙ™šXÙ\œË›[™ÝÂ‚ˆÛÛœÝXÝ]™T›ÜÜXÝÈH[›ÜÜXÝË™š[\ŠOˆœÝ]\ÈOOH	Ð\˜Ú]™Y	ÊNÂˆÛÛœÝÝ[XÝ]™T›ÜÜXÝÈHXÝ]™T›ÜÜXÝË›[™ÝÂ‚ˆÛÛœÝÝ[YY][™ÜÒ[H[YY][™ÜË›[™ÝÂ‚ˆÛÛœÝÛÜÙY›ÜÜXÝÈH[›ÜÜXÝË™š[\ŠOˆœÝ]\ÈOOH	ÐÛÛ™\Y	ÈœÝ]\ÈOOH	ÕÛÛ‰ÊNÂˆÛÛœÝÝ[[™\ÝY[ÐÛÜÙYHÛÜÙY›ÜÜXÝË›[™ÝÂ‚ˆÛÛœÝÝ[[™ÔÙXÝ\™YHÛÜÙY›ÜÜXÝËœ™YXÙJ
+Ý[K
+HOˆÝ[H
+È
+›ÜÜ[š]U˜[YH
+K
+NÂ‚ˆÛÛœÝÝ[™\ÜÔÝX›Z]YH[™\ÜË™š[\ŠˆOˆ‹œÝ]\ÈOOH	ÔÝX›Z]Y	È‹œÝ]\ÈOOH	Ô™]šY]ÙY	ÊK›[™ÝÂ‚ˆËÈ‹ˆÙ™šXÙ\ˆ\™›Ü›X[˜ÙHØ\™ÂˆÛÛœÝÙ™šXÙ\”\™›Ü›X[˜ÙHHÙ™šXÙ\œË›X\
+HOˆÂˆÛÛœÝÔ›ÜÜXÝÈH[›ÜÜXÝË™š[\ŠOˆ˜\ÜÚYÛ™YÙ™šXÙ\’YOOHKšY	‰ˆœÝ]\ÈOOH	Ð\˜Ú]™Y	ÊNÂˆÛÛœÝÓYY][™ÜÈH[YY][™ÜË™š[\ŠHOˆK›Ù™šXÙ\’YOOHKšY
+NÂˆÛÛœÝÐÛÜÙYH[›ÜÜXÝË™š[\ŠOˆ˜\ÜÚYÛ™YÙ™šXÙ\’YOOHKšY	‰ˆ
+œÝ]\ÈOOH	ÐÛÛ™\Y	ÈœÝ]\ÈOOH	ÕÛÛ‰ÊJNÂˆÛÛœÝÐ[[Ý[ÙXÝ\™YHÐÛÜÙYœ™YXÙJ
+Ý[K
+HOˆÝ[H
+È
+›ÜÜ[š]U˜[YH
+K
+NÂ‚ˆÛÛœÝÙ]H™]ÈÙ]Ýš[™ÏŠ
+NÂˆÐÛÜÙY™›Ü‘XXÚ
+OˆÂˆÛÛœÝ›Ý\ÓÝÙ\ˆH
+››Ý\ÈˆŠKÓÝÙ\Ø\ÙJ
+NÂˆYˆ
+›Ý\ÓÝÙ\‹š[˜ÛY\Ê	Û[Û™^HX\šÙ]	ÊH›Ý\ÓÝÙ\‹š[˜ÛY\Ê	Û[Y‰ÊH
+›[Y”Ý[X[	‰ˆ\œÙQ›Ø]
+›[Y”Ý[X[
+Hˆ
+JHÙ]˜Y
+“[Û™^HX\šÙ][™ŠNÂˆYˆ
+›Ý\ÓÝÙ\‹š[˜ÛY\Ê	ÜÚÚ\	ÊH
+ÙX[Ý[X[	‰ˆ\œÙQ›Ø]
+ÙX[Ý[X[
+Hˆ
+JHÙ]˜Y
+”ÒÒTŠNÂˆYˆ
+›Ý\ÓÝÙ\‹š[˜ÛY\Ê	Û™\Ù‰ÊH
+›]\˜XÞTÝ[X[	‰ˆ\œÙQ›Ø]
+›]\˜XÞTÝ[X[
+Hˆ
+JHÙ]˜Y
+“‘TÑˆŠNÂˆYˆ
+›Ý\ÓÝÙ\‹š[˜ÛY\Ê	ÜØÙÙ‰ÊH
+™X\Ý\žTÝ[X[	‰ˆ\œÙQ›Ø]
+™X\Ý\žTÝ[X[
+Hˆ
+JHÙ]˜Y
+”ÐÑÑˆŠNÂˆYˆ
+›Ý\ÓÝÙ\‹š[˜ÛY\Ê	Ùœ›ÛY\‰ÊJHÙ]˜Y
+‘œ›ÛY\ˆ[™ŠNÂˆJNÂ‚ˆÛÛœÝÔ™\ÜÈH[™\ÜË™š[\ŠˆOˆ‹\Ù\’YOOHKšY
+NÂˆÔ™\ÜË™›Ü‘XXÚ
+ˆOˆÂˆYˆ
+‹œ›ÙXÝÔÛÛ
+HÂˆ‹œ›ÙXÝÔÛÛœÜ]
+	Ë	ÊK™›Ü‘XXÚ
+
+ÝŽˆÝš[™ÊHOˆÂˆÛÛœÝÛX[ˆHÝ‹š[J
+NÂˆYˆ
+ÛX[ŠHÙ]˜Y
+ÛX[ŠNÂˆJNÂˆBˆJNÂ‚ˆÛÛœÝ\Ý™\HÔ™\ÜÂˆ™š[\ŠˆOˆ‹œÝ]\ÈOOH	ÔÝX›Z]Y	È‹œÝ]\ÈOOH	Ô™]šY]ÙY	ÊBˆœÛÜ
+
+KŠHOˆ™]È]J‹œÝX›Z]Y]‹\]Y]
+K™Ù][YJ
+HH™]È]JKœÝX›Z]Y]K\]Y]
+K™Ù][YJ
+JVÌNÂ‚ˆ™]\›ˆÂˆYˆKšYˆ[˜[YNˆK™[˜[YKˆ›ÛNˆKœ›ÛKˆ›ÜÜXÝÎˆÔ›ÜÜXÝË›[™ÝˆYY][™ÜÎˆÓYY][™ÜË›[™Ýˆ[™\ÝY[ÐÛÜÙYˆÐÛÜÙY›[™Ýˆ[[Ý[ÙXÝ\™YˆÐ[[Ý[ÙXÝ\™Yˆ›ÙXÝÔÛÛˆ\œ˜^K™œ›ÛJÙ]
+Kˆ\Ý™\ÜÝX›Z]Yˆ\Ý™\È
+\Ý™\œÝX›Z]Y]\Ý™\\]Y]ˆŠKœÝXœÝš[™ÊL
+Hˆ“›Û™H‹ˆÝ]\ÎˆKœÝ]\È	ÐXÝ]™IÂˆNÂˆJNÂ‚ˆËÈËˆX[HXY\˜›Ø\™ˆÛÛœÝXY\˜›Ø\™HÙ™šXÙ\œË›X\
+HOˆÂˆÛÛœÝÔ›ÜÜXÝÈH[›ÜÜXÝË™š[\ŠOˆ˜\ÜÚYÛ™YÙ™šXÙ\’YOOHKšY	‰ˆœÝ]\ÈOOH	Ð\˜Ú]™Y	ÊNÂˆÛÛœÝÐÛÜÙYH[›ÜÜXÝË™š[\ŠOˆ˜\ÜÚYÛ™YÙ™šXÙ\’YOOHKšY	‰ˆ
+œÝ]\ÈOOH	ÐÛÛ™\Y	ÈœÝ]\ÈOOH	ÕÛÛ‰ÊJNÂˆÛÛœÝÐ[[Ý[ÙXÝ\™YHÐÛÜÙYœ™YXÙJ
+Ý[K
+HOˆÝ[H
+È
+›ÜÜ[š]U˜[YH
+K
+NÂˆÛÛœÝÛÛ™\œÚ[Û”˜]HHÔ›ÜÜXÝË›[™ÝˆÈ\œÙQ›Ø]
+
+
+ÐÛÜÙY›[™ÝÈÔ›ÜÜXÝË›[™Ý
+H
+ˆL
+KÑš^Y
+JJHˆÂ‚ˆ™]\›ˆÂˆYˆKšYˆ[˜[YNˆK™[˜[YKˆ[[Ý[ÙXÝ\™YˆÐ[[Ý[ÙXÝ\™YˆX[ÐÛÜÙYˆÐÛÜÙY›[™ÝˆÛÛ™\œÚ[Û”˜]BˆNÂˆJKœÛÜ
+
+KŠHOˆ‹˜[[Ý[ÙXÝ\™YHK˜[[Ý[ÙXÝ\™Y‹™X[ÐÛÜÙYHK™X[ÐÛÜÙY
+NÂ‚ˆËÈˆ›ÙXÝ\™›Ü›X[˜ÙHœ™XZÙÝÛ‚ˆÛÛœÝ›ÙXÝY]šXÜÈHÂˆ“[Û™^HX\šÙ][™ŽˆÈÛÝ[ˆ[[Ý[ˆKˆ”ÒÒTŽˆÈÛÝ[ˆ[[Ý[ˆKˆ“‘TÑˆŽˆÈÛÝ[ˆ[[Ý[ˆKˆ”ÐÑÑˆŽˆÈÛÝ[ˆ[[Ý[ˆKˆ‘œ›ÛY\ˆ[™ŽˆÈÛÝ[ˆ[[Ý[ˆBˆNÂ‚ˆÛÜÙY›ÜÜXÝË™›Ü‘XXÚ
+OˆÂˆ]X]ÚYH˜[ÙNÂˆÛÛœÝ›Ý\ÓÝÙ\ˆH
+››Ý\ÈˆŠKÓÝÙ\Ø\ÙJ
+NÂˆÛÛœÝ˜[H›ÜÜ[š]U˜[YHÂ‚ˆYˆ
+›Ý\ÓÝÙ\‹š[˜ÛY\Ê	Û[Û™^HX\šÙ]	ÊH›Ý\ÓÝÙ\‹š[˜ÛY\Ê	Û[Y‰ÊH›Ý\ÓÝÙ\‹š[˜ÛY\Ê	Û]]X[[™	ÊJHÂˆ›ÙXÝY]šXÜÖÈ“[Û™^HX\šÙ][™—K˜ÛÝ[
+ÏHNÂˆ›ÙXÝY]šXÜÖÈ“[Û™^HX\šÙ][™—K˜[[Ý[
+ÏH˜[ÂˆX]ÚYHYNÂˆBˆYˆ
+›Ý\ÓÝÙ\‹š[˜ÛY\Ê	ÜÚÚ\	ÊH›Ý\ÓÝÙ\‹š[˜ÛY\Ê	ÜÝXÝ\™YÙ^IÊJHÂˆ›ÙXÝY]šXÜÖÈ”ÒÒT—K˜ÛÝ[
+ÏHNÂˆ›ÙXÝY]šXÜÖÈ”ÒÒT—K˜[[Ý[
+ÏH˜[ÂˆX]ÚYHYNÂˆBˆYˆ
+›Ý\ÓÝÙ\‹š[˜ÛY\Ê	Û™\Ù‰ÊH›Ý\ÓÝÙ\‹š[˜ÛY\Ê	Ù\]Z]HÝXÝ\™Y	ÊJHÂˆ›ÙXÝY]šXÜÖÈ“‘TÑˆ—K˜ÛÝ[
+ÏHNÂˆ›ÙXÝY]šXÜÖÈ“‘TÑˆ—K˜[[Ý[
+ÏH˜[ÂˆX]ÚYHYNÂˆBˆYˆ
+›Ý\ÓÝÙ\‹š[˜ÛY\Ê	ÜØÙÙ‰ÊH›Ý\ÓÝÙ\‹š[˜ÛY\Ê	ÙÝX\˜[YY	ÊJHÂˆ›ÙXÝY]šXÜÖÈ”ÐÑÑˆ—K˜ÛÝ[
+ÏHNÂˆ›ÙXÝY]šXÜÖÈ”ÐÑÑˆ—K˜[[Ý[
+ÏH˜[ÂˆX]ÚYHYNÂˆBˆYˆ
+›Ý\ÓÝÙ\‹š[˜ÛY\Ê	Ùœ›ÛY\‰ÊH›Ý\ÓÝÙ\‹š[˜ÛY\Ê	Ùœ›ÛY\ˆ[™	ÊJHÂˆ›ÙXÝY]šXÜÖÈ‘œ›ÛY\ˆ[™—K˜ÛÝ[
+ÏHNÂˆ›ÙXÝY]šXÜÖÈ‘œ›ÛY\ˆ[™—K˜[[Ý[
+ÏH˜[ÂˆX]ÚYHYNÂˆB‚ˆYˆ
+[X]ÚY
+HÂˆYˆ
+›[Y”Ý[X[	‰ˆ\œÙQ›Ø]
+›[Y”Ý[X[
+Hˆ
+HÂˆ›ÙXÝY]šXÜÖÈ“[Û™^HX\šÙ][™—K˜ÛÝ[
+ÏHNÂˆ›ÙXÝY]šXÜÖÈ“[Û™^HX\šÙ][™—K˜[[Ý[
+ÏH˜[ÂˆH[ÙHYˆ
+ÙX[Ý[X[	‰ˆ\œÙQ›Ø]
+ÙX[Ý[X[
+Hˆ
+HÂˆ›ÙXÝY]šXÜÖÈ”ÒÒT—K˜ÛÝ[
+ÏHNÂˆ›ÙXÝY]šXÜÖÈ”ÒÒT—K˜[[Ý[
+ÏH˜[ÂˆH[ÙHYˆ
+›]\˜XÞTÝ[X[	‰ˆ\œÙQ›Ø]
+›]\˜XÞTÝ[X[
+Hˆ
+HÂˆ›ÙXÝY]šXÜÖÈ“‘TÑˆ—K˜ÛÝ[
+ÏHNÂˆ›ÙXÝY]šXÜÖÈ“‘TÑˆ—K˜[[Ý[
+ÏH˜[ÂˆH[ÙHYˆ
+™X\Ý\žTÝ[X[	‰ˆ\œÙQ›Ø]
+™X\Ý\žTÝ[X[
+Hˆ
+HÂˆ›ÙXÝY]šXÜÖÈ”ÐÑÑˆ—K˜ÛÝ[
+ÏHNÂˆ›ÙXÝY]šXÜÖÈ”ÐÑÑˆ—K˜[[Ý[
+ÏH˜[ÂˆH[ÙHÂˆ›ÙXÝY]šXÜÖÈ“[Û™^HX\šÙ][™—K˜ÛÝ[
+ÏHNÂˆ›ÙXÝY]šXÜÖÈ“[Û™^HX\šÙ][™—K˜[[Ý[
+ÏH˜[ÂˆBˆBˆJNÂ‚ˆ[™\ÜË™›Ü‘XXÚ
+ˆOˆÂˆYˆ
+
+‹œÝ]\ÈOOH	ÔÝX›Z]Y	È‹œÝ]\ÈOOH	Ô™]šY]ÙY	ÊH	‰ˆ‹™[™ÔÙXÝ\™Yˆ
+HÂˆÛÛœÝ›ÙXÝÔÛÛÝˆH‹œ›ÙXÝÔÛÛˆŽÂˆÛÛœÝX]ÚY›ÙÎˆÝš[™Ö×HH×NÂˆYˆ
+›ÙXÝÔÛÛÝ‹ÓÝÙ\Ø\ÙJ
+Kš[˜ÛY\Ê	Û[Û™^HX\šÙ]	ÊH›ÙXÝÔÛÛÝ‹ÓÝÙ\Ø\ÙJ
+Kš[˜ÛY\Ê	Û[Y‰ÊJHX]ÚY›ÙËœ\Ú
+“[Û™^HX\šÙ][™ŠNÂˆYˆ
+›ÙXÝÔÛÛÝ‹Õ\\Ø\ÙJ
+Kš[˜ÛY\Ê	ÔÒÒT	ÊJHX]ÚY›ÙËœ\Ú
+”ÒÒTŠNÂˆYˆ
+›ÙXÝÔÛÛÝ‹Õ\\Ø\ÙJ
+Kš[˜ÛY\Ê	Ó‘TÑ‰ÊJHX]ÚY›ÙËœ\Ú
+“‘TÑˆŠNÂˆYˆ
+›ÙXÝÔÛÛÝ‹Õ\\Ø\ÙJ
+Kš[˜ÛY\Ê	ÔÐÑÑ‰ÊJHX]ÚY›ÙËœ\Ú
+”ÐÑÑˆŠNÂˆYˆ
+›ÙXÝÔÛÛÝ‹ÓÝÙ\Ø\ÙJ
+Kš[˜ÛY\Ê	Ùœ›ÛY\‰ÊJHX]ÚY›ÙËœ\Ú
+‘œ›ÛY\ˆ[™ŠNÂ‚ˆYˆ
+X]ÚY›ÙË›[™Ýˆ
+HÂˆÛÛœÝÜ][[Ý[H‹™[™ÔÙXÝ\™YÈX]ÚY›ÙË›[™ÝÂˆX]ÚY›ÙË™›Ü‘XXÚ
+˜[YHOˆÂˆ›ÙXÝY]šXÜÖÜ˜[YH\ÈÙ^[Ùˆ\[Ùˆ›ÙXÝY]šXÜ×K˜[[Ý[
+ÏHÜ][[Ý[ÂˆJNÂˆBˆBˆJNÂ‚ˆËÈÛÛ™\È\œ˜^BˆÛÛœÝ›ÙXÝ\™›Ü›X[˜ÙHHØš™XÝ™[šY\Ê›ÙXÝY]šXÜÊK›X\
+
+Û˜[YK]WJHOˆ
+Âˆ›ÙXÝ˜[YNˆ˜[YKˆ[™\ÝY[ÐÛÝ[ˆ]K˜ÛÝ[ˆÝ[[[Ý[ˆ]K˜[[Ý[ˆJJNÂ‚ˆËÈKˆÙYZÛH™\Ü[Ûš]Üˆ\ÝˆÛÛœÝ™\Ü[Ûš]ÜˆH[™\ÜË›X\
+ˆOˆ
+ÂˆYˆ‹šYˆÙ™šXÙ\“˜[YNˆ‹\Ù\“˜[YKˆÙ™šXÙ\‘[XZ[ˆ‹\Ù\‘[XZ[ˆÙYZÔÝ\]Nˆ‹ÙYZÔÝ\]KˆÙYZÑ[™]Nˆ‹ÙYZÑ[™]KˆÝX›Z\ÜÚ[Û‘]Nˆ‹œÝX›Z]Y]È‹œÝX›Z]Y]œÝXœÝš[™ÊL
+Hˆ“‹ÐH‹ˆÝ]\Îˆ‹œÝ]\Ëˆ[™ÔÙXÝ\™Yˆ‹™[™ÔÙXÝ\™Yˆ›ÜÜXÝÐYYˆ‹œ›ÜÜXÝÐYYˆYY][™ÜÒ[ˆ‹›YY][™ÜÒ[ˆJJKœÛÜ
+
+KŠHOˆ™]È]J‹ÙYZÑ[™]JK™Ù][YJ
+HH™]È]JKÙYZÑ[™]JK™Ù][YJ
+JNÂ‚ˆËÈ‹ˆX[˜YÙ[Y[[œÚYÚÈÙ[™\˜]Ü‚ˆÛÛœÝ[œÚYÚÎˆÝš[™Ö×HH×NÂˆ]YÚ\Ý›ÙHˆŽÂˆ]YÚ\Ý[]HÂˆ›ÙXÝ\™›Ü›X[˜ÙK™›Ü‘XXÚ
+›ÙOˆÂˆYˆ
+›ÙÝ[[[Ý[ˆYÚ\Ý[]
+HÂˆYÚ\Ý[]H›ÙÝ[[[Ý[ÂˆYÚ\Ý›ÙH›Ùœ›ÙXÝ˜[YNÂˆ5ëÏm¢G§²ÚîÆ­yÔ–@¢“° ¢&WGW&â&W2æ§6öâ‡²7V66W73¢G'VRÂ&W÷'C¢WFFVE&W÷'BÒ“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%vVV¶Ç’&W÷'B&Wf–WrD"f–ÆVC¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$FF&6RWFFRf–ÆVC¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¢òòbâFÖ–âVæÆö6²&W÷'B‡&WGW&ç2FòG&gB¦ç÷7B‚"ö’öFÖ–â÷vVV¶Ç’×&W÷'G2÷VæÆö6²ó¦–B"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²W6W$–BÂVÖ–ÂÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢6öç7BÆ÷vW$VÖ–ÂÒVÖ–ÂòVÖ–ÂçFôÆ÷vW$66R‚’¢"#°¢–b†Æ÷vW$VÖ–ÂÓÒ'v—6FöÒæö¶ö„66Ö6—FÆæræ6öÒ"bbÆ÷vW$VÖ–ÂÓÒ&öÖöÆöÇRæ¦VF—&ä66Ö6—FÆæræ6öÒ"’°¢&WGW&â&W2ç7FGW2ƒC2’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ&W7G&–7FVBFòWF†÷&—6VB7WW"FÖ–ç2â"Ò“°¢Ð ¢6öç7B²–BÒÒ&Wç&×3° ¢G'’°¢6öç7B&W7VÇG2Òv—BF"ç6VÆV7B‚’æg&öÒ‡vVV¶Ç•&W÷'G2’çv†W&R†W‡vVV¶Ç•&W÷'G2æ–BÂ–B’“°¢6öç7B&W÷'BÒ&W7VÇG5³Ó°¢–b‚&W÷'B’&WGW&â&W2ç7FGW2ƒCB’æ§6öâ‡²W'&÷#¢%&W÷'Bæ÷Bf÷VæB"Ò“° ¢6öç7BWFFVE&W÷'BÒ°¢ââç&W÷'BÀ¢7FGW3¢tG&gBrÀ¢7V&Ö—GFVDC¢çVÆÂÀ¢WFFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚¢Ó° ¢v—BF"çWFFR‡vVV¶Ç•&W÷'G2’ç6WB‡WFFVE&W÷'B’çv†W&R†W‡vVV¶Ç•&W÷'G2æ–BÂ–B’“° ¢v—BÆöu7—7FVÔWfVçB‚%&W÷'BVæÆö6¶VB"Â&W÷'BÒG¶–GÖÂ%7V66W72"Â&WÂ²&W÷'D–C¢–BÒ“° ¢&WGW&â&W2æ§6öâ‡²7V66W73¢G'VRÂ&W÷'C¢WFFVE&W÷'BÒ“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%vVV¶Ç’&W÷'BVæÆö6²D"f–ÆVC¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$FF&6RWFFRf–ÆVC¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¢òòrâFÖ–âÆörW‡÷'B7F–öà¦ç÷7B‚"ö’öFÖ–â÷vVV¶Ç’×&W÷'G2öÆörÖW‡÷'Bó¦–B"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²W6W$–BÂVÖ–ÂÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢6öç7B²–BÒÒ&Wç&×3°¢6öç7B²f÷&ÖBÒÒ&Wæ&öG“° ¢v—BÆöu7—7FVÔWfVçB‚%&W÷'BW‡÷'FVB"Â&W÷'BÒG¶–GÖÂ%7V66W72"Â&WÂ²&W÷'D–C¢–BÂf÷&ÖBÒ“° ¢&WGW&â&W2æ§6öâ‡²7V66W73¢G'VRÒ“°§Ò“° ¢òò‚âFÖ–âÖçVÂ&VÖ–æFW"G&–vvW"f÷"FW7F–ærb&öGV7F–öâ6†V6·0¦ç÷7B‚"ö’öFÖ–â÷vVV¶Ç’×&W÷'G2÷G&–vvW"×&VÖ–æFW'2"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²W6W$–BÂVÖ–ÂÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢6öç7BÆ÷vW$VÖ–ÂÒVÖ–ÂòVÖ–ÂçFôÆ÷vW$66R‚’¢"#°¢–b†Æ÷vW$VÖ–ÂÓÒ'v—6FöÒæö¶ö„66Ö6—FÆæræ6öÒ"bbÆ÷vW$VÖ–ÂÓÒ&öÖöÆöÇRæ¦VF—&ä66Ö6—FÆæræ6öÒ"’°¢&WGW&â&W2ç7FGW2ƒC2’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ&W7G&–7FVBFòWF†÷&—6VB7WW"FÖ–ç2â"Ò“°¢Ð ¢6öç7B²6Æ÷BÒÒ&Wæ&öG“°¢ÆWBÖW76vRÒ"#°¢–b‡6Æ÷BÓÓÒs”Òr’°¢ÖW76vRÒ%vVV¶Ç’&W÷'B—2GVRFöF’â#°¢ÒVÇ6R–b‡6Æ÷BÓÓÒs%Òr’°¢ÖW76vRÒ%ÆV6R7V&Ö—B–÷W"vVV¶Ç’&W÷'B&Vf÷&R6Æ÷6Röb'W6–æW72â#°¢ÒVÇ6R–b‡6Æ÷BÓÓÒsEÒr’°¢ÖW76vRÒ$f–æÂ&VÖ–æFW#¢vVV¶Ç’&W÷'B7V&Ö—76–öâ6Æ÷6W2FöF’â#°¢ÒVÇ6R°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$–çfÆ–B6Æ÷B&ÖWFW"â×W7B&R”ÒÂ%ÒÂ÷"EÒâ"Ò“°¢Ð ¢G&–vvW%&VÖ–æFW'4f÷$7F—fUW6W'2†ÖW76vR“°¢&WGW&â&W2æ§6öâ‡²7V66W73¢G'VRÂÖW76vS¢&VÖ–æFW'2G&–vvW&VBf÷"G·6Æ÷GÒ6Æ÷BæÒ“°§Ò“° ¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¢òòUDôÔDTB$Uõ%B$TÔ”äDU%244„TETÄU ¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¦6öç7B6VçE&VÖ–æFW'5F†—5vVV²ÒæWr6WCÇ7G&–æsâ‚“° ¦7–æ2gVæ7F–öâG&–vvW%&VÖ–æFW'4f÷$7F—fUW6W'2†ÖW76vS¢7G&–ær’°¢G'’°¢6öç7B7F—fTöff–6W'2Òv—BF"ç6VÆV7B‚’æg&öÒ‡W6W'2’çv†W&R€¢æB€¢–ä'&’‡W6W'2ç&öÆRÂ²u&VÆF–öç6†—ÖævW"rÂt'W6–æW72FWfVÆ÷ÖVçBöff–6W"uÒ’À¢–ä'&’‡W6W'2ç7FGW2Â²t&÷fVBrÂt7F—fRrÂuVæF–æruÒ¢¢“°¢ ¢6öç6öÆRæÆör†µ$Uõ%E2$TÔ”äDU"5•5DTÕÒG&–vvW&–ær&VÖ–æFW"FòG¶7F—fTöff–6W'2æÆVæwF‡Òöff–6W'3¢"G¶ÖW76vWÒ&“°¢ ¢f÷"†6öç7Böff–6W"öb7F—fTöff–6W'2’°¢v—B7&VFTæ÷F–f–6F–öâ€¢uvVV¶Ç’&W÷'BGVRrÀ¢uvVV¶Ç’W&f÷&Öæ6R&W÷'BGVRrÀ¢ÖW76vRÀ¢uF6²rÀ¢öff–6W"æ–@¢“°¢Ð¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ$Uõ%E2$TÔ”äDU"5•5DTÒU%$õ%Òf–ÆVBFòG&–vvW"&VÖ–æFW'3¢"ÂW'"“°¢Ð§Ð ¦gVæ7F–öâ6†V6´æEG&–vvW%vVV¶Ç•&W÷'E&VÖ–æFW'2‚’°¢6öç7Bæ÷rÒæWrFFR‚“°¢6öç7BF’Òæ÷rævWDF’‚“²òòRÒg&–F¢6öç7B†÷W"Òæ÷rævWD†÷W'2‚“°¢6öç7BÖ–çWFRÒæ÷rævWDÖ–çWFW2‚“°¢ ¢6öç7BvWEvVVµ–V"Ò†C¢FFR’Óâ°¢6öç7BFV×ÒæWrFFR„FFRåUD2†BævWDgVÆÅ–V"‚’ÂBævWDÖöçF‚‚’ÂBævWDFFR‚’’“°¢6öç7BF”çVÒÒFV×ævWEUD4F’‚’ÇÂs°¢FV×ç6WEUD4FFR‡FV×ævWEUD4FFR‚’²BÒF”çVÒ“°¢6öç7B–V%7F'BÒæWrFFR„FFRåUD2‡FV×ævWEUD4gVÆÅ–V"‚’ÂÂ’“°¢&WGW&âG·FV×ævWEUD4gVÆÅ–V"‚—ÒÕrG´ÖF‚æ6V–Â‚‚‚‡FV×ævWEF–ÖR‚’Ò–V%7F'BævWEF–ÖR‚’’òƒcC’²’òr—Ö°¢Ó°¢ ¢6öç7BvVV´¶W’ÒvWEvVVµ–V"†æ÷r“° ¢–b†F’ÓÓÒR’°¢ÆWB6Æ÷C¢7G&–ærÂçVÆÂÒçVÆÃ°¢ÆWBÖW76vRÒ"#°¢ ¢–b††÷W"ÓÓÒ’bbÖ–çWFRÓÓÒ’°¢6Æ÷BÒ#”Ò#°¢ÖW76vRÒ%vVV¶Ç’&W÷'B—2GVRFöF’â#°¢ÒVÇ6R–b††÷W"ÓÓÒBbbÖ–çWFRÓÓÒ’°¢6Æ÷BÒ#%Ò#°¢ÖW76vRÒ%ÆV6R7V&Ö—B–÷W"vVV¶Ç’&W÷'B&Vf÷&R6Æ÷6Röb'W6–æW72â#°¢ÒVÇ6R–b††÷W"ÓÓÒbbbÖ–çWFRÓÓÒ’°¢6Æ÷BÒ#EÒ#°¢ÖW76vRÒ$f–æÂ&VÖ–æFW#¢vVV¶Ç’&W÷'B7V&Ö—76–öâ6Æ÷6W2FöF’â#°¢Ð¢ ¢–b‡6Æ÷B’°¢6öç7B&VÖ–æFW$¶W’ÒG·vVV´¶W—ÒÒG·6Æ÷GÖ°¢–b‚6VçE&VÖ–æFW'5F†—5vVV²æ†2‡&VÖ–æFW$¶W’’’°¢6VçE&VÖ–æFW'5F†—5vVV²æFB‡&VÖ–æFW$¶W’“°¢G&–vvW%&VÖ–æFW'4f÷$7F—fUW6W'2†ÖW76vR“°¢Ð¢Ð¢ÒVÇ6R°¢–b‡6VçE&VÖ–æFW'5F†—5vVV²ç6—¦Râ’°¢6VçE&VÖ–æFW'5F†—5vVV²æ6ÆV"‚“°¢Ð¢Ð§Ð ¢òòF–6²WfW'’36V6öæG0§6WD–çFW'fÂ†6†V6´æEG&–vvW%vVV¶Ç•&W÷'E&VÖ–æFW'2Â3“°   ¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¢òòD4µ2õU$D”ôå0¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¦ævWB‚"ö’÷F6·2"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²W6W$–BÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2æ§6öâ…µÒ“° ¢G'’°¢6öç7BÆ—7BÒv—BvWEF6·4f÷%W6W"‡&W“°¢6öç7BÖVBÒÆ—7BæÖ‡BÓâ‡°¢ââçBÀ¢7FGW3¢Bæ—46ö×ÆWFVBò$6ö×ÆWFVB"¢%VæF–ær ¢Ò’“°¢&WGW&â&W2æ§6öâ†ÖVB“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒF6·2VW'’f–ÆVC¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòVW'’F6·2FF&6Râ"Ò“°¢Ð§Ò“° ¦ç÷7B‚"ö’÷F6·2"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²&÷7V7D–BÂ&÷7V7DæÖRÂF—FÆRÂGVTFFRÂ76–væVE7FfbÂ&–÷&—G’Âæ÷FW2ÂFW67&—F–öâÂ7FGW2ÂF6µG—RÒÒ&Wæ&öG“°¢–b‚F—FÆRÇÂGVTFFR’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢%F—FÆRæBGVRFFR&R&WV—&VBâ"Ò“°¢Ð ¢6öç7B²W6W$–BÒÒvWE&WVW7EW6W"‡&W“°¢6öç7Böff–6W$–BÒ&Wæ&öG’æöff–6W$–BÇÂW6W$–BÇÂ'W6W"Ó#° ¢G'’°¢ÆWBf–æÄ76–væVE7FfbÒ76–væVE7Ffc°¢ÆWBf–æÅ&÷7V7DæÖRÒ&÷7V7DæÖS° ¢–b‡&÷7V7D–B’°¢6öç7BfWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ‡&÷7V7G2’çv†W&R†W‡&÷7V7G2æ–BÂ&÷7V7D–B’“°¢6öç7BÒfWF6†VE³Ó°¢–b‡’°¢–b‚f–æÄ76–væVE7Ffbbbæ76–væVDöff–6W$æÖR’°¢f–æÄ76–væVE7FfbÒæ76–væVDöff–6W$æÖS°¢Ð¢–b‚f–æÅ&÷7V7DæÖR’°¢f–æÅ&÷7V7DæÖRÒææÖS°¢Ð¢Ð¢Ð ¢–b‚f–æÄ76–væVE7Ffb’°¢6öç7BTfWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ‡W6W'2’æÆ–Ö—Bƒ“°¢f–æÄ76–væVE7FfbÒTfWF6†VE³ÓòægVÆÄæÖRÇÂ$§VÆ–âG&†ÆW"#°¢Ð ¢–b‚f–æÅ&÷7V7DæÖR’°¢f–æÅ&÷7V7DæÖRÒ$vVæW&Â44Ò÷W&F–öç2#°¢Ð ¢6öç7BFWFW&Ö–æVE7FGW2Ò7FGW2ÇÂ%VæF–ær#°¢6öç7BFWFW&Ö–æVEG—RÒF6µG—RÇÂ$6ÆÂ#°¢6öç7B—46ö×ÆWFVEfÂÒFWFW&Ö–æVE7FGW2ÓÓÒ$6ö×ÆWFVB#° ¢6öç7BæWuF6³¢ç’Ò°¢–C¢F6²ÒG´FFRææ÷r‚—ÖÀ¢&÷7V7D–BÀ¢&÷7V7DæÖS¢f–æÅ&÷7V7DæÖRÀ¢F—FÆRÀ¢FW67&—F–öã¢FW67&—F–öâÇÂæ÷FW2ÇÂ""À¢GVTFFRÀ¢76–væVE7Ffc¢f–æÄ76–væVE7FfbÀ¢öff–6W$–C¢öff–6W$–BÀ¢&–÷&—G“¢&–÷&—G’ÇÂ$ÖVF—VÒ"À¢7FGW3¢FWFW&Ö–æVE7FGW2À¢F6µG—S¢FWFW&Ö–æVEG—RÀ¢—46ö×ÆWFVC¢—46ö×ÆWFVEfÂÀ¢æ÷FW3¢æ÷FW2ÇÂFW67&—F–öâÇÂ" ¢Ó° ¢v—BF"æ–ç6W'B‡F6·2’çfÇVW2‡°¢–C¢æWuF6²æ–BÀ¢&÷7V7D–C¢æWuF6²ç&÷7V7D–BÀ¢&÷7V7DæÖS¢æWuF6²ç&÷7V7DæÖRÀ¢F—FÆS¢æWuF6²çF—FÆRÀ¢GVTFFS¢æWuF6²æGVTFFRÀ¢76–væVE7Ffc¢æWuF6²æ76–væVE7FfbÀ¢öff–6W$–C¢æWuF6²æöff–6W$–BÀ¢&–÷&—G“¢æWuF6²ç&–÷&—G’À¢—46ö×ÆWFVC¢æWuF6²æ—46ö×ÆWFVBÀ¢æ÷FW3¢æWuF6²ææ÷FW0¢Ò“° ¢òòWFöÖF–6ÆÇ’6VVB2&VÆF–öç6†—7F—f—G’Föð¢–b‡&÷7V7D–B’°¢6öç7BWFô7BÒ°¢–C¢7B×F²ÒG´FFRææ÷r‚—ÖÀ¢&÷7V7D–BÀ¢FFS¢æWrFFR‚’çFô•4õ7G&–ær‚’ç7Æ—B‚uBr•³ÒÀ¢F–ÖS¢æWrFFR‚’çFôÆö6ÆUF–ÖU7G&–ær…µÒÂ²†÷W#¢s"ÖF–v—BrÂÖ–çWFS¢s"ÖF–v—BrÒ’À¢öff–6W$–C¢öff–6W$–BÀ¢öff–6W$æÖS¢f–æÄ76–væVE7FfbÀ¢7F—f—G•G—S¢tföÆÆ÷r×WrÀ¢÷WF6öÖS¢76–væVBF6³¢G·F—FÆWÖÀ¢æ÷FW3¢GVR'“¢G¶GVTFFWÒâ7Ffc¢G¶f–æÄ76–væVE7FfgÒâG—S¢G¶FWFW&Ö–æVEG—WÖÀ¢7FGW3¢u66†VGVÆVBrÀ¢7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚¢Ó°¢v—BF"æ–ç6W'B†7F—f—F–W2’çfÇVW2†WFô7B“°¢Ð ¢òòG&–vvW"&÷fVBF6·276–væVBæ÷F–f–6F–öç0¢6öç7BT76–væVBÒv—BF"ç6VÆV7B‚’æg&öÒ‡W6W'2’çv†W&R†W‡W6W'2ægVÆÄæÖRÂf–æÄ76–væVE7Ffb’“°¢6öç7BÖF6†VEW6W"ÒT76–væVE³Ó°¢7&VFTæ÷F–f–6F–öâ€¢$æWrF6²76–væVB"À¢æWrF6²76–væVC¢G·F—FÆWÖÀ¢–÷R†fR&VVâ76–væVBF6²öbG—R"G¶FWFW&Ö–æVEG—WÒ"GVRöâG¶GVTFFWÒ&VÆFVBFò"G¶æWuF6²ç&÷7V7DæÖWÒ"æÀ¢VæFVf–æVBÀ¢ÖF6†VEW6W"òÖF6†VEW6W"æ–B¢VæFVf–æV@¢“° ¢òòWfVçC¢F6²7&VFV@¢7&VFTæ÷F–f–6F–öâ€¢%F6²7&VFVB"À¢F6²7&VFVC¢G·F—FÆWÖÀ¢æWrF6²"G·F—FÆWÒ"öbG—R"G¶FWFW&Ö–æVEG—WÒ"†2&VVâ7&VFVBæÀ¢%F6²"À¢öff–6W$–@¢“° ¢òòWfVçC¢F6²76–væV@¢–b†ÖF6†VEW6W"’°¢7&VFTæ÷F–f–6F–öâ€¢%F6²76–væVB"À¢F6²76–væVC¢G·F—FÆWÖÀ¢–÷R†fR&VVâ76–væVBF6²öbG—R"G¶FWFW&Ö–æVEG—WÒ"GVRöâG¶GVTFFWÒ&VÆFVBFò"G¶æWuF6²ç&÷7V7DæÖWÒ"æÀ¢%F6²"À¢ÖF6†VEW6W"æ–@¢“°¢Ð ¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ†æWuF6²“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒF6·2õ5Bf–ÆVC¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFò7&VFRF6³¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¦çF6‚‚"ö’÷F6·2ó¦–B"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²–BÒÒ&Wç&×3° ¢6öç7B²W6W$–BÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ6–vâÖ–â&WV—&VBâ"Ò“° ¢G'’°¢6öç7BF6´fWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ‡F6·2’çv†W&R†W‡F6·2æ–BÂ–B’“°¢6öç7BF6´ö&¢ÒF6´fWF6†VE³Ó°¢–b‚F6´ö&¢’°¢&WGW&â&W2ç7FGW2ƒCB’æ§6öâ‡²W'&÷#¢%F6²æ÷Bf÷VæBâ"Ò“°¢Ð ¢–b‚—4FÖ–âbbF6´ö&¢æöff–6W$–BÓÒW6W$–B’°¢&WGW&â&W2ç7FGW2ƒC2’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ–÷R6âöæÇ’ÖöF–g’–÷W"÷vâF6·2â"Ò“°¢Ð ¢6öç7BÖW&vVBÒ²ââçF6´ö&¢Âââç&Wæ&öG’Ó° ¢òò†æFÆRFW&—fVB6ö×ÆWF–öâ7FFP¢–b‡&Wæ&öG’ç7FGW2’°¢ÖW&vVBæ—46ö×ÆWFVBÒ&Wæ&öG’ç7FGW2ÓÓÒ$6ö×ÆWFVB#°¢ÒVÇ6R–b‡&Wæ&öG’æ—46ö×ÆWFVBÓÒVæFVf–æVB’°¢ÖW&vVBç7FGW2Ò&Wæ&öG’æ—46ö×ÆWFVBò$6ö×ÆWFVB"¢%VæF–ær#°¢Ð ¢v—BF"çWFFR‡F6·2’ç6WB‡°¢F—FÆS¢ÖW&vVBçF—FÆRÀ¢GVTFFS¢ÖW&vVBæGVTFFRÀ¢76–væVE7Ffc¢ÖW&vVBæ76–væVE7FfbÀ¢öff–6W$–C¢ÖW&vVBæöff–6W$–BÀ¢&–÷&—G“¢ÖW&vVBç&–÷&—G’À¢—46ö×ÆWFVC¢ÖW&vVBæ—46ö×ÆWFVBÀ¢æ÷FW3¢ÖW&vVBææ÷FW0¢Ò’çv†W&R†W‡F6·2æ–BÂ–B’“° ¢òòWfVçC¢F6²6ö×ÆWFVB÷"F6²WFFV@¢–b†ÖW&vVBæ—46ö×ÆWFVBbbF6´ö&¢æ—46ö×ÆWFVB’°¢7&VFTæ÷F–f–6F–öâ€¢%F6²6ö×ÆWFVB"À¢F6²6ö×ÆWFVC¢G¶ÖW&vVBçF—FÆWÖÀ¢F†RF6²"G¶ÖW&vVBçF—FÆWÒ"†2&VVâ7V66W76gVÆÇ’6ö×ÆWFVB'’G¶ÖW&vVBæ76–væVE7FfgÒæÀ¢%F6²"À¢ÖW&vVBæöff–6W$–@¢“°¢ÒVÇ6R°¢7&VFTæ÷F–f–6F–öâ€¢%F6²WFFVB"À¢F6²WFFVC¢G¶ÖW&vVBçF—FÆWÖÀ¢F†RF6²"G¶ÖW&vVBçF—FÆWÒ"FWF–Ç2†fR&VVâWFFVBæÀ¢%F6²"À¢ÖW&vVBæöff–6W$–@¢“°¢Ð ¢òòG&–vvW"&÷fVBæ÷F–f–6F–öç2–bF6²7FGW2G&ç6—F–öç2Fò÷fW&GVP¢–b‡&Wæ&öG’ç7FGW2ÓÓÒ$÷fW&GVR"bbF6´ö&¢æ—46ö×ÆWFVB’°¢6öç7BT76–væVBÒv—BF"ç6VÆV7B‚’æg&öÒ‡W6W'2’çv†W&R†W‡W6W'2ægVÆÄæÖRÂÖW&vVBæ76–væVE7Ffb’“°¢6öç7BÖF6†VEW6W"ÒT76–væVE³Ó°¢7&VFTæ÷F–f–6F–öâ€¢%F6²÷fW&GVR"À¢F6²÷fW&GVS¢G¶ÖW&vVBçF—FÆWÖÀ¢F†RF6²"G¶ÖW&vVBçF—FÆWÒ"76–væVBFòG¶ÖW&vVBæ76–væVE7FfgÒ†2'&V6†VB—G2FVFÆ–æRæB—2æ÷rÖ&¶VB÷fW&GVRæÀ¢VæFVf–æVBÀ¢ÖF6†VEW6W"òÖF6†VEW6W"æ–B¢VæFVf–æV@¢“°¢Ð ¢6öç7B&W7öç6Tö&¢Ò°¢ââæÖW&vVBÀ¢7FGW3¢ÖW&vVBæ—46ö×ÆWFVBò$6ö×ÆWFVB"¢%VæF–ær ¢Ó° ¢&WGW&â&W2æ§6öâ‡&W7öç6Tö&¢“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒWFFRF6²f–ÆVC¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòWFFRF6³¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¦æFVÆWFR‚"ö’÷F6·2ó¦–B"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²–BÒÒ&Wç&×3° ¢6öç7B²W6W$–BÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ6–vâÖ–â&WV—&VBâ"Ò“° ¢G'’°¢6öç7BF6´fWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ‡F6·2’çv†W&R†W‡F6·2æ–BÂ–B’“°¢6öç7BF6´ö&¢ÒF6´fWF6†VE³Ó°¢–b‚F6´ö&¢’°¢&WGW&â&W2ç7FGW2ƒCB’æ§6öâ‡²W'&÷#¢%F6²æ÷Bf÷VæBâ"Ò“°¢Ð ¢–b‚—4FÖ–âbbF6´ö&¢æöff–6W$–BÓÒW6W$–B’°¢&WGW&â&W2ç7FGW2ƒC2’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ–÷R6âöæÇ’FVÆWFR–÷W"÷vâF6·2â"Ò“°¢Ð ¢v—BF"æFVÆWFR‡F6·2’çv†W&R†W‡F6·2æ–BÂ–B’“°¢&WGW&â&W2æ§6öâ‡²7V66W73¢G'VRÒ“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒFVÆWFRF6²f–ÆVC¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòFVÆWFRF6³¢"²W'"æÖW76vRÒ“°¢Ð§Ò“°  ¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¢òò5$ÒäõDU2ÔôETÄRb$U4T$4‚tõ$µ54U0¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ ¢òòäõDU25%T@¦ævWB‚"ö’öæ÷FW2"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²W6W$–BÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢G'’°¢ÆWBæ÷FW4Æ—7C¢ç•µÒÒµÓ°¢–b†—4FÖ–â’°¢æ÷FW4Æ—7BÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76Tæ÷FW2“°¢ÒVÇ6R°¢æ÷FW4Æ—7BÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76Tæ÷FW2’çv†W&R†W‡v÷&·76Tæ÷FW2æ7&VFVD'’ÂW6W$–B’“°¢Ð¢&WGW&â&W2æ§6öâ†æ÷FW4Æ—7B“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒæ÷FW2VW'’f–ÆVC¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòÆöBæ÷FW3¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¦ç÷7B‚"ö’öæ÷FW2"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²W6W$–BÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢6öç7B²&÷7V7D–BÂv÷&·76T–BÂF—FÆRÂ6öçFVçBÂf—6–&–Æ—G’ÒÒ&Wæ&öG“°¢–b‚F—FÆRÇÂ6öçFVçB’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢%F—FÆRæB6öçFVçB&R&WV—&VBâ"Ò“°¢Ð ¢6öç7BæWtæ÷FS¢ç’Ò°¢–C¢æ÷FRÒG´FFRææ÷r‚—ÒÒG´ÖF‚æfÆö÷"„ÖF‚ç&æFöÒ‚’¢—ÖÀ¢&÷7V7D–C¢&÷7V7D–BÇÂçVÆÂÀ¢v÷&·76T–C¢v÷&·76T–BÇÂçVÆÂÀ¢F—FÆRÀ¢6öçFVçBÀ¢7&VFVD'“¢W6W$–BÀ¢7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢WFFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢f—6–&–Æ—G“¢f—6–&–Æ—G’ÇÂ'&—fFR"À¢—5–ææVC¢fÇ6RÀ¢—4&6†—fVC¢fÇ6RÀ¢Ó° ¢G'’°¢v—BF"æ–ç6W'B‡v÷&·76Tæ÷FW2’çfÇVW2†æWtæ÷FR“°¢v—BÆöu7—7FVÔWfVçB‚$æ÷FR7&VFVB"ÂF—FÆRÂ%7V66W72"Â&WÂ²æ÷FT–C¢æWtæ÷FRæ–BÂF—FÆRÒ“°¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ†æWtæ÷FR“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFò–ç6W'Bæ÷FR–âD#¢"ÂW'"æÖW76vR“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFò7&VFRæ÷FS¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¦çF6‚‚"ö’öæ÷FW2ó¦–B"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²–BÒÒ&Wç&×3°¢6öç7B²W6W$–BÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢G'’°¢6öç7BfWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76Tæ÷FW2’çv†W&R†W‡v÷&·76Tæ÷FW2æ–BÂ–B’“°¢6öç7BW†—7F–ætæ÷FRÒfWF6†VE³Ó°¢–b‚W†—7F–ætæ÷FR’°¢&WGW&â&W2ç7FGW2ƒCB’æ§6öâ‡²W'&÷#¢$æ÷FRæ÷Bf÷VæBâ"Ò“°¢Ð ¢–b‚—4FÖ–âbbW†—7F–ætæ÷FRæ7&VFVD'’ÓÒW6W$–B’°¢&WGW&â&W2ç7FGW2ƒC2’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ–÷R6âöæÇ’VF—B–÷W"÷vâæ÷FW2â"Ò“°¢Ð ¢6öç7B²F—FÆRÂ6öçFVçBÂf—6–&–Æ—G’ÒÒ&Wæ&öG“°¢6öç7BWFFW3¢ç’Ò·Ó°¢–b‡F—FÆRÓÒVæFVf–æVB’WFFW2çF—FÆRÒF—FÆS°¢–b†6öçFVçBÓÒVæFVf–æVB’WFFW2æ6öçFVçBÒ6öçFVçC°¢–b‡f—6–&–Æ—G’ÓÒVæFVf–æVB’WFFW2çf—6–&–Æ—G’Òf—6–&–Æ—G“°¢WFFW2çWFFVDBÒæWrFFR‚’çFô•4õ7G&–ær‚“° ¢v—BF"çWFFR‡v÷&·76Tæ÷FW2’ç6WB‡WFFW2’çv†W&R†W‡v÷&·76Tæ÷FW2æ–BÂ–B’“° ¢v—BÆöu7—7FVÔWfVçB‚$æ÷FRÖöF–f–VB"ÂW†—7F–ætæ÷FRçF—FÆRÂ%7V66W72"Â&WÂ²æ÷FT–C¢–BÒ“°¢&WGW&â&W2æ§6öâ‡²ââæW†—7F–ætæ÷FRÂââçWFFW2Ò“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFòWFFRæ÷FS¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòWFFRæ÷FS¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¦æFVÆWFR‚"ö’öæ÷FW2ó¦–B"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²–BÒÒ&Wç&×3°¢6öç7B²W6W$–BÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢G'’°¢6öç7BfWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76Tæ÷FW2’çv†W&R†W‡v÷&·76Tæ÷FW2æ–BÂ–B’“°¢6öç7BW†—7F–ætæ÷FRÒfWF6†VE³Ó°¢–b‚W†—7F–ætæ÷FR’°¢&WGW&â&W2ç7FGW2ƒCB’æ§6öâ‡²W'&÷#¢$æ÷FRæ÷Bf÷VæBâ"Ò“°¢Ð ¢–b‚—4FÖ–âbbW†—7F–ætæ÷FRæ7&VFVD'’ÓÒW6W$–B’°¢&WGW&â&W2ç7FGW2ƒC2’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ–÷R6âöæÇ’FVÆWFR–÷W"÷vâæ÷FW2â"Ò“°¢Ð ¢v—BF"æFVÆWFR‡v÷&·76Tæ÷FW2’çv†W&R†W‡v÷&·76Tæ÷FW2æ–BÂ–B’“° ¢v—BÆöu7—7FVÔWfVçB‚$æ÷FRFVÆWFVB"ÂW†—7F–ætæ÷FRçF—FÆRÂ%7V66W72"Â&WÂ²æ÷FT–C¢–BÒ“°¢&WGW&â&W2æ§6öâ‡²7V66W73¢G'VRÒ“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFòFVÆWFRæ÷FS¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòFVÆWFRæ÷FS¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¦ç÷7B‚"ö’öæ÷FW2ó¦–B÷–â"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²–BÒÒ&Wç&×3°¢6öç7B²W6W$–BÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢G'’°¢6öç7BfWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76Tæ÷FW2’çv†W&R†W‡v÷&·76Tæ÷FW2æ–BÂ–B’“°¢6öç7BW†—7F–ætæ÷FRÒfWF6†VE³Ó°¢–b‚W†—7F–ætæ÷FR’&WGW&â&W2ç7FGW2ƒCB’æ§6öâ‡²W'&÷#¢$æ÷FRæ÷Bf÷VæBâ"Ò“° ¢–b‚—4FÖ–âbbW†—7F–ætæ÷FRæ7&VFVD'’ÓÒW6W$–B’°¢&WGW&â&W2ç7FGW2ƒC2’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“°¢Ð ¢6öç7BæW‡E–ææVBÒW†—7F–ætæ÷FRæ—5–ææVC°¢6öç7BWFFVDBÒæWrFFR‚’çFô•4õ7G&–ær‚“° ¢v—BF"çWFFR‡v÷&·76Tæ÷FW2’ç6WB‡²—5–ææVC¢æW‡E–ææVBÂWFFVDBÒ’çv†W&R†W‡v÷&·76Tæ÷FW2æ–BÂ–B’“° ¢v—BÆöu7—7FVÔWfVçB‚$æ÷FRÖöF–f–VB"ÂW†—7F–ætæ÷FRçF—FÆRÂ%7V66W72"Â&WÂ²æ÷FT–C¢–BÂ–ææVC¢æW‡E–ææVBÒ“°¢&WGW&â&W2æ§6öâ‡²ââæW†—7F–ætæ÷FRÂ—5–ææVC¢æW‡E–ææVBÂWFFVDBÒ“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFò–âæ÷FS¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFò–âæ÷FS¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¦ç÷7B‚"ö’öæ÷FW2ó¦–Bö&6†—fR"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²–BÒÒ&Wç&×3°¢6öç7B²W6W$–BÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢G'’°¢6öç7BfWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76Tæ÷FW2’çv†W&R†W‡v÷&·76Tæ÷FW2æ–BÂ–B’“°¢6öç7BW†—7F–ætæ÷FRÒfWF6†VE³Ó°¢–b‚W†—7F–ætæ÷FR’&WGW&â&W2ç7FGW2ƒCB’æ§6öâ‡²W'&÷#¢$æ÷FRæ÷Bf÷VæBâ"Ò“° ¢–b‚—4FÖ–âbbW†—7F–ætæ÷FRæ7&VFVD'’ÓÒW6W$–B’°¢&WGW&â&W2ç7FGW2ƒC2’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“°¢Ð ¢6öç7BæW‡D&6†—fVBÒW†—7F–ætæ÷FRæ—4&6†—fVC°¢6öç7BWFFVDBÒæWrFFR‚’çFô•4õ7G&–ær‚“° ¢v—BF"çWFFR‡v÷&·76Tæ÷FW2’ç6WB‡²—4&6†—fVC¢æW‡D&6†—fVBÂWFFVDBÒ’çv†W&R†W‡v÷&·76Tæ÷FW2æ–BÂ–B’“° ¢v—BÆöu7—7FVÔWfVçB‚$æ÷FRÖöF–f–VB"ÂW†—7F–ætæ÷FRçF—FÆRÂ%7V66W72"Â&WÂ²æ÷FT–C¢–BÂ&6†—fVC¢æW‡D&6†—fVBÒ“°¢&WGW&â&W2æ§6öâ‡²ââæW†—7F–ætæ÷FRÂ—4&6†—fVC¢æW‡D&6†—fVBÂWFFVDBÒ“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFò&6†—fRæ÷FS¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFò&6†—fRæ÷FS¢"²W'"æÖW76vRÒ“°¢Ð§Ò“°  ¢òòtõ$µ54U25%T@¦ævWB‚"ö’÷v÷&·76W2"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²W6W$–BÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢–b†—4FF&6T†VÇF‡’’°¢G'’°¢ÆWBÆ—7C¢ç•µÒÒµÓ°¢–b†—4FÖ–â’°¢Æ—7BÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76W2“°¢ÒVÇ6R°¢Æ—7BÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76W2’çv†W&R†W‡v÷&·76W2æ÷væW%W6W$–BÂW6W$–B’“°¢Ð¢&WGW&â&W2æ§6öâ†Æ—7B“°¢Ò6F6‚†W'#¢ç’’°¢—4FF&6T†VÇF‡’ÒfÇ6S°¢Ð¢Ð ¢6öç7BÆ—7BÒ—4FÖ–âòF%v÷&·76W2¢F%v÷&·76W2æf–ÇFW"‡rÓâræ÷væW%W6W$–BÓÓÒW6W$–B“°¢&WGW&â&W2æ§6öâ†Æ—7B“°§Ò“° ¦ç÷7B‚"ö’÷v÷&·76W2"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²W6W$–BÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢6öç7B²&÷7V7D–BÂ6ö×ç”æÖRÒÒ&Wæ&öG“°¢–b‚&÷7V7D–BÇÂ6ö×ç”æÖR’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢%&÷7V7B”BæB6ö×ç’æÖR&R&WV—&VBâ"Ò“°¢Ð ¢G'’°¢òò&WfVçBGWÆ–6FRv÷&·76W2f÷"F†R6ÖR&÷7V7@¢6öç7BGWÆ–6FRÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76W2’çv†W&R†W‡v÷&·76W2ç&÷7V7D–BÂ&÷7V7D–B’“°¢–b†GWÆ–6FRæÆVæwF‚â’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$v÷&·76RÇ&VG’W†—7G2f÷"F†—2&÷7V7Bâ"Ò“°¢Ð ¢òòÆöö²W&÷7V7BFò&W6öÇfR76–væVB&VÆF–öç6†—öff–6W ¢ÆWBF&vWD÷væW$–BÒW6W$–C°¢6öç7B&÷7V7Dö&¤fWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ‡&÷7V7G2’çv†W&R†W‡&÷7V7G2æ–BÂ&÷7V7D–B’“°¢6öç7B&÷7V7Dö&¢Ò&÷7V7Dö&¤fWF6†VE³Ó°¢–b‡&÷7V7Dö&¢bb&÷7V7Dö&¢æ76–væVDöff–6W$–B’°¢F&vWD÷væW$–BÒ&÷7V7Dö&¢æ76–væVDöff–6W$–C°¢Ð ¢6öç7BæWuv÷&·76S¢ç’Ò°¢–C¢v÷&·76RÒG´FFRææ÷r‚—ÒÒG´ÖF‚æfÆö÷"„ÖF‚ç&æFöÒ‚’¢—ÖÀ¢&÷7V7D–BÀ¢÷væW%W6W$–C¢F&vWD÷væW$–BÀ¢6ö×ç”æÖRÀ¢7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢WFFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢7FGW3¢$7F—fR"À¢öÆÆôf–æF–æw3¢çVÆÂÀ¢6ö×ç•&öf–ÆS¢çVÆÂÀ¢–æGW7G'”æÇ—6—3¢çVÆÂÀ¢W†V7WF—fT–ç6–v‡G3¢çVÆÂÀ¢–çfW7FÖVçD÷÷'GVæ—F–W3¢çVÆÂÀ¢&W6V&6…7VÖÖ&–W3¢çVÆÂÀ¢Ó° ¢v—BF"æ–ç6W'B‡v÷&·76W2’çfÇVW2†æWuv÷&·76R“° ¢v—BÆöu7—7FVÔWfVçB‚%v÷&·76R7&VFVB"Â6ö×ç”æÖRÂ%7V66W72"Â&WÂ²v÷&·76T–C¢æWuv÷&·76Ræ–BÂ6ö×ç”æÖRÒ“°¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ†æWuv÷&·76R“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒv÷&·76Rõ5Bf–ÆVC¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFò7&VFRv÷&·76S¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¦çF6‚‚"ö’÷v÷&·76W2ó¦–B"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²–BÒÒ&Wç&×3°¢6öç7B²W6W$–BÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢G'’°¢6öç7Bw4fWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76W2’çv†W&R†W‡v÷&·76W2æ–BÂ–B’“°¢6öç7Bv÷&·76Tö&¢Òw4fWF6†VE³Ó°¢–b‚v÷&·76Tö&¢’°¢&WGW&â&W2ç7FGW2ƒCB’æ§6öâ‡²W'&÷#¢%v÷&·76Ræ÷Bf÷VæBâ"Ò“°¢Ð ¢–b‚—4FÖ–âbbv÷&·76Tö&¢æ÷væW%W6W$–BÓÒW6W$–B’°¢&WGW&â&W2ç7FGW2ƒC2’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ7G&–7B6V7W&—G’'VÆS¢F†—2v÷&·76R&VÆöæw2Fòæ÷F†W"&VÆF–öç6†—öff–6W"â"Ò“°¢Ð ¢6öç7B°¢7FGW2À¢öÆÆôf–æF–æw2À¢6ö×ç•&öf–ÆRÀ¢–æGW7G'”æÇ—6—2À¢W†V7WF—fT–ç6–v‡G2À¢–çfW7FÖVçD÷÷'GVæ—F–W2À¢&W6V&6…7VÖÖ&–W0¢ÒÒ&Wæ&öG“° ¢6öç7BWFFW3¢ç’Ò·Ó°¢–b‡7FGW2ÓÒVæFVf–æVB’WFFW2ç7FGW2Ò7FGW3°¢–b†öÆÆôf–æF–æw2ÓÒVæFVf–æVB’WFFW2æöÆÆôf–æF–æw2ÒöÆÆôf–æF–æw3°¢–b†6ö×ç•&öf–ÆRÓÒVæFVf–æVB’WFFW2æ6ö×ç•&öf–ÆRÒ6ö×ç•&öf–ÆS°¢–b†–æGW7G'”æÇ—6—2ÓÒVæFVf–æVB’WFFW2æ–æGW7G'”æÇ—6—2Ò–æGW7G'”æÇ—6—3°¢–b†W†V7WF—fT–ç6–v‡G2ÓÒVæFVf–æVB’WFFW2æW†V7WF—fT–ç6–v‡G2ÒW†V7WF—fT–ç6–v‡G3°¢–b†–çfW7FÖVçD÷÷'GVæ—F–W2ÓÒVæFVf–æVB’WFFW2æ–çfW7FÖVçD÷÷'GVæ—F–W2Ò–çfW7FÖVçD÷÷'GVæ—F–W3°¢–b‡&W6V&6…7VÖÖ&–W2ÓÒVæFVf–æVB’WFFW2ç&W6V&6…7VÖÖ&–W2Ò&W6V&6…7VÖÖ&–W3°¢WFFW2çWFFVDBÒæWrFFR‚’çFô•4õ7G&–ær‚“° ¢v—BF"çWFFR‡v÷&·76W2’ç6WB‡WFFW2’çv†W&R†W‡v÷&·76W2æ–BÂ–B’“° ¢v—BÆöu7—7FVÔWfVçB‚%v÷&·76RWFFVB"Âv÷&·76Tö&¢æ6ö×ç”æÖRÂ%7V66W72"Â&WÂ²v÷&·76T–C¢–BÒ“°¢&WGW&â&W2æ§6öâ‡²ââçv÷&·76Tö&¢ÂââçWFFW2Ò“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒv÷&·76RD4‚f–ÆVC¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòWFFRv÷&·76S¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¦æFVÆWFR‚"ö’÷v÷&·76W2ó¦–B"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²–BÒÒ&Wç&×3°¢6öç7B²W6W$–BÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢G'’°¢6öç7Bw4fWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76W2’çv†W&R†W‡v÷&·76W2æ–BÂ–B’“°¢6öç7Bv÷&·76Tö&¢Òw4fWF6†VE³Ó°¢–b‚v÷&·76Tö&¢’°¢&WGW&â&W2ç7FGW2ƒCB’æ§6öâ‡²W'&÷#¢%v÷&·76Ræ÷Bf÷VæBâ"Ò“°¢Ð ¢–b‚—4FÖ–âbbv÷&·76Tö&¢æ÷væW%W6W$–BÓÒW6W$–B’°¢&WGW&â&W2ç7FGW2ƒC2’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ7G&–7B6V7W&—G’'VÆS¢F†—2v÷&·76R&VÆöæw2Fòæ÷F†W"&VÆF–öç6†—öff–6W"â"Ò“°¢Ð ¢v—BF"æFVÆWFR‡v÷&·76W2’çv†W&R†W‡v÷&·76W2æ–BÂ–B’“° ¢v—BÆöu7—7FVÔWfVçB‚%v÷&·76RFVÆWFVB"Âv÷&·76Tö&¢æ6ö×ç”æÖRÂ%7V66W72"Â&WÂ²v÷&·76T–C¢–BÒ“°¢&WGW&â&W2æ§6öâ‡²7V66W73¢G'VRÒ“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒv÷&·76RDTÄUDRf–ÆVC¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòFVÆWFRv÷&·76S¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¢òò6–ævÆRv÷&·76RFWF–Âv—F‚7V"ÔVçF—F–W2æB7F—f—G’F–ÖVÆ–æP¦ævWB‚"ö’÷v÷&·76W2ó¦–B"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²–BÒÒ&Wç&×3°¢6öç7B²W6W$–BÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢G'’°¢6öç7Bw4fWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76W2’çv†W&R†W‡v÷&·76W2æ–BÂ–B’“°¢6öç7Bv÷&·76Tö&¢Òw4fWF6†VE³Ó°¢–b‚v÷&·76Tö&¢’°¢&WGW&â&W2ç7FGW2ƒCB’æ§6öâ‡²W'&÷#¢%v÷&·76Ræ÷Bf÷VæBâ"Ò“°¢Ð ¢–b‚—4FÖ–âbbv÷&·76Tö&¢æ÷væW%W6W$–BÓÒW6W$–B’°¢&WGW&â&W2ç7FGW2ƒC2’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ7G&–7B6V7W&—G’'VÆS¢F†—2v÷&·76R&VÆöæw2Fòæ÷F†W"&VÆF–öç6†—öff–6W"â"Ò“°¢Ð ¢6öç7B&÷7V7D–BÒv÷&·76Tö&¢ç&÷7V7D–C° ¢òòvF†W"6†–ÆG&Vâg&öÒ5$ÒFF&6W2F—&V7FÇ¢6öç7B6öçF7G4Æ—7BÒ&÷7V7D–Bòv—BF"ç6VÆV7B‚’æg&öÒ†6öçF7G2’çv†W&R†W†6öçF7G2ç&÷7V7D–BÂ&÷7V7D–B’’¢µÓ°¢6öç7BÖVWF–æw4Æ—7BÒ&÷7V7D–Bòv—BF"ç6VÆV7B‚’æg&öÒ†ÖVWF–æw2’çv†W&R†W†ÖVWF–æw2ç&÷7V7D–BÂ&÷7V7D–B’’¢µÓ°¢6öç7BF6·4Æ—7BÒ&÷7V7D–Bòv—BF"ç6VÆV7B‚’æg&öÒ‡F6·2’çv†W&R†W‡F6·2ç&÷7V7D–BÂ&÷7V7D–B’’¢µÓ°¢ ¢òòf÷"æ÷FW2ÂÆöBÖF6†–ærv÷&·76T–Bõ"&÷7V7D–@¢ÆWBæ÷FW4Æ—7BÒµÓ°¢–b‡&÷7V7D–B’°¢æ÷FW4Æ—7BÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76Tæ÷FW2’çv†W&R€¢÷"€¢W‡v÷&·76Tæ÷FW2çv÷&·76T–BÂ–B’À¢W‡v÷&·76Tæ÷FW2ç&÷7V7D–BÂ&÷7V7D–B¢¢“°¢ÒVÇ6R°¢æ÷FW4Æ—7BÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76Tæ÷FW2’çv†W&R†W‡v÷&·76Tæ÷FW2çv÷&·76T–BÂ–B’“°¢Ð ¢6öç7B&÷÷6Ç4Æ—7BÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76U&÷÷6Ç2’çv†W&R†W‡v÷&·76U&÷÷6Ç2çv÷&·76T–BÂ–B’“°¢6öç7B&W6VçFF–öç4Æ—7BÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76U&W6VçFF–öç2’çv†W&R†W‡v÷&·76U&W6VçFF–öç2çv÷&·76T–BÂ–B’“°¢6öç7B”6öçfW'6F–öç4Æ—7BÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76T”6öçfW'6F–öç2’çv†W&R†W‡v÷&·76T”6öçfW'6F–öç2çv÷&·76T–BÂ–B’“°¢6öç7B6V&6„†—7F÷'”Æ—7BÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76U6V&6„†—7F÷'’’çv†W&R†W‡v÷&·76U6V&6„†—7F÷'’çv÷&·76T–BÂ–B’“° ¢òòvVæW&FR7F—f—G’F–ÖVÆ–æP¢6öç7BF–ÖVÆ–æS¢ç•µÒÒµÓ° ¢òòâ&W6V&6‚7&VFVBõWFFV@¢F–ÖVÆ–æRçW6‚‡°¢–C¢B×&W6V&6‚Ö7&VFVBÒG·v÷&·76Tö&¢æ–GÖÀ¢G—S¢%&W6V&6‚7&VFVB"À¢F—FÆS¢%&W6V&6‚v÷&·76RW7F&Æ—6†VB"À¢FW67&—F–öã¢44Ò&W6V&6‚v÷&·76RW7F&Æ—6†VBf÷"G·v÷&·76Tö&¢æ6ö×ç”æÖWÒæÀ¢F–ÖW7F×¢v÷&·76Tö&¢æ7&VFVDBÀ¢W6W#¢%7—7FVÒ ¢Ò“° ¢–b‡v÷&·76Tö&¢çWFFVDBbbv÷&·76Tö&¢çWFFVDBÓÒv÷&·76Tö&¢æ7&VFVDB’°¢F–ÖVÆ–æRçW6‚‡°¢–C¢B×&W6V&6‚×WFFVBÒG·v÷&·76Tö&¢æ–GÖÀ¢G—S¢%&W6V&6‚WFFVB"À¢F—FÆS¢%v÷&·76R&öf–ÆR7–æ6‡&öæ—¦VB"À¢FW67&—F–öã¢$6ö×ç’&öf–ÆRÂöÆÆò–çFVÆÆ–vVæ6RÂ÷"Ö&¶WBG–æÖ–72WFFVBâ"À¢F–ÖW7F×¢v÷&·76Tö&¢çWFFVDBÀ¢W6W#¢%7—7FVÒ ¢Ò“°¢Ð ¢òò"â6öçF7G2FFV@¢f÷"†6öç7B2öb6öçF7G4Æ—7B’°¢F–ÖVÆ–æRçW6‚‡°¢–C¢BÖ6öçF7BÒG¶2æ–GÖÀ¢G—S¢$6öçF7BFFVB"À¢F—FÆS¢$W†V7WF—fR6öçF7BÆövvVB"À¢FW67&—F–öã¢FFVBFV6—6–öâÖ¶W#¢G¶2ægVÆÄæÖWÒ‚G¶2ç÷6—F–öçÒ–À¢F–ÖW7F×¢2æ7&VFVDBÇÂv÷&·76Tö&¢æ7&VFVDBÀ¢W6W#¢%7—7FVÒ ¢Ò“°¢Ð ¢òò2âÖVWF–æw2†VÆ@¢f÷"†6öç7BÒöbÖVWF–æw4Æ—7B’°¢F–ÖVÆ–æRçW6‚‡°¢–C¢BÖÖVWF–ærÒG¶Òæ–GÖÀ¢G—S¢$ÖVWF–ær†VÆB"À¢F—FÆS¢$W†V7WF—fRÖVWF–ær6öæGV7FVB"À¢FW67&—F–öã¢W'÷6S¢G¶ÒçW'÷6RÇÂ$–ç7F—GWF–öæÂ&VÆF–öç6†—&Wf–Wr'ÖÀ¢F–ÖW7F×¢Òæ7&VFVDBÇÂG¶ÒæFFWÕBG¶ÒçF–ÖWÓ£ã¦À¢W6W#¢Òæöff–6W$æÖRÇÂ%&VÆF–öç6†—öff–6W" ¢Ò“°¢Ð ¢òòBâ&÷÷6Ç2vVæW&FV@¢f÷"†6öç7Böb&÷÷6Ç4Æ—7B’°¢F–ÖVÆ–æRçW6‚‡°¢–C¢B×&÷÷6ÂÒG·æ–GÖÀ¢G—S¢%&÷÷6ÂvVæW&FVB"À¢F—FÆS¢$–çfW7FÖVçB&÷÷6ÂG&gFVB"À¢FW67&—F–öã¢vVæW&FVB&÷÷6Ã¢"G·çF—FÆWÒ"…fW'6–öâG·çfW'6–öçÒ–À¢F–ÖW7F×¢æ7&VFVDBÀ¢W6W#¢%7—7FVÒ ¢Ò“°¢Ð ¢òòRâ&W6VçFF–öç2WÆöFV@¢f÷"†6öç7B"öb&W6VçFF–öç4Æ—7B’°¢F–ÖVÆ–æRçW6‚‡°¢–C¢B×&W6VçFF–öâÒG·"æ–GÖÀ¢G—S¢%&W6VçFF–öâWÆöFVB"À¢F—FÆS¢%&W6VçFF–öâ6öÆÆFW&ÂFFVB"À¢FW67&—F–öã¢WÆöFVBG·"çG—RÇÂ$6Æ–VçB—F6‚FV6²'Ó¢"G·"çF—FÆWÒ&À¢F–ÖW7F×¢"æ7&VFVDBÀ¢W6W#¢%7—7FVÒ ¢Ò“°¢Ð ¢òòbâF6·26ö×ÆWFV@¢f÷"†6öç7BBöbF6·4Æ—7B’°¢–b‡Bæ—46ö×ÆWFVB’°¢F–ÖVÆ–æRçW6‚‡°¢–C¢B×F6²ÒG·Bæ–GÖÀ¢G—S¢%F6²6ö×ÆWFVB"À¢F—FÆS¢$5$Ò7F–öâ—FVÒ6ö×ÆWFVB"À¢FW67&—F–öã¢6ö×ÆWFVBF6³¢"G·BçF—FÆWÒ&À¢F–ÖW7F×¢v÷&·76Tö&¢æ7&VFVDBÂòòfÆÆ&6²Fòfö–BW'&÷'0¢W6W#¢Bæ76–væVE7FfbÇÂ%&VÆF–öç6†—öff–6W" ¢Ò“°¢Ð¢Ð ¢òòrâæ÷FW2FFV@¢f÷"†6öç7Bâöbæ÷FW4Æ—7B’°¢F–ÖVÆ–æRçW6‚‡°¢–C¢BÖæ÷FRÒG¶âæ–GÖÀ¢G—S¢$æ÷FRFFVB"À¢F—FÆS¢%7G&FVv–2æ÷FR6fVB"À¢FW67&—F–öã¢ÆövvVBæ÷FS¢"G¶âçF—FÆWÒ&À¢F–ÖW7F×¢âæ7&VFVDBÀ¢W6W#¢%7—7FVÒ ¢Ò“°¢Ð ¢òò‚â’6W76–öç2vVæW&FV@¢f÷"†6öç7B2öb”6öçfW'6F–öç4Æ—7B’°¢F–ÖVÆ–æRçW6‚‡°¢–C¢BÖ’ÒG¶2æ–GÖÀ¢G—S¢$’6W76–öâvVæW&FVB"À¢F—FÆS¢%6W&Væ–çFVÆÆ–vVæ6R–çV—'’"À¢FW67&—F–öã¢6öç7VÇFVB6W&Væv—F‚&ö×C¢"G¶2çW6W%&ö×Bç7V'7G&–ærƒÂc—Òâââ&À¢F–ÖW7F×¢2æ7&VFVDBÀ¢W6W#¢%7—7FVÒ ¢Ò“°¢Ð ¢òò6÷'BF–ÖVÆ–æRæWvW7Bf—'7@¢F–ÖVÆ–æRç6÷'B‚†Â"’ÓâæWrFFR†"çF–ÖW7F×’ævWEF–ÖR‚’ÒæWrFFR†çF–ÖW7F×’ævWEF–ÖR‚’“° ¢&WGW&â&W2æ§6öâ‡°¢v÷&·76S¢v÷&·76Tö&¢À¢6öçF7G3¢6öçF7G4Æ—7BÀ¢ÖVWF–æw3¢ÖVWF–æw4Æ—7BÀ¢F6·3¢F6·4Æ—7BÀ¢æ÷FW3¢æ÷FW4Æ—7BÀ¢&÷÷6Ç3¢&÷÷6Ç4Æ—7BÀ¢&W6VçFF–öç3¢&W6VçFF–öç4Æ—7BÀ¢”6öçfW'6F–öç3¢”6öçfW'6F–öç4Æ—7BÀ¢6V&6„†—7F÷'“¢6V&6„†—7F÷'”Æ—7BÀ¢F–ÖVÆ–æP¢Ò“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒv÷&·76RFWF–Âf–ÆVC¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòÆöBv÷&·76RFWF–Ç3¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¢òòv÷&·76R&÷÷6Ç27&VF–öà¦ç÷7B‚"ö’÷v÷&·76W2ó¦–B÷&÷÷6Ç2"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²–BÒÒ&Wç&×3°¢6öç7B²W6W$–BÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢G'’°¢6öç7Bw4fWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76W2’çv†W&R†W‡v÷&·76W2æ–BÂ–B’“°¢6öç7Bv÷&·76Tö&¢Òw4fWF6†VE³Ó°¢–b‚v÷&·76Tö&¢’&WGW&â&W2ç7FGW2ƒCB’æ§6öâ‡²W'&÷#¢%v÷&·76Ræ÷Bf÷VæBâ"Ò“° ¢6öç7B²F—FÆRÂ6öçFVçBÂfW'6–öâÂ&÷fÅ7FGW2ÒÒ&Wæ&öG“°¢–b‚F—FÆRÇÂ6öçFVçB’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢%F—FÆRæB6öçFVçB&R&WV—&VBâ"Ò“°¢Ð ¢6öç7BæWu&÷÷6Ã¢ç’Ò°¢–C¢&÷÷6ÂÒG´FFRææ÷r‚—ÒÒG´ÖF‚æfÆö÷"„ÖF‚ç&æFöÒ‚’¢—ÖÀ¢v÷&·76T–C¢–BÀ¢F—FÆRÀ¢6öçFVçBÀ¢fW'6–öã¢fW'6–öâÇÂ#ã"À¢&÷fÅ7FGW3¢&÷fÅ7FGW2ÇÂ$G&gB"À¢7&VFVD'“¢W6W$–BÀ¢7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢WFFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢Ó° ¢v—BF"æ–ç6W'B‡v÷&·76U&÷÷6Ç2’çfÇVW2†æWu&÷÷6Â“° ¢v—BÆöu7—7FVÔWfVçB‚%&÷÷6Â7&VFVB"ÂF—FÆRÂ%7V66W72"Â&WÂ²v÷&·76T–C¢–BÂ&÷÷6Ä–C¢æWu&÷÷6Âæ–BÒ“°¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ†æWu&÷÷6Â“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFò7&VFRv÷&·76R&÷÷6Ã¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFò6fR&÷÷6Ã¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¢òòv÷&·76R&W6VçFF–öç2WÆö@¦ç÷7B‚"ö’÷v÷&·76W2ó¦–B÷&W6VçFF–öç2"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²–BÒÒ&Wç&×3°¢6öç7B²W6W$–BÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢G'’°¢6öç7Bw4fWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76W2’çv†W&R†W‡v÷&·76W2æ–BÂ–B’“°¢6öç7Bv÷&·76Tö&¢Òw4fWF6†VE³Ó°¢–b‚v÷&·76Tö&¢’&WGW&â&W2ç7FGW2ƒCB’æ§6öâ‡²W'&÷#¢%v÷&·76Ræ÷Bf÷VæBâ"Ò“° ¢6öç7B²F—FÆRÂG—RÂ6öçFVçBÒÒ&Wæ&öG“°¢–b‚F—FÆRÇÂG—R’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢%F—FÆRæBG—R&R&WV—&VBâ"Ò“°¢Ð ¢6öç7BæWu&W6VçFF–öã¢ç’Ò°¢–C¢&W6VçFF–öâÒG´FFRææ÷r‚—ÒÒG´ÖF‚æfÆö÷"„ÖF‚ç&æFöÒ‚’¢—ÖÀ¢v÷&·76T–C¢–BÀ¢F—FÆRÀ¢G—RÀ¢6öçFVçC¢6öçFVçBÇÂ—F6‚ÖFW&–Ç2f÷"G·v÷&·76Tö&¢æ6ö×ç”æÖWÖÀ¢7&VFVD'“¢W6W$–BÀ¢7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢Ó° ¢v—BF"æ–ç6W'B‡v÷&·76U&W6VçFF–öç2’çfÇVW2†æWu&W6VçFF–öâ“° ¢v—BÆöu7—7FVÔWfVçB‚%&W6VçFF–öâWÆöFVB"ÂF—FÆRÂ%7V66W72"Â&WÂ²v÷&·76T–C¢–BÂ&W6VçFF–öä–C¢æWu&W6VçFF–öâæ–BÒ“°¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ†æWu&W6VçFF–öâ“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFò7&VFR&W6VçFF–öã¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòWÆöB&W6VçFF–öã¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¢òòv÷&·76R’6öçfW'6F–öç2…6W&Væ–çFW&7F–öç2¦ç÷7B‚"ö’÷v÷&·76W2ó¦–Bö’Ö6öçfW'6F–öç2"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²–BÒÒ&Wç&×3°¢6öç7B²W6W$–BÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢6öç7B²W6W%&ö×BÂ&W7öç6UFW‡BÂÖöFVÅW6VBÂFö¶Vç2ÒÒ&Wæ&öG“°¢–b‚W6W%&ö×BÇÂ&W7öç6UFW‡B’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢%&ö×BæB&W7öç6RFW‡B&R&WV—&VBâ"Ò“°¢Ð ¢6öç7BæWt”6öçc¢ç’Ò°¢–C¢–6öçbÒG´FFRææ÷r‚—ÒÒG´ÖF‚æfÆö÷"„ÖF‚ç&æFöÒ‚’¢—ÖÀ¢v÷&·76T–C¢–BÀ¢W6W$–BÀ¢W6W%&ö×BÀ¢&W7öç6UFW‡BÀ¢ÖöFVÅW6VC¢ÖöFVÅW6VBÇÂ&vVÖ–æ’Ó"ãRÖfÆ6‚"À¢Fö¶Vç3¢Fö¶Vç2ÇÂÀ¢7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢Ó° ¢G'’°¢v—BF"æ–ç6W'B‡v÷&·76T”6öçfW'6F–öç2’çfÇVW2†æWt”6öçb“°¢v—BÆöu7—7FVÔWfVçB‚$’6W76–öâ6fVB"Â’–çFW&7F–öâ7F÷&VBf÷"v÷&·76VÂ%7V66W72"Â&WÂ²v÷&·76T–C¢–BÒ“°¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ†æWt”6öçb“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFò6fR’6W76–öã¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFò6fR’6W76–öã¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¢òòv÷&·76R6V&6‚†—7F÷'’6fP¦ç÷7B‚"ö’÷v÷&·76W2ó¦–B÷6V&6‚Ö†—7F÷'’"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²–BÒÒ&Wç&×3°¢6öç7B²W6W$–BÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ"Ò“° ¢6öç7B²6V&6…FW&ÒÂ6÷W&6RÂ&W7öç6RÂFö¶Vç2ÒÒ&Wæ&öG“°¢–b‚6V&6…FW&Ò’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢%6V&6‚FW&Ò—2&WV—&VBâ"Ò“°¢Ð ¢6öç7BæWt†—7F÷'“¢ç’Ò°¢–C¢†—7F÷'’ÒG´FFRææ÷r‚—ÒÒG´ÖF‚æfÆö÷"„ÖF‚ç&æFöÒ‚’¢—ÖÀ¢v÷&·76T–C¢–BÀ¢W6W$–BÀ¢6V&6…FW&ÒÀ¢6÷W&6S¢6÷W&6RÇÂ$öÆÆò"À¢&W7öç6S¢&W7öç6RÇÂ""À¢Fö¶Vç3¢Fö¶Vç2ÇÂÀ¢7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢Ó° ¢G'’°¢v—BF"æ–ç6W'B‡v÷&·76U6V&6„†—7F÷'’’çfÇVW2†æWt†—7F÷'’“°¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ†æWt†—7F÷'’“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFò6fR6V&6‚†—7F÷'“¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFò6fR6V&6‚†—7F÷'“¢"²W'"æÖW76vRÒ“°¢Ð§Ò“°  ¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¢òòäUu24”täÂ•TÄ”äU0¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¦ævWB‚"ö’öæWw2"Â7–æ2‡&WÂ&W2’Óâ°¢–b†—4FF&6T†VÇF‡’’°¢G'’°¢6öç7BÆ—7BÒv—BF"ç6VÆV7B‚’æg&öÒ†æWw4'F–6ÆW2“°¢&WGW&â&W2æ§6öâ†Æ—7B“°¢Ò6F6‚†W'#¢ç’’°¢—4FF&6T†VÇF‡’ÒfÇ6S°¢6öç6öÆRçv&â‚%µ44ÒDD$4UÒæWw26VÆV7Bæ÷F–6S¢÷W&F–ær–âÆö6ÂÖVÖ÷'’fÆÆ&6²ÖöFRâ"ÂW'"æÖW76vRÇÂW'"“°¢Ð¢Ð¢&WGW&â&W2æ§6öâ†F$æWw4'F–6ÆW2bbF$æWw4'F–6ÆW2æÆVæwF‚âòF$æWw4'F–6ÆW2¢FVfVÇDæWw4'F–6ÆW2“°§Ò“° ¦ç÷7B‚"ö’öæWw2"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²6ö×ç”æÖRÂF—FÆRÂ6öçFVçBÂFW67&—F–öâÂ6FVv÷'’Â6WfW&—G’ÒÒ&Wæ&öG“°¢6öç7B7GVÄ6öçFVçBÒ6öçFVçBÇÂFW67&—F–öã°¢–b‚6ö×ç”æÖRÇÂF—FÆRÇÂ7GVÄ6öçFVçB’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$6ö×ç’æÖRÂF—FÆRÂæB6öçFVçBöFW67&—F–öâ&R&WV—&VBâ"Ò“°¢Ð¢6öç7BæWt'F–6ÆS¢æWw4'F–6ÆRÒ°¢–C¢æWw2ÒG´FFRææ÷r‚—ÖÀ¢6ö×ç”æÖRÀ¢F—FÆRÀ¢6öçFVçC¢7GVÄ6öçFVçBÀ¢6FVv÷'“¢6FVv÷'’ÇÂ%6–væÇ2"À¢FFS¢æWrFFR‚’çFô•4õ7G&–ær‚’ç7Æ—B‚uBr•³ÒÀ¢6WfW&—G“¢6WfW&—G’ÇÂ$ÖVF—VÒ ¢Ó° ¢G'’°¢v—BF"æ–ç6W'B†æWw4'F–6ÆW2’çfÇVW2‡°¢–C¢æWt'F–6ÆRæ–BÀ¢6ö×ç”æÖS¢æWt'F–6ÆRæ6ö×ç”æÖRÀ¢F—FÆS¢æWt'F–6ÆRçF—FÆRÀ¢6öçFVçC¢æWt'F–6ÆRæ6öçFVçBÀ¢6FVv÷'“¢æWt'F–6ÆRæ6FVv÷'’À¢FFS¢æWt'F–6ÆRæFFRÀ¢6WfW&—G“¢æWt'F–6ÆRç6WfW&—G¢Ò“°¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ†æWt'F–6ÆR“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFòW'6—7BæWr6–væÂFò÷7Fw&W3¢"ÂW'"æÖW76vR“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòW'6—7BæWr6–væÃ¢"²W'"æÖW76vRÒ“°¢Ð§Ò“°  ¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¢òò$ô5D•dRD•44õdU%’UDôÔD”ôâb’D•44õdU%’Tät”äP¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ ¢òòVæGö–çC¢fWF6‚7F—fRF—66÷fW'’ÆVG2f÷"ÆövvVBÖ–âW6W"v—F‚7G&–7B÷væW'6†—bGWÆ–6FR–çFVÆÆ–vVæ6P¦ævWB‚"ö’öF—66÷fW'’öÆVG2"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢6öç7B7F'EF–ÖRÒFFRææ÷r‚“°¢6öç7B²W6W$–BÂ&öÆRÒÒvWE&WVW7EW6W"‡&W“° ¢G'’°¢–b‚W6W$–B’°¢&WGW&â&W2æ§6öâ…µÒ“°¢Ð ¢ÆWBtÆVG3¢ç•µÒÒµÓ°¢ÆWBÆÅ&÷7V7G3¢ç•µÒÒµÓ° ¢–b†—4FF&6T†VÇF‡’’°¢G'’°¢tÆVG2Òv—BF"ç6VÆV7B‚’æg&öÒ†F—66÷fW&VDÆVG2’çv†W&R†W†F—66÷fW&VDÆVG2çW6W$–BÂW6W$–B’’æ÷&FW$'’†FW62†F—66÷fW&VDÆVG2æ7&VFVDB’“°¢ÆÅ&÷7V7G2Òv—BF"ç6VÆV7B‚’æg&öÒ‡&÷7V7G2“°¢Ò6F6‚†F$W'#¢ç’’°¢—4FF&6T†VÇF‡’ÒfÇ6S°¢6öç6öÆRæÆör‚%µ44ÒD•44õdU%’DD$4RäõD”4UÒ÷W&F–ærF—66÷fW'’ÆVG2–âÆö6ÂÖVÖ÷'’fÆÆ&6²ÖöFRâ"“°¢tÆVG2Ò†F$F—66÷fW&VDÆVG2ÇÂµÒ’æf–ÇFW"‚†Ã¢ç’’ÓâÂçW6W$–BÓÓÒW6W$–BÇÂÂçW6W$–B“°¢ÆÅ&÷7V7G2ÒF%&÷7V7G2ÇÂµÓ°¢Ð¢ÒVÇ6R°¢tÆVG2Ò†F$F—66÷fW&VDÆVG2ÇÂµÒ’æf–ÇFW"‚†Ã¢ç’’ÓâÂçW6W$–BÓÓÒW6W$–BÇÂÂçW6W$–B“°¢ÆÅ&÷7V7G2ÒF%&÷7V7G2ÇÂµÓ°¢Ð ¢6öç7BÖVBÒ‡tÆVG2ÇÂµÒ’æÖ‚‡#¢ç’’Óâ°¢–b‚"’&WGW&âçVÆÃ°¢ ¢6öç7BÖF6†VE&÷7V7BÒÆÅ&÷7V7G2æf–æB‡ÓâææÖRbbææÖRçG&–Ò‚’çFôÆ÷vW$66R‚’ÓÓÒ"ææÖRçG&–Ò‚’çFôÆ÷vW$66R‚’“°¢ ¢&WGW&â°¢–C¢"æ–BÇÂrrÀ¢W6W$–C¢"çW6W$–BÇÂW6W$–BÀ¢æÖS¢"ææÖRÇÂuVæ¶æ÷vâ6÷'÷&F–öârÀ¢–æGW7G'“¢"æ–æGW7G'’ÇÂt#$"VçFW'&—6RrÀ¢6—¦S¢"ç6—¦RÇÂtæ÷B7V6–f–VBrÀ¢vV'6—FS¢"çvV'6—FRÇÂrrÀ¢Æö6F–öã¢"æÆö6F–öâÇÂtÆv÷2Âæ–vW&–rÀ¢÷÷'GVæ—G•66÷&S¢G—Vöb"æ÷÷'GVæ—G•66÷&RÓÓÒvçVÖ&W"rò"æ÷÷'GVæ—G•66÷&R¢ƒRÀ¢6öæf–FVæ6U66÷&S¢G—Vöb"æ6öæf–FVæ6U66÷&RÓÓÒvçVÖ&W"rò"æ6öæf–FVæ6U66÷&R¢“À¢'W6–æW74f—C¢"æ'W6–æW74f—BÇÂ‡"æ÷÷'GVæ—G•66÷&RãÒ“òtW†6WF–öæÂf—Br¢t†–v‚f—Br’À¢G&V7W'•÷FVçF–Ã¢"çG&V7W'•÷FVçF–ÂÇÂ~(*c"²Æ—V–F—G’ööÂrÀ¢W7F–ÖFVE&WfVçVUfÇVS¢G—Vöb"æW7F–ÖFVE&WfVçVUfÇVRÓÓÒvçVÖ&W"rò"æW7F–ÖFVE&WfVçVUfÇVR¢#SÀ¢&V6öã¢"ç&V6öâÇÂrrÀ¢Ç&VG––×÷'FVC¢‡"æÇ&VG––×÷'FVBÇÂ"æÇ&VG•ö–×÷'FVBÇÂfÇ6R’À¢&V6öÖÖVæFVE&öGV7G3¢'&’æ—4'&’‡"ç&V6öÖÖVæFVE&öGV7G2’ò"ç&V6öÖÖVæFVE&öGV7G2¢²u44Ò6÷'÷&FRÖöæW’Ö&¶WBgVæBrÂtf—†VB–æ6öÖRb5Æ6VÖVçG2uÒÀ¢FV6—6–öäÖ¶W'3¢'&’æ—4'&’‡"æFV6—6–öäÖ¶W'2’ò"æFV6—6–öäÖ¶W'2¢·²æÖS¢$6†–Vbf–ææ6–Âöff–6W""ÂF—FÆS¢$4dòòf–ææ6RF—&V7F÷""ÕÒÀ¢ÆFW7DæWw3¢"æÆFW7DæWw2ÇÂ$6÷'÷&FRÆ—V–F—G’÷F–Ö—¦F–öâ6–væÂFWFV7FVBâ"À¢6÷W&6S¢"ç6÷W&6RÇÂ$äu‚Æ—7FVB6÷'÷&F–öç2"À¢&WfVçVU&ævS¢"ç&WfVçVU&ævRÇÂ.(*c"Ò(*c"†–v‚Æ—V–F—G’"À¢7&VFVDC¢"æ7&VFVDBÇÂæWrFFR‚’çFô•4õ7G&–ær‚’À¢W†—7F–æu&÷7V7C¢ÖF6†VE&÷7V7Bò°¢–C¢ÖF6†VE&÷7V7Bæ–BÀ¢æÖS¢ÖF6†VE&÷7V7BææÖRÀ¢76–væVDöff–6W$–C¢ÖF6†VE&÷7V7Bæ76–væVDöff–6W$–BÀ¢76–væVDöff–6W$æÖS¢ÖF6†VE&÷7V7Bæ76–væVDöff–6W$æÖRÇÂ$76–væVB&VÆF–öç6†—ÖævW""À¢7FGW3¢ÖF6†VE&÷7V7Bç7FGW2ÇÂ$ÆVB"À¢7FvS¢ÖF6†VE&÷7V7Bç7FGW0¢Ò¢çVÆÀ¢Ó°¢Ò’æf–ÇFW"„&ööÆVâ“° ¢&WGW&â&W2æ§6öâ†ÖVB“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"†µ44ÒD•44õdU%’U%$õ%Ò&÷WFSÒö’öF—66÷fW'’öÆVG2W'&÷#¦ÂW'"æÖW76vRÇÂW'"“°¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ…µÒ“°¢Ð§Ò“° ¢òòVæGö–çC¢×VÇF’Õ&ÖWFW"’F—66÷fW'’66âG&–vvW"„G–æÖ–2æW‡BÓ2VWVR&F6†–ær¦ç÷7B‚"ö’öF—66÷fW'’÷66â"Â7–æ2‡&WÂ&W2’Óâ°¢G'’°¢6öç7B²W6W$–BÂVÖ–ÂÒÒvWE&WVW7EW6W"‡&W“°¢6öç7BfÆ–EW6W"Òv—BVç7W&UfÆ–EW6W"‡W6W$–BÂVÖ–Â“° ¢6öç7B² ¢6÷W&6RÒ$ÆÂ"Â ¢–æGW7G'’Ò$ÆÂ"Â ¢Æö6F–öâÒ$ÆÂ"Â ¢6—¦UF–W"Ò$ÆÂ"Â ¢&WfVçVU&ævRÒ$ÆÂ"Â ¢F&vWE&öGV7BÒ$ÆÂ" ¢ÒÒ&Wæ&öG’ÇÂ·Ó° ¢6öç6öÆRæÆör†µ44Ò’D•44õdU%’Tät”äUÒW†V7WF–ærF—66÷fW'’66âf÷"W6W#ÒG·fÆ–EW6W"æVÖ–ÇÒf–ÇFW'3¢6÷W&6SÒG·6÷W&6WÒÂ–æGW7G'“ÒG¶–æGW7G'—ÒÂÆö6F–öãÒG¶Æö6F–öçÖ“° ¢òò'V–ÆBD"6öçFW‡Bf÷"F—66÷fW'’VWVRVæv–æP¢6öç7B7Gƒ¢D$6Æ–VçD6öçFW‡BÒ°¢F"À¢—4FF&6T†VÇF‡’À¢F—66÷fW&VDÆVG5F&ÆS¢F—66÷fW&VDÆVG2À¢F—66÷fW'•VWVW5F&ÆS¢F—66÷fW'•VWVW2À¢&÷7V7G5F&ÆS¢&÷7V7G2À¢öÆÆôVç&–6†ÖVçD66†UF&ÆS¢öÆÆôVç&–6†ÖVçD66†RÀ¢Wfã¢WÀ¢–ä'&”fã¢–ä'&’À¢÷$fã¢÷"À¢F$F—66÷fW&VDÆVG4fÆÆ&6³¢F$F—66÷fW&VDÆVG2À¢F%&÷7V7G4fÆÆ&6³¢F%&÷7V7G0¢Ó° ¢òòW†V7WFR66â&F6‚f–F—66÷fW'’VWVRVæv–æR„&F6‚öb2¢6öç7B66å&W7VÇBÒv—BF—66÷fW'•VWVTVæv–æRæW†V7WFU66ä&F6‚€¢fÆ–EW6W"æ–BÀ¢²6÷W&6RÂ–æGW7G'’ÂÆö6F–öâÂ6—¦UF–W"Â&WfVçVU&ævRÂF&vWE&öGV7BÒÀ¢7G‚À¢0¢“° ¢òò6ÆV"&Wf–÷W2Væ–×÷'FVBF—66÷fW&VBÆVG2f÷"F†—2W6W"Fò&W6VçBF†Rg&W6‚VWVR66à¢–b†—4FF&6T†VÇF‡’’°¢G'’°¢v—BF"æFVÆWFR†F—66÷fW&VDÆVG2’çv†W&R€¢æB€¢W†F—66÷fW&VDÆVG2çW6W$–BÂfÆ–EW6W"æ–B’À¢W†F—66÷fW&VDÆVG2æÇ&VG––×÷'FVBÂfÇ6R¢¢“°¢Ò6F6‚†FVÄW'#¢ç’’°¢6öç6öÆRçv&â‚%µ44ÒD•44õdU%•ÒæöâÖ7&—F–6Âv&æ–ær6ÆV&–ær&Wf–÷W266âÆVG3¢"ÂFVÄW'#òæÖW76vRÇÂFVÄW'"“°¢Ð¢ÒVÇ6R°¢F$F—66÷fW&VDÆVG2Ò†F$F—66÷fW&VDÆVG2ÇÂµÒ’æf–ÇFW"†ÂÓâÂçW6W$–BÓÒfÆ–EW6W"æ–BÇÂÂæÇ&VG––×÷'FVB“°¢Ð ¢6öç7B–ç6W'FVDÆVG3¢ç•µÒÒµÓ° ¢f÷"†6öç7BÆVBöb66å&W7VÇBæ&F6‚’°¢6öç7BÆVDFF¢ç’Ò°¢–C¢ÆVBæ–BÀ¢W6W$–C¢fÆ–EW6W"æ–BÀ¢æÖS¢ÆVBææÖRÀ¢–æGW7G'“¢ÆVBæ–æGW7G'’À¢6—¦S¢ÆVBç6—¦RÀ¢vV'6—FS¢ÆVBçvV'6—FRÀ¢Æö6F–öã¢ÆVBæÆö6F–öâÀ¢÷÷'GVæ—G•66÷&S¢ÆVBæ÷÷'GVæ—G•66÷&RÀ¢6öæf–FVæ6U66÷&S¢ÆVBæ6öæf–FVæ6U66÷&RÀ¢'W6–æW74f—C¢ÆVBæ'W6–æW74f—BÀ¢G&V7W'•÷FVçF–Ã¢ÆVBçG&V7W'•÷FVçF–ÂÀ¢W7F–ÖFVE&WfVçVUfÇVS¢ÆVBæW7F–ÖFVE&WfVçVUfÇVRÀ¢&V6öã¢ÆVBç&V6öâÀ¢Ç&VG––×÷'FVC¢fÇ6RÀ¢&V6öÖÖVæFVE&öGV7G3¢ÆVBç&V6öÖÖVæFVE&öGV7G2À¢FV6—6–öäÖ¶W'3¢ÆVBæFV6—6–öäÖ¶W'2À¢ÆFW7DæWw3¢ÆVBæÆFW7DæWw2À¢6÷W&6S¢ÆVBç6÷W&6RÀ¢&WfVçVU&ævS¢ÆVBç&WfVçVU&ævRÀ¢7&VFVDC¢ÆVBæ7&VFVDBÀ¢Vç&–6†ÖVçE7FGW3¢ÆVBæVç&–6†ÖVçE7FGW2ÇÂ%Væf–Æ&ÆR"À¢Æ7E7–æ6VDC¢ÆVBæÆ7E7–æ6VDBÇÂæWrFFR‚’çFô•4õ7G&–ær‚’À¢öÆÆô÷&t–C¢ÆVBæöÆÆô÷&t–BÇÂçVÆÂÀ¢Æ–æ¶VF–åW&Ã¢ÆVBæÆ–æ¶VF–åW&ÂÇÂ%Væf–Æ&ÆR ¢Ó° ¢–b†—4FF&6T†VÇF‡’’°¢G'’°¢v—BF"æ–ç6W'B†F—66÷fW&VDÆVG2’çfÇVW2†ÆVDFF“°¢Ò6F6‚†–ç4W'#¢ç’’°¢—4FF&6T†VÇF‡’ÒfÇ6S°¢6öç6öÆRçv&â‚%µ44Ò’D•44õdU%’Tät”äUÒD"–ç6W'Bf–ÆVBf÷"F—66÷fW&VBÆVBÂ6f–ærFòÖVÖ÷'’7FFS¢"Â–ç4W'"æÖW76vRÇÂ–ç4W'"“°¢F$F—66÷fW&VDÆVG2çVç6†–gB†ÆVDFF“°¢Ð¢ÒVÇ6R°¢F$F—66÷fW&VDÆVG2çVç6†–gB†ÆVDFF“°¢Ð ¢–ç6W'FVDÆVG2çW6‚‡°¢ââæÆVDFFÀ¢W†—7F–æu&÷7V7C¢ÆVBæW†—7F–æu&÷7V7@¢Ò“°¢Ð ¢òò&V6÷&B6W76–öâ†—7F÷'¢6öç7B6W76–öä–BÒ6W76–öâÒG´FFRææ÷r‚—Ö°¢6öç7B6W76–öå&V6÷&BÒ°¢–C¢6W76–öä–BÀ¢W6W$–C¢fÆ–EW6W"æ–BÀ¢W6W$VÖ–Ã¢fÆ–EW6W"æVÖ–ÂÀ¢6÷W&6S¢6÷W&6RÇÂ$ÆÂ6÷W&6W2"À¢–æGW7G'“¢–æGW7G'’ÇÂ$ÆÂ–æGW7G&–W2"À¢Æö6F–öã¢Æö6F–öâÇÂ$ÆÂ&Vv–öç2"À¢6—¦UF–W#¢6—¦UF–W"ÇÂ$ÆÂF–W'2"À¢&WfVçVU&ævS¢&WfVçVU&ævRÇÂ$ÆÂ&ævW2"À¢F&vWE&öGV7C¢F&vWE&öGV7BÇÂ$ÆÂ44ÒöffW&–æw2"À¢WfÄ6÷VçC¢66å&W7VÇBçF÷FÄWfÇVFVBÀ¢&V46÷VçC¢–ç6W'FVDÆVG2æÆVæwF‚À¢6fVD6÷VçC¢À¢7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚¢Ó° ¢–b†—4FF&6T†VÇF‡’’°¢G'’°¢v—BF"æ–ç6W'B†F—66÷fW'•6W76–öç2’çfÇVW2‡6W76–öå&V6÷&B“°¢Ò6F6‚‡4W'"’°¢6öç6öÆRçv&â‚%µ44ÒD•44õdU%•Ò6W76–öâ†—7F÷'’&V6÷&B–ç6W'Bf–ÆVC¢"Â4W'"“°¢Ð¢Ð ¢òòÆör7—7FVÒVF—@¢–b†—4FF&6T†VÇF‡’’°¢G'’°¢v—BF"æ–ç6W'B†VF—DÆöw2’çfÇVW2‡°¢–C¢VF—BÒG´FFRææ÷r‚—ÖÀ¢F–ÖW7F×¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢6V&6…FW&Ó¢44ÒF—66÷fW'’66ã¢6÷W&6SÒG·6÷W&6WÒÂ–æGW7G'“ÒG¶–æGW7G'—ÖÀ¢W6W#¢fÆ–EW6W"ægVÆÄæÖRÇÂfÆ–EW6W"æVÖ–ÂÀ¢W6W$–C¢fÆ–EW6W"æ–BÀ¢W6W$VÖ–Ã¢fÆ–EW6W"æVÖ–ÂÀ¢7FGW3¢%5T44U52"À¢6öæf–FVæ6U66÷&S¢“"À¢7F–öåF¶Vã¢W†V7WFVB44Ò’F—66÷fW'’66â(	BWfÇVFVBG·66å&W7VÇBçF÷FÄWfÇVFVGÒ6÷'÷&F–öç2ÂvVæW&FVBG¶–ç6W'FVDÆVG2æÆVæwF‡Ò&V6öÖÖVæFF–öç2æ ¢Ò“°¢Ò6F6‚†W'"’°¢6öç6öÆRçv&â‚%µ44ÒD•44õdU%•ÒVF—BÆörw&—FRf–ÆVC¢"ÂW'"“°¢Ð¢Ð ¢6öç6öÆRæÆör†µ44Ò’D•44õdU%’Tät”äUÒ7V66W76gVÆÇ’6ö×ÆWFVB66âf÷"G·fÆ–EW6W"æVÖ–ÇÒâvVæW&FVB&F6‚öbG¶–ç6W'FVDÆVG2æÆVæwF‡ÒÆVG2‡VWVR7–6ÆR&W6WC¢G·66å&W7VÇBçVWVT7–6ÆU&W6WGÒ’æ“°¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ‡°¢7V66W73¢G'VRÀ¢6W76–öã¢6W76–öå&V6÷&BÀ¢ÆVG3¢–ç6W'FVDÆVG2À¢VWVT7–6ÆU&W6WC¢66å&W7VÇBçVWVT7–6ÆU&W6W@¢Ò“° ¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44Ò’D•44õdU%’Tät”äRU%$õ%ÒF—66÷fW'’66âf–ÆVC¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$F—66÷fW'’66âW†V7WF–öâf–ÆVC¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¢òò&6·v&B6ö×F–&–Æ—G’VæGö–çC¢ÆVv7’G&–vvW ¦ç÷7B‚"ö’öF—66÷fW'’÷G&–vvW""Â7–æ2‡&WÂ&W2’Óâ°¢G'’°¢6öç7B²W6W$–BÂVÖ–ÂÒÒvWE&WVW7EW6W"‡&W“°¢6öç7BfÆ–EW6W"Òv—BVç7W&UfÆ–EW6W"‡W6W$–BÂVÖ–Â“° ¢òò6ÆÂ66â–çFW&æÆÇ’v—F‚FVfVÇG0¢&Wæ&öG’Ò²6÷W&6S¢$äu‚Æ—7FVB6÷'÷&F–öç2"Â–æGW7G'“¢$ÆÂ"ÂÆö6F–öã¢$ÆÂ"Â6—¦UF–W#¢$ÆÂ"Â&WfVçVU&ævS¢$ÆÂ"ÂF&vWE&öGV7C¢$ÆÂ"Ó°¢ ¢6öç7B66å&W7öç6RÒv—BfWF6‚†‡GG¢òöÆö6Æ†÷7C£3ö’öF—66÷fW'’÷66æÂ°¢ÖWF†öC¢%õ5B"À¢†VFW'3¢²$6öçFVçBÕG—R#¢&Æ–6F–öâö§6öâ"Â'‚×W6W"Ö–B#¢fÆ–EW6W"æ–BÂ'‚×W6W"ÖVÖ–Â#¢fÆ–EW6W"æVÖ–ÂÒÀ¢&öG“¢¥4ôâç7G&–æv–g’‡&Wæ&öG’¢Ò“°¢6öç7B66äFFÒv—B66å&W7öç6Ræ§6öâ‚“° ¢–b‡66äFFbb66äFFæÆVG2bb66äFFæÆVG2æÆVæwF‚â’°¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ‡66äFFæÆVG5³Ò“°¢Ð ¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ‡²ÖW76vS¢%66â6ö×ÆWFVB7V66W76gVÆÇ’â"Ò“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44Ò$D"E$”ttU"U%$õ%Ó¢"ÂW'"æÖW76vR“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòG&–vvW"F—66÷fW'’ÆVC¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¢òòVæGö–çC¢F—6Ö—72ÆVBg&öÒF—66÷fW'’VWVP¦æFVÆWFR‚"ö’öF—66÷fW'’öÆVBó¦–B"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²–BÒÒ&Wç&×3°¢G'’°¢6öç7B²W6W$–BÂVÖ–ÂÒÒvWE&WVW7EW6W"‡&W“°¢6öç7BfÆ–EW6W"Òv—BVç7W&UfÆ–EW6W"‡W6W$–BÂVÖ–Â“° ¢6öç7B7Gƒ¢D$6Æ–VçD6öçFW‡BÒ°¢F"À¢—4FF&6T†VÇF‡’À¢F—66÷fW&VDÆVG5F&ÆS¢F—66÷fW&VDÆVG2À¢F—66÷fW'•VWVW5F&ÆS¢F—66÷fW'•VWVW2À¢&÷7V7G5F&ÆS¢&÷7V7G2À¢öÆÆôVç&–6†ÖVçD66†UF&ÆS¢öÆÆôVç&–6†ÖVçD66†RÀ¢Wfã¢WÀ¢–ä'&”fã¢–ä'&’À¢÷$fã¢÷"À¢F$F—66÷fW&VDÆVG4fÆÆ&6³¢F$F—66÷fW&VDÆVG2À¢F%&÷7V7G4fÆÆ&6³¢F%&÷7V7G0¢Ó° ¢ÆWBÆVDæÖRÒ"#°¢–b†—4FF&6T†VÇF‡’’°¢G'’°¢6öç7BW†—7F–ærÒv—BF"ç6VÆV7B‚’æg&öÒ†F—66÷fW&VDÆVG2’çv†W&R€¢æB†W†F—66÷fW&VDÆVG2æ–BÂ–B’ÂW†F—66÷fW&VDÆVG2çW6W$–BÂfÆ–EW6W"æ–B’¢“°¢–b†W†—7F–æræÆVæwF‚â’°¢ÆVDæÖRÒW†—7F–æu³ÒææÖS°¢v—BF"æFVÆWFR†F—66÷fW&VDÆVG2’çv†W&R†æB†W†F—66÷fW&VDÆVG2æ–BÂ–B’ÂW†F—66÷fW&VDÆVG2çW6W$–BÂfÆ–EW6W"æ–B’’“°¢Ð¢Ò6F6‚†F$W'#¢ç’’°¢—4FF&6T†VÇF‡’ÒfÇ6S°¢6öç7B–G‚Ò†F$F—66÷fW&VDÆVG2ÇÂµÒ’æf–æD–æFW‚‚†Ã¢ç’’ÓâÂæ–BÓÓÒ–BbbÂçW6W$–BÓÓÒfÆ–EW6W"æ–B“°¢–b†–G‚ÓÒÓ’°¢ÆVDæÖRÒF$F—66÷fW&VDÆVG5¶–G…ÒææÖS°¢F$F—66÷fW&VDÆVG2ç7Æ–6R†–G‚Â“°¢Ð¢Ð¢ÒVÇ6R°¢6öç7B–G‚Ò†F$F—66÷fW&VDÆVG2ÇÂµÒ’æf–æD–æFW‚‚†Ã¢ç’’ÓâÂæ–BÓÓÒ–BbbÂçW6W$–BÓÓÒfÆ–EW6W"æ–B“°¢–b†–G‚ÓÒÓ’°¢ÆVDæÖRÒF$F—66÷fW&VDÆVG5¶–G…ÒææÖS°¢F$F—66÷fW&VDÆVG2ç7Æ–6R†–G‚Â“°¢Ð¢Ð ¢–b†ÆVDæÖR’°¢v—BF—66÷fW'•VWVTVæv–æRç&V6÷&DF—6Ö—76VD6ö×ç’‡fÆ–EW6W"æ–BÂÆVDæÖRÂ7G‚“°¢Ð ¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ‡²7V66W73¢G'VRÂÖW76vS¢$ÆVB&VÖ÷fVBg&öÒ7F—fRF—66÷fW'’VWVRâ"Ò“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒD•44õdU%’D•4Ô•52U%$õ%Ó¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòF—6Ö—72ÆVC¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¢òòVæGö–çC¢÷Vâ–çFVÆÆ–vVæ6R†7&VFW2&W6V&6‚v÷&·76RæB&R×÷VÆFW2FVW’æÇ—6—2¦ç÷7B‚"ö’öF—66÷fW'’ö÷VâÖ–çFVÆÆ–vVæ6Ró¦–B"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²–BÒÒ&Wç&×3°¢G'’°¢6öç7B²W6W$–BÂVÖ–ÂÒÒvWE&WVW7EW6W"‡&W“°¢6öç7BfÆ–EW6W"Òv—BVç7W&UfÆ–EW6W"‡W6W$–BÂVÖ–Â“° ¢6öç7BÆVDfWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ†F—66÷fW&VDÆVG2¢çv†W&R†æB†W†F—66÷fW&VDÆVG2æ–BÂ–B’ÂW†F—66÷fW&VDÆVG2çW6W$–BÂfÆ–EW6W"æ–B’’“°¢6öç7BÆVBÒÆVDfWF6†VE³Ó° ¢–b‚ÆVB’°¢&WGW&â&W2ç7FGW2ƒCB’æ§6öâ‡²W'&÷#¢$F—66÷fW&VBÆVBæ÷Bf÷VæB–â–÷W"F—66÷fW'’VWVRâ"Ò“°¢Ð ¢òò6†V6²–bv÷&·76RÇ&VG’W†—7G2f÷"F†—2ÆVB÷"6ö×ç’æÖP¢6öç7BW†—7F–æuv÷&·76RÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76W2’çv†W&R€¢æB€¢7ÆÄõtU"‚G·v÷&·76W2æ6ö×ç”æÖWÒ’ÒÄõtU"‚G¶ÆVBææÖRçG&–Ò‚—Ò–À¢W‡v÷&·76W2æ÷væW%W6W$–BÂfÆ–EW6W"æ–B¢¢“° ¢–b†W†—7F–æuv÷&·76RæÆVæwF‚â’°¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ‡°¢7V66W73¢G'VRÀ¢v÷&·76T–C¢W†—7F–æuv÷&·76U³Òæ–BÀ¢6ö×ç”æÖS¢ÆVBææÖRÀ¢—4W†—7F–æs¢G'VP¢Ò“°¢Ð ¢òòvVæW&FR&–6‚&W6V&6‚v÷&·76P¢6öç7Bv÷&·76T–BÒv÷&·76RÒG´FFRææ÷r‚—ÒÒG´ÖF‚æfÆö÷"„ÖF‚ç&æFöÒ‚’¢—Ö°¢6öç7BæWuv÷&·76RÒ°¢–C¢v÷&·76T–BÀ¢&÷7V7D–C¢çVÆÂÀ¢÷væW%W6W$–C¢fÆ–EW6W"æ–BÀ¢6ö×ç”æÖS¢ÆVBææÖRÀ¢7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢WFFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢7FGW3¢$7F—fR"À¢öÆÆôf–æF–æw3¢44Ò7F—fRF—66÷fW'’&F"–çFVÆÆ–vVæ6RF÷76–W#¥ÆâÒF&vWB–æGW7G'“¢G¶ÆVBæ–æGW7G'—ÕÆâÒ†VGV'FW'3¢G¶ÆVBæÆö6F–öçÕÆâÒFöÖ–ã¢G¶ÆVBçvV'6—FWÕÆâÒ’÷÷'GVæ—G’66÷&S¢G¶ÆVBæ÷÷'GVæ—G•66÷&WÒUÆâÒ’6öæf–FVæ6R&F–æs¢G¶ÆVBæ6öæf–FVæ6U66÷&RÇÂ“ÒUÆâÒW7F–ÖFVBÆ—V–F—G’GW&æ÷fW#¢G¶ÆVBçG&V7W'•÷FVçF–ÂÇÂt†–v‚wÖÀ¢6ö×ç•&öf–ÆS¢ÆVBç&V6öâÀ¢–æGW7G'”æÇ—6—3¢FVWæÇ—6—2f÷"vW7Bg&–6âG¶ÆVBæ–æGW7G'—Ò6V7F÷#¥ÆâÒ†–v‚w&÷wF‚6÷'÷&FRG&V7W'’ÖöÖVçGVÒåÆâÒ¶W’Æ—V–F—G’&WV—&VÖVçG2Æ–væVBv—F‚44Ò6—FÂÖöæW’Ö&¶WB×WGVÂgVæG2b†–v‚×––VÆB6öÖÖW&6–ÂW"Æ6VÖVçG2æÀ¢W†V7WF—fT–ç6–v‡G3¢7G&FVv–2W†V7WF—fR÷WG&V6‚Æã¥ÆâÒF&vWBöff–6W'3¢w&÷W6†–Vbf–ææ6–Âöff–6W"Â†VBöb6÷'÷&FRG&V7W'’åÆâÒ—F6‚ævÆS¢†–v‚×––VÆBÆ—V–BG&V7W'’÷F–Ö—¦F–öâæB5G&æ6†R'F–6—F–öâæÀ¢–çfW7FÖVçD÷÷'GVæ—F–W3¢&V6öÖÖVæFVB44Ò6—FÂ&öGV7G3¥Æãâ44Ò6÷'÷&FRÖöæW’Ö&¶WB×WGVÂgVæB„F–Ç’Æ—V–F—G’•Æã"â†–v‚Õ––VÆBf—†VB–æ6öÖRò5Æ6VÖVçG5Æã2â7W7FöÖ—¦VB6÷'÷&FRÆ—V–F—G’ÖævVÖVçFÀ¢&W6V&6…7VÖÖ&–W3¢WFòÖvVæW&FVB'’44ÒW‚F—66÷fW'’Væv–æRf÷"G¶ÆVBææÖWÒâ’7G&FVv–2&F–öæÆS¢G¶ÆVBç&V6öçÖ ¢Ó° ¢v—BF"æ–ç6W'B‡v÷&·76W2’çfÇVW2†æWuv÷&·76R“° ¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ‡°¢7V66W73¢G'VRÀ¢v÷&·76T–C¢v÷&·76T–BÀ¢6ö×ç”æÖS¢ÆVBææÖRÀ¢—4W†—7F–æs¢fÇ6P¢Ò“° ¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒõTâ”åDTÄÄ”tTä4RU%$õ%Ó¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFò÷Vâ–çFVÆÆ–vVæ6RF÷76–W#¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¢òòVæGö–çC¢–×÷'BF—66÷fW&VBÆVB–çFò44Ò5$Ò…&÷7V7B²v÷&·76R²&–Ö'’6öçF7B¦ç÷7B‚"ö’öF—66÷fW'’ö–×÷'Bó¦–B"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²–BÒÒ&Wç&×3°¢G'’°¢6öç7B²W6W$–BÂVÖ–ÂÒÒvWE&WVW7EW6W"‡&W“°¢6öç7BfÆ–EW6W"Òv—BVç7W&UfÆ–EW6W"‡W6W$–BÂVÖ–Â“° ¢6öç7BÆVDfWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ†F—66÷fW&VDÆVG2¢çv†W&R†æB†W†F—66÷fW&VDÆVG2æ–BÂ–B’ÂW†F—66÷fW&VDÆVG2çW6W$–BÂfÆ–EW6W"æ–B’’“°¢6öç7BÆVBÒÆVDfWF6†VE³Ó°¢–b‚ÆVB’°¢&WGW&â&W2ç7FGW2ƒCB’æ§6öâ‡²W'&÷#¢$F—66÷fW&VBÆVBæ÷Bf÷VæB–â6÷'÷&FR&F"FF&6R÷"&VÆöæw2Fòæ÷F†W"W6W"â"Ò“°¢Ð¢–b†ÆVBæÇ&VG––×÷'FVB’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$ÆVB—2Ç&VG’–×÷'FVB2â7F—fR&÷7V7B–â–÷W"5$Òâ"Ò“°¢Ð ¢6öç7BGWÆ–6FRÒv—BF"ç6VÆV7B‚’æg&öÒ‡&÷7V7G2’çv†W&R€¢æB€¢7ÆÄõtU"‚G·&÷7V7G2ææÖWÒ’ÒÄõtU"‚G¶ÆVBææÖRçG&–Ò‚—Ò–À¢W‡&÷7V7G2æ76–væVDöff–6W$–BÂfÆ–EW6W"æ–B¢¢“°¢–b†GWÆ–6FRæÆVæwF‚â’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢â÷&væ—¦F–öâæÖVB"G¶ÆVBææÖWÒ"Ç&VG’W†—7G2VæFW"–÷W"76–væVB&÷7V7BF—&V7F÷'’æÒ“°¢Ð ¢6öç7B&÷7V7D–BÒ&÷7V7BÒG´FFRææ÷r‚—Ö°¢6öç7BW7F–ÖFVEfÇVRÒÆVBæW7F–ÖFVE&WfVçVUfÇVRÇÂ#S° ¢6öç7BæWu&÷7V7C¢ç’Ò°¢–C¢&÷7V7D–BÀ¢æÖS¢ÆVBææÖRÀ¢–æGW7G'“¢ÆVBæ–æGW7G'’À¢÷&uG—S¢%V&Æ–2Æ–Ö—FVB6÷'÷&F–öâ"À¢Æö6F–öã¢ÆVBæÆö6F–öâÀ¢vV'6—FS¢ÆVBçvV'6—FRÀ¢7FGW3¢$ÆVB"À¢&–÷&—G“¢ÆVBæ÷÷'GVæ—G•66÷&RãÒ“ò$†–v‚"¢$ÖVF—VÒ"À¢6öçfW'6–öå&ö&&–Æ—G“¢3RÀ¢÷÷'GVæ—G•fÇVS¢W7F–ÖFVEfÇVRÂ ¢76–væVDöff–6W$–C¢fÆ–EW6W"æ–BÀ¢76–væVDöff–6W$æÖS¢fÆ–EW6W"ægVÆÄæÖRÀ¢÷÷'GVæ—G•66÷&S¢ÆVBæ÷÷'GVæ—G•66÷&RÀ¢æ÷FW3¢–×÷'FVBF—&V7FÇ’g&öÒ44ÒW‚F—66÷fW'’Væv–æRâ7G&FVv–2&F–öæÆS¢G¶ÆVBç&V6öçÖÀ¢7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢WFFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢&–Ö'”6öçF7D–C¢çVÆÀ¢Ó° ¢òòWFòÖ7&VFR&–Ö'’6öçF7B„w&÷W4dò¢6öç7B6öçF7D–BÒ6öçF7BÒG´FFRææ÷r‚—Ö°¢6öç7BæWt6öçF7BÒ°¢–C¢6öçF7D–BÀ¢&÷7V7D–C¢&÷7V7D–BÀ¢&÷7V7DæÖS¢ÆVBææÖRÀ¢gVÆÄæÖS¢$6†–Vbf–ææ6–Âöff–6W""À¢÷6—F–öã¢$w&÷W6†–Vbf–ææ6–Âöff–6W""À¢FW'FÖVçC¢$f–ææ6RbG&V7W'’"À¢VÖ–Ã¢6fôG¶ÆVBçvV'6—FRòÆVBçvV'6—FRç&WÆ6R‚v‡GG3¢òòrÂrr’ç&WÆ6R‚v‡GG¢òòrÂrr’ç7Æ—B‚ròr•³Ò¢v6ö×ç’æ6öÒwÖÀ¢†öæS¢"³#3B#3BScs‚"À¢–æfÇVVæ6TÆWfVÃ¢$†–v‚"À¢—4FV6—6–öäÖ¶W#¢G'VRÀ¢æ÷FW3¢%&–Ö'’W†V7WF—fR6öçF7BWFò×&÷f—6–öæVBGW&–ær44ÒW‚F—66÷fW'’–×÷'Bâ"À¢7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚¢Ó° ¢æWu&÷7V7Bç&–Ö'”6öçF7D–BÒ6öçF7D–C° ¢òòWFòÖ7&VFR&W6V&6‚v÷&·76P¢6öç7Bv÷&·76T–BÒv÷&·76RÒG´FFRææ÷r‚—ÒÒG´ÖF‚æfÆö÷"„ÖF‚ç&æFöÒ‚’¢—Ö°¢6öç7BæWuv÷&·76S¢ç’Ò°¢–C¢v÷&·76T–BÀ¢&÷7V7D–C¢&÷7V7D–BÀ¢÷væW%W6W$–C¢fÆ–EW6W"æ–BÀ¢6ö×ç”æÖS¢ÆVBææÖRÀ¢7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢WFFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢7FGW3¢$7F—fR"À¢öÆÆôf–æF–æw3¢44ÒF—66÷fW'’–×÷'Bf–æF–æw3¥ÆâÒF&vWB6÷'÷&F–öã¢G¶ÆVBææÖWÕÆâÒ–æGW7G'“¢G¶ÆVBæ–æGW7G'—ÕÆâÒÆö6F–öã¢G¶ÆVBæÆö6F–öçÕÆâÒW7F–ÖFVBG&V7W'’ööÃ¢G¶ÆVBçG&V7W'•÷FVçF–ÂÇÂ~(*c"²wÕÆâÒfW&–f–6F–öâÆWfVÃ¢ÖVBöâ44Ò6—FÂ÷'FÆÀ¢6ö×ç•&öf–ÆS¢ÆVBç&V6öâÀ¢–æGW7G'”æÇ—6—3¢æ–vW&–â–æGW7G'’6V7F÷#¢G¶ÆVBæ–æGW7G'—Òâ6÷'÷&FRG&V7W'’÷F–Ö—¦F–öâWfÇVF–öâ6öæGV7FVB'’44Ò6—FÂæÀ¢W†V7WF—fT–ç6–v‡G3¢6÷'÷&FRG&V7W'’öff–6W'2&Rv—F–ær5$Ò76–væÖVçBæB–çG&òÖVWF–æræÀ¢–çfW7FÖVçD÷÷'GVæ—F–W3¢&V6öÖÖVæFVB44Ò6—FÂ&öGV7G3¥ÆâÒ44Ò6÷'÷&FRÖöæW’Ö&¶WB×WGVÂgVæEÆâÒ†–v‚Õ––VÆB6öÖÖW&6–ÂW"Æ6VÖVçG5ÆâÒ7G'V7GW&VBG&V7W'’÷F–Ö—¦F–öæÀ¢&W6V&6…7VÖÖ&–W3¢ÖVBFò&÷7V7BF—&V7F÷'’âÆVB’66÷&S¢G¶ÆVBæ÷÷'GVæ—G•66÷&WÒV ¢Ó° ¢v—BF"çWFFR†F—66÷fW&VDÆVG2’ç6WB‡²Ç&VG––×÷'FVC¢G'VRÒ’çv†W&R†W†F—66÷fW&VDÆVG2æ–BÂ–B’“°¢v—BF"æ–ç6W'B‡&÷7V7G2’çfÇVW2†æWu&÷7V7B“°¢v—BF"æ–ç6W'B†6öçF7G2’çfÇVW2†æWt6öçF7B“°¢v—BF"æ–ç6W'B‡v÷&·76W2’çfÇVW2†æWuv÷&·76R“° ¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ‡²7V66W73¢G'VRÂ&÷7V7C¢æWu&÷7V7BÂv÷&·76T–BÒ“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒD•44õdU%’”Õõ%BU%$õ%ÒÆVB–×÷'Bf–ÆVC¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFò–×÷'BÆVC¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¢òòVæGö–çC¢fWF6‚W6W"w2F—66÷fW'’66â6W76–öâ†—7F÷'¦ævWB‚"ö’öF—66÷fW'’ö†—7F÷'’"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢G'’°¢6öç7B²W6W$–BÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2æ§6öâ…µÒ“° ¢6öç7B6W76–öç2Òv—BF"ç6VÆV7B‚’æg&öÒ†F—66÷fW'•6W76–öç2¢çv†W&R†W†F—66÷fW'•6W76–öç2çW6W$–BÂW6W$–B’¢æ÷&FW$'’†FW62†F—66÷fW'•6W76–öç2æ7&VFVDB’“° ¢&WGW&â&W2æ§6öâ‡6W76–öç2“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒD•44õdU%’„•5Dõ%’U%$õ%Ó¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ…µÒ“°¢Ð§Ò“° ¢òòVæGö–çC¢fWF6‚W†V7WF—fRF—66÷fW'’æÇ—F–70¦ævWB‚"ö’öF—66÷fW'’öæÇ—F–72"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢G'’°¢6öç7B²W6W$–BÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢%VæWF†÷&—¦VB"Ò“° ¢6öç7BÆVG2Òv—BF"ç6VÆV7B‚’æg&öÒ†F—66÷fW&VDÆVG2’çv†W&R†W†F—66÷fW&VDÆVG2çW6W$–BÂW6W$–B’“°¢6öç7B6W76–öç2Òv—BF"ç6VÆV7B‚’æg&öÒ†F—66÷fW'•6W76–öç2’çv†W&R†W†F—66÷fW'•6W76–öç2çW6W$–BÂW6W$–B’“° ¢6öç7BF÷FÄWfÇVFVBÒ6W76–öç2ç&VGV6R‚†62Â2’Óâ62²‡2æWfÄ6÷VçBÇÂ’Â’²†ÆVG2æÆVæwF‚¢2“°¢6öç7BF÷FÅVÆ–f–VBÒÆVG2æf–ÇFW"†ÂÓâÂæ÷÷'GVæ—G•66÷&RãÒƒ’æÆVæwFƒ°¢6öç7BF÷FÅ6fVBÒÆVG2æf–ÇFW"†ÂÓâÂæÇ&VG––×÷'FVB’æÆVæwFƒ°¢6öç7B6öçfW'6–öå&FRÒF÷FÅVÆ–f–VBâòÖF‚ç&÷VæB‚‡F÷FÅ6fVBòF÷FÅVÆ–f–VB’¢’¢°¢ ¢6öç7BF÷FÅG&V7W'•fÇVRÒÆVG2ç&VGV6R‚†62ÂÂ’Óâ62²„çVÖ&W"†ÂæW7F–ÖFVE&WfVçVUfÇVR’ÇÂ#S’Â“° ¢òò–æGW7G'’'&V¶F÷và¢6öç7B–æDÖ¢&V6÷&CÇ7G&–ærÂçVÖ&W#âÒ·Ó°¢ÆVG2æf÷$V6‚†ÂÓâ°¢–æDÖ¶Âæ–æGW7G'•ÒÒ†–æDÖ¶Âæ–æGW7G'•ÒÇÂ’²°¢Ò“°¢6öç7BF÷–æGW7G&–W2Òö&¦V7BæVçG&–W2†–æDÖ’æÖ‚…¶æÖRÂ6÷VçEÒ’Óâ‡²æÖRÂ6÷VçBÒ’’ç6÷'B‚†Æ"’Óâ"æ6÷VçBÒæ6÷VçB“° ¢òò&öGV7G2'&V¶F÷và¢6öç7B&öDÖ¢&V6÷&CÇ7G&–ærÂçVÖ&W#âÒ·Ó°¢ÆVG2æf÷$V6‚†ÂÓâ°¢6öç7B&öG2Ò'&’æ—4'&’†Âç&V6öÖÖVæFVE&öGV7G2’òÂç&V6öÖÖVæFVE&öGV7G2¢²%44Ò6÷'÷&FRÖöæW’Ö&¶WBgVæB%Ó°¢&öG2æf÷$V6‚‚‡¢7G&–ær’Óâ°¢&öDÖ·ÒÒ‡&öDÖ·ÒÇÂ’²°¢Ò“°¢Ò“°¢6öç7BF÷&öGV7G2Òö&¦V7BæVçG&–W2‡&öDÖ’æÖ‚…¶æÖRÂ6÷VçEÒ’Óâ‡²æÖRÂ6÷VçBÒ’’ç6÷'B‚†Æ"’Óâ"æ6÷VçBÒæ6÷VçB“° ¢òò6÷W&6W2'&V¶F÷và¢6öç7B7&4Ö¢&V6÷&CÇ7G&–ærÂçVÖ&W#âÒ·Ó°¢ÆVG2æf÷$V6‚†ÂÓâ°¢6öç7B7&2ÒÂç6÷W&6RÇÂ$äu‚Æ—7FVB6÷'÷&F–öç2#°¢7&4Ö·7&5ÒÒ‡7&4Ö·7&5ÒÇÂ’²°¢Ò“°¢6öç7BF÷6÷W&6W2Òö&¦V7BæVçG&–W2‡7&4Ö’æÖ‚…¶æÖRÂ6÷VçEÒ’Óâ‡²æÖRÂ6÷VçBÒ’’ç6÷'B‚†Æ"’Óâ"æ6÷VçBÒæ6÷VçB“° ¢&WGW&â&W2æ§6öâ‡°¢F÷FÄWfÇVFVBÀ¢F÷FÅVÆ–f–VBÀ¢F÷FÅ6fVBÀ¢6öçfW'6–öå&FRÀ¢F÷FÅG&V7W'•fÇVRÀ¢F÷–æGW7G&–W2À¢F÷&öGV7G2À¢F÷6÷W&6W2À¢6W76–öä†—7F÷'“¢6W76–öç0¢Ò“° ¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒD•44õdU%’äÅ•D”52U%$õ%Ó¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòvVæW&FRF—66÷fW'’æÇ—F–73¢"²W'"æÖW76vRÒ“°¢Ð§Ò“°  ¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¢òòDTÒU$dõ$Ôä4R5DE2„E”äÔ”24Ä5TÄD”ôâ¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¦ævWB‚"ö’÷FVÒ÷W&f÷&Öæ6R"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢G'’°¢6öç7B²W6W$–BÂ&öÆRÂVÖ–ÂÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢6öç7B—57WW$FÖ–âÒVÖ–ÂÓÓÒwv—6FöÒæö¶ö„66Ö6—FÆæræ6öÒrÇÂ ¢VÖ–ÂÓÓÒvöÖöÆöÇRæ¦VF—&ä66Ö6—FÆæræ6öÒs°¢6öç7B—57—7FVÔFÖ–âÒ—57WW$FÖ–âÇÂ ¢&öÆRÓÓÒtFÖ–ârÇÂ ¢&öÆRÓÓÒu5UU%ôDÔ”ârÇÂ ¢&öÆRÓÓÒtFÖ–æ—7G&F÷"rÇÂ ¢—4FÖ–ã° ¢–b‚W6W$–BÇÂ—57—7FVÔFÖ–â’°¢&WGW&â&W2ç7FGW2ƒC2’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ7FfbW&f÷&Öæ6R–æF–6F÷'2&R&W7G&–7FVBFò7—7FVÒFÖ–æ—7G&F÷'2â"Ò“°¢Ð ¢ÆWBuW6W'3¢ç•µÒÒF%W6W'2ÇÂµÓ°¢ÆWBu&÷7V7G3¢ç•µÒÒF%&÷7V7G2ÇÂµÓ°¢ÆWBtÖVWF–æw3¢ç•µÒÒF$ÖVWF–æw2ÇÂµÓ°¢ÆWBt7F—f—F–W3¢ç•µÒÒF$7F—f—F–W2ÇÂµÓ°¢ÆWBuF6·3¢ç•µÒÒF%F6·2ÇÂµÓ° ¢–b†—4FF&6T†VÇF‡’’°¢G'’°¢uW6W'2Òv—BF"ç6VÆV7B‚’æg&öÒ‡W6W'2“°¢u&÷7V7G2Òv—BF"ç6VÆV7B‚’æg&öÒ‡&÷7V7G2“°¢tÖVWF–æw2Òv—BF"ç6VÆV7B‚’æg&öÒ†ÖVWF–æw2“°¢t7F—f—F–W2Òv—BF"ç6VÆV7B‚’æg&öÒ†7F—f—F–W2“°¢uF6·2Òv—BF"ç6VÆV7B‚’æg&öÒ‡F6·2“°¢Ò6F6‚†W'#¢ç’’°¢—4FF&6T†VÇF‡’ÒfÇ6S°¢6öç6öÆRçv&â‚%µ44ÒU$dõ$Ôä4RäõD”4UÒ÷W&F–ærW&f÷&Öæ6R–æFW‚–âÆö6ÂÖVÖ÷'’fÆÆ&6²ÖöFS¢"ÂW'"æÖW76vRÇÂW'"“°¢uW6W'2ÒF%W6W'2ÇÂµÓ°¢u&÷7V7G2ÒF%&÷7V7G2ÇÂµÓ°¢tÖVWF–æw2ÒF$ÖVWF–æw2ÇÂµÓ°¢t7F—f—F–W2ÒF$7F—f—F–W2ÇÂµÓ°¢uF6·2ÒF%F6·2ÇÂµÓ°¢Ð¢Ð ¢6öç7BW&f÷&Öæ6RÒuW6W'2æÖ‡W6W"Óâ°¢òò&÷7V7G276–væVBFòF†—2&VÆF–öç6†—ÖævW"ôöff–6W ¢6öç7BW6W%&÷7V7G2Òu&÷7V7G2æf–ÇFW"‡Óâæ76–væVDöff–6W$–BÓÓÒW6W"æ–B“°¢6öç7B&÷7V7G46÷VçBÒW6W%&÷7V7G2æÆVæwFƒ°¢ ¢òò6öçfW'FVB&÷7V7G0¢6öç7BW6W$6öçfW'6–öç2ÒW6W%&÷7V7G2æf–ÇFW"‡Óâç7FGW2ÓÓÒt6öçfW'FVBr“°¢6öç7B&WfVçVT6öçfW'FVBÒW6W$6öçfW'6–öç2ç&VGV6R‚‡7VÒÂ’Óâ7VÒ²‡æ÷÷'GVæ—G•fÇVRÇÂ’Â“°¢ ¢òòÖVWF–æw2ÆVB'’F†—2öff–6W ¢6öç7BÖVWF–æw4†VÆD6÷VçBÒtÖVWF–æw2æf–ÇFW"†ÒÓâÒæöff–6W$–BÓÓÒW6W"æ–B’æÆVæwFƒ°¢ ¢òò6ö×ÆWFVB7F—f—F–W0¢6öç7Böff–6W$7F—f—F–W2Òt7F—f—F–W2æf–ÇFW"†Óâæöff–6W$–BÓÓÒW6W"æ–B“°¢6öç7BÆ—FW&7•6W76–öç46÷VçBÒöff–6W$7F—f—F–W2æf–ÇFW"†Óâæ7F—f—G•G—RÓÓÒtf–ææ6–ÂÆ—FW&7’6W76–öârbbç7FGW2ÓÓÒt6ö×ÆWFVBr’æÆVæwFƒ°¢ ¢òòF6²6ö×ÆWF–öâÖWG&–70¢6öç7B6ö×ÆWFVEF6·2ÒuF6·2æf–ÇFW"‡BÓâBæ76–væVE7FfbÓÓÒW6W"ægVÆÄæÖRbbBæ—46ö×ÆWFVB’æÆVæwFƒ°¢6öç7BF÷FÅF6·2ÒuF6·2æf–ÇFW"‡BÓâBæ76–væVE7FfbÓÓÒW6W"ægVÆÄæÖR’æÆVæwFƒ°¢6öç7BF6µ&F–òÒF÷FÅF6·2âò†6ö×ÆWFVEF6·2òF÷FÅF6·2’¢°¢ ¢òò÷&væ–2ÂG–æÖ–2W&f÷&Öæ6R–æFW‚÷WBöb ¢ÆWBW&f÷&Öæ6T–æFW‚Ò°¢–b‡&÷7V7G46÷VçBâ’°¢W&f÷&Öæ6T–æFW‚ÒÖF‚æÖ–â€¢À¢ÖF‚ç&÷VæB‚‡W6W$6öçfW'6–öç2æÆVæwF‚¢C’²†ÖVWF–æw4†VÆD6÷VçB¢R’²‡F6µ&F–ò¢3’²†öff–6W$7F—f—F–W2æÆVæwF‚¢R’¢“°¢Ð¢ ¢&WGW&â°¢–C¢W6W"æ–BÀ¢æÖS¢W6W"ægVÆÄæÖRÀ¢&öÆS¢W6W"ç&öÆRÇÂ%&VÆF–öç6†—ÖævW""À¢&÷7V7G46÷VçBÀ¢&WfVçVT6öçfW'FVBÀ¢ÖVWF–æw4†VÆC¢ÖVWF–æw4†VÆD6÷VçBÀ¢Æ—FW&7•6W76–öç46÷VçBÀ¢ÆVG4vVæW&FVC¢W6W%&÷7V7G2æf–ÇFW"‡Óâç6÷W&6Rbbç6÷W&6RÓÒtF—&V7B÷WG&V6‚r’æÆVæwF‚À¢÷÷'GVæ—F–W47&VFVC¢&÷7V7G46÷VçBÀ¢6öçfW'6–öç3¢W6W$6öçfW'6–öç2æÆVæwF‚À¢—VÆ–æUfÇVS¢W6W%&÷7V7G2ç&VGV6R‚‡7VÒÂ’Óâ7VÒ²‡æ÷÷'GVæ—G•fÇVRÇÂ’Â’À¢W&f÷&Öæ6T–æFW‚À¢fF#¢W6W"ægVÆÄæÖRç7Æ—B‚rr’æÖ†âÓâå³Ò’æ¦ö–â‚rr’ç6Æ–6RƒÂ"’çFõWW$66R‚¢Ó°¢Ò“°¢ ¢&WGW&â&W2æ§6öâ‡W&f÷&Öæ6R“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒU$dõ$Ôä4RU%$õ%Òf–ÆVBFò6ö×WFRW&f÷&Öæ6R–æFWƒ¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFò6ö×WFRW&f÷&Öæ6RÖWG&–73¢"²W'"æÖW76vRÒ“°¢Ð§Ò“°  ¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¢òò’5$ÒEdô4DR54•5DåB…4U$Tä¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¦6öç7B66Õ&öGV7G4Æ—7BÒ°¢°¢æÖS¢%44Ò6÷'÷&FRÖöæW’Ö&¶WBgVæB"À¢FW67&—F–öã¢%6†÷'B×FW&Ò†–v‚×––VÆB6V7W&R&W÷6—F÷'’f÷"W†6W7266‚&W6W'fW2ÂöffW&–ærÖ†–×VÒÆ—V–F—G’æB6ö×WF—F—fR––VÆG2â"À¢–FVÄ7W7FöÖW#¢$6÷'÷&FW2v—F‚–FÆR6—FÂÂ4ÔW2æVVF–ær–çFW&W7BÖ&V&–ær6†V6¶–ær66÷VçG2â"À¢&VæVf—G3¢²%6ÖRÖF’fÇVR"Â$†–v‚VÆ—G’VæFW&Ç––ær76WG2"Â%6÷fW&V–vâö&æ²&æ·&öÆÂÖF6†–ær"Â$6—FÂ&W6W'fF–öâ%ÒÀ¢&—6µ&öf–ÆS¢$Æ÷r"À¢Æ—V–F—G•&öf–ÆS¢$F–Ç’‡6ÖRÖF’6WGFÆVÖVçB’"À¢G—–6ÅW6T66W3¢²$6÷'÷&FR7vVW66÷VçB"Â%—&öÆÂ'VffW&–ær"Â%6†÷'B×FW&ÒG&V7W'’&¶–ær%ÒÀ¢–FVÄ–æGW7G&–W3¢²$ÖçVf7GW&–ær"Â$6öævÆöÖW&FW2"Â$VæW&w’"Â$f–ææ6–Â6W'f–6W2"Â%&WF–Â"Â%FV6†æöÆöw’"Â$6öç7G'V7F–öâ%ÒÀ¢&V6öÖÖVæFVEW'6öæ3¢²%G&V7W&W""Â$4dò"Â$f–ææ6RF—&V7F÷""Â$f–ææ6RÖævW"%Ð¢ÒÀ¢°¢æÖS¢%44Òf—†VB–æ6öÖRgVæB"À¢FW67&—F–öã¢$Ö–B×FòÖÆöærFW&Ò–çfW7FÖVçBfV†–6ÆRF&vWF–ær6÷fW&V–vâFV'BÂ6÷'÷&FR&öæG2ÂæB7&VF—B–æg&7G'V7GW&Ræ÷FW2â"À¢–FVÄ7W7FöÖW#¢%Vç6–öâÖævW'2Â–ç7W&æ6Rf—&×2Â6÷'÷&FW2v—F‚Æöær×FW&Ò6—FÂÆÆö6F–öâÆç2â"À¢&VæVf—G3¢²%FW&Ò&VÖ—VÒ&WGW&ç2"Â%4T2×&VwVÆFVBF—fW'6–f–6F–öâ"Â%&öfW76–öæÂ&öæB÷fW'6–v‡B%ÒÀ¢&—6µ&öf–ÆS¢$ÖVF—VÒ"À¢Æ—V–F—G•&öf–ÆS¢%B³2'W6–æW72F—2"À¢G—–6ÅW6T66W3¢²$76WBÖÆ–&–Æ—G’ÖF6†–ær"Â$4U‚&W6W'fR†VFv–ær"Â%7G&FVv–2Æöær×FW&Ò76WB÷6—F–öæ–ær%ÒÀ¢–FVÄ–æGW7G&–W3¢²$†VÇF†6&R"Â$w&–7VÇGW&R"Â$ÖçVf7GW&–ær"Â%FVÆV6öÖ×Væ–6F–öç2"Â$VGV6F–öâ%ÒÀ¢&V6öÖÖVæFVEW'6öæ3¢²$4dò"Â$ÆVB–çfW7FÖVçB7G&FVv—7B"Â$†VBöbVç6–öâ"Â$ÔB%Ð¢ÒÀ¢°¢æÖS¢%44ÒG&V7W'’&–ÆÇ26W'f–6R"À¢FW67&—F–öã¢$F—&V7B66W72æB6V6öæF'’'&ö¶W&vRöbfVFW&Âv÷fW&æÖVçBG&V7W'’&–ÆÇ2Â&6¶VB'’6÷fW&V–vâwV&çFVRâ"À¢–FVÄ7W7FöÖW#¢$†–v†Ç’&—6²ÖfW'6R6÷'÷&FW2Âv÷fW&æÖVçBvVæ6–W2ÂfÖ–Ç’G'W7G2â"À¢&VæVf—G3¢²#R6÷fW&V–vâwV&çFVR"Â%Wg&öçB–çFW&W7BF—66÷VçB–÷WG2"Â$æò7&VF—BFVfVÇB&—6²%ÒÀ¢&—6µ&öf–ÆS¢$Æ÷r"À¢Æ—V–F—G•&öf–ÆS¢%6V6öæF'’Ö&¶WBG&F–ærò†öÆBFòÖGW&—G’"À¢G—–6ÅW6T66W3¢²%6÷fW&V–vâÖw&FR&VwVÆF÷'’&6¶–ær"Â$6öÆÆFW&Â&W6W'fR÷F–Ö—¦F–öâ%ÒÀ¢–FVÄ–æGW7G&–W3¢²$&æ¶–ær"Â$v÷fW&æÖVçBvVæ6–W2"Â$Æöv—7F–72"Â$f–F–öâ%ÒÀ¢&V6öÖÖVæFVEW'6öæ3¢²%G&V7W&W""Â$VF—F÷"vVæW&Â"Â$†VBöb&—6²%Ð¢ÒÀ¢°¢æÖS¢%44Ò6öÖÖW&6–ÂW"Æ6VÖVçG2"À¢FW67&—F–öã¢$F—&V7B–çfW7FÖVçG2–â†–v‚×VÆ—G’6÷'÷&FR6†÷'B×FW&ÒFV'B–ç7G'VÖVçG2––VÆF–ær7WW&–÷"&VÖ—VÒ&WGW&ç2÷fW"V&Æ–2æ÷FW2â"À¢–FVÄ7W7FöÖW#¢$76WBÖævW'2Â–ç7F—GWF–öæÂG&V7W&W'26VV¶–ærÖ†–×VÒ6†÷'B×FW&Ò––VÆG2â"À¢&VæVf—G3¢²%&VÖ—VÒ––VÆB&ö÷7BöbSÓ3'2÷fW"G&V7W'’&–ÆÇ2"Â$F—&V7B&6¶–ær'’†–v†Ç’×&FVB6÷'÷&FW2"Â%7FæF&B––VÆG2ÖF6†–ær7W7FöÖ—¦VB†÷&—¦öç2%ÒÀ¢&—6µ&öf–ÆS¢$ÖVF—VÒ"À¢Æ—V–F—G•&öf–ÆS¢$†öÆBFòÖGW&—G’ƒRFò#sF—2’"À¢G—–6ÅW6T66W3¢²$6÷'÷&FR66‚––VÆB×Æ–f–6F–öâ"Â$Ö–ÆW7FöæRÖ&6¶VBG&V7W'’Æææ–ær%ÒÀ¢–FVÄ–æGW7G&–W3¢²$ö–Âbv2"Â%FVÆV6öÖ×Væ–6F–öç2"Â$6öævÆöÖW&FW2"Â%FV6†æöÆöw’%ÒÀ¢&V6öÖÖVæFVEW'6öæ3¢²$4dò"Â$f–ææ6RF—&V7F÷""Â%G&V7W&W""Â$6÷'÷&FR6öçG&öÆÆW"%Ð¢ÒÀ¢°¢æÖS¢%44Ò&—fFRG'W7B"À¢FW67&—F–öã¢$&W7ö¶Rf–GV6–'’æB&÷FV7F—fR7G'V7GW&W2†öÆF–ærW7FFRÆææ–ærÂ¶W–Öâ&—6²6†–VÆF–ærÂæBfÖ–Ç’76WG2G&ç6—F–öâ&ö&G2â"À¢–FVÄ7W7FöÖW#¢$f÷VæFW"ÖÆVBVçFW'&—6W2ÂfÖ–Ç’6öævÆöÖW&FW2Â†–v‚ÔæWBÕv÷'F‚–æF—f–GVÇ2â"À¢&VæVf—G3¢²%&–v–B76WB&÷FV7F–öâÆ–÷WB"Â$¶W–Öâ6öçF–çV—G’Æææ–ær"Â%F‚ÖVff–6–VçB7V66W76–öâ7G'V7GW&W2%ÒÀ¢&—6µ&öf–ÆS¢$Æ÷r"À¢Æ—V–F—G•&öf–ÆS¢%7G'V7GW&VBFW&ÒF—7G&–'WF–öç2"À¢G—–6ÅW6T66W3¢²%7V66W76–öâÖ–ær"Â$v÷fW&ææ6R&W6W'fF–öâf÷"×VÇF’ÖvVæW&F–öæÂ÷W&F–öç2"Â$F—67&WF–öæ'’76WBÆö6¶–ær%ÒÀ¢–FVÄ–æGW7G&–W3¢²$fÖ–Ç’'W6–æW76W2"Â$w&–7VÇGW&R"Â%&VÂW7FFR"Â%&öfW76–öæÂ6W'f–6W2%ÒÀ¢&V6öÖÖVæFVEW'6öæ3¢²$6†—&Öâ"Â$f÷VæFW""Â$Öæv–ærF—&V7F÷""Â$6†–VbÆVvÂ6÷Vç6VÂ%Ð¢ÒÀ¢°¢æÖS¢%44Ò÷'FföÆ–òÖævVÖVçB„F—67&WF–öæ'’’"À¢FW67&—F–öã¢$&W7ö¶RG–æÖ–6ÆÇ’ÖævVB×VÇF’Ö76WB–çfW7FÖVçB÷'FföÆ–÷2ÖF6†–ærVæ—VR6÷'÷&FRÖæFFR7&—FW&–â"À¢–FVÄ7W7FöÖW#¢$–ç7W&æ6R&÷f–FW'2Âf÷VæFF–öç2ÂÆ&vR6ö÷W&F—fW26VV¶–ær7W7FöÒ–çfW7FÖVçBÖæFFW2â"À¢&VæVf—G3¢²$&W7ö¶R–çfW7FÖVçBwV–FVÆ–æW2ÖF6†–ær6÷'÷&FR&VwVÆF–öç2"Â$7F—fR&—6²†VFv–ær"Â$vÆö&Â76WBÆÆö6F–öâ6÷fW&vR%ÒÀ¢&—6µ&öf–ÆS¢$ÖVF—VÒ"À¢Æ—V–F—G•&öf–ÆS¢$&W7ö¶RW†—B'VÆW2"À¢G—–6ÅW6T66W3¢²$Æöær×FW&Ò6÷'÷&FRG&V7W'’&W6W'fR&V6–F–öâ"Â%7G&FVv–2VæF÷vÖVçBw&÷wF‚%ÒÀ¢–FVÄ–æGW7G&–W3¢²$–ç7W&æ6R"Â$f÷VæFF–öç2"Â$Æ&vR6÷'÷&FW2"Â%Vç6–öç2%ÒÀ¢&V6öÖÖVæFVEW'6öæ3¢²%G&V7W'’6öÖÖ—GFVR"Â$–çfW7FÖVçB6ö÷&F–æF÷""Â$f–ææ6RG'W7FVR%Ð¢ÒÀ¢°¢æÖS¢%44ÒvVÇF‚Gf—6÷'’6W'f–6W2"À¢FW67&—F–öã¢$vÆö&Â7FæF&B×VÇF’Ö7W'&Væ7’Gf—6÷'’Æ–væ–ær†–v‚×W&f÷&Öæ6R÷'FföÆ–÷2v—F‚W†V7WF—fRvVÇF‚F&vWG2â"À¢–FVÄ7W7FöÖW#¢$W†V7WF—fW2Â&ö&BÖVÖ&W'2Â¶W’6VVB–çfW7F÷'2â"À¢&VæVf—G3¢²$–æfÆF–öâ†VFv–ærf–×VÇF’Ö7W'&Væ7’&6¶WG2"Â$–çFVw&FVBF‚Ö–ær"Â%&VÖ—VÒ&—fFRÆ6VÖVçBFVÇ266W72%ÒÀ¢&—6µ&öf–ÆS¢$ÖVF—VÒ"À¢Æ—V–F—G•&öf–ÆS¢%f&–&ÆR†Æ—V–B66‚g2&—fFRWV—G’Æö6·W2’"À¢G—–6ÅW6T66W3¢²$2×7V—FR6ö×Vç6F–öâ&W6W'fF–öâ"Â%W'6öæÂG&V7W'’†VFvRFWfVÆ÷ÖVçB%ÒÀ¢–FVÄ–æGW7G&–W3¢²$f–ææ6–Â6W'f–6W2"Â$ö–Âbv2"Â%FV6†æöÆöw’"Â$f–F–öâ%ÒÀ¢&V6öÖÖVæFVEW'6öæ3¢²$Öæv–ærF—&V7F÷""Â$W†V7WF—fRF—&V7F÷""Â$4dò"Â$4Tò%Ð¢ÒÀ¢°¢æÖS¢%44Ò–ç7F—GWF–öæÂÖæFFW2"À¢FW67&—F–öã¢$&W7ö¶RV&Æ–2×&—fFR76WBg&ÖWv÷&·2÷&væ—¦–ær6—FÂf–ææ6–ærÂ×Væ–6—Â&öæG2—77Væ6RÂæB7V6–Æ—¦VB&ö¦V7BfV†–6ÆW2â"À¢–FVÄ7W7FöÖW#¢%7FFR6ö÷W&F—fW2Â×Væ–6—Æ—F–W2ÂÆ&vR×66ÆR–æGW7G&–ÂFWfVÆ÷W'2â"À¢&VæVf—G3¢²$VÆ—FR7G'V7GW&VB6÷'÷&FRf–ææ6R&6¶–ær"Â$6ö÷W&F—fR6—FÂÖF6†–ær"Â$W‡W'B&ö¦V7B÷fW'6–v‡B7G'V7GW&W2%ÒÀ¢&—6µ&öf–ÆS¢$ÖVF—VÒ"À¢Æ—V–F—G•&öf–ÆS¢$ÆöærFW&Ò7G'V7GW&VBF–ÖVÆ–æR"À¢G—–6ÅW6T66W3¢²%V&Æ–2–æg&7G'V7GW&RgVæF–ær6WGW"Â%&Vv–öæÂFWfVÆ÷ÖVçB76WBööÆ–ær%ÒÀ¢–FVÄ–æGW7G&–W3¢²%÷vW""Â$6öç7G'V7F–öâ"Â%&VÂW7FFR"Â$v÷fW&æÖVçB"Â$–æg&7G'V7GW&R%ÒÀ¢&V6öÖÖVæFVEW'6öæ3¢²$F—&V7F÷"vVæW&Â"Â$Öæv–ærF—&V7F÷""Â$6†—&ÖâöbF†R&ö&B%Ð¢ÒÀ¢°¢æÖS¢%44ÒÆ—V–F—G’ÖævVÖVçB6öÇWF–öç2"À¢FW67&—F–öã¢$WFöÖFVB'W6–æW72Væ—B7vVWg&ÖWv÷&·26öæ6VçG&F–ær×VÇF’×7V'6–F–'’&Ææ6W2Fò†'fW7B7—7FVÖF–266‚fÇVRâ"À¢–FVÄ7W7FöÖW#¢$×VÇF’×7V'6–F–'’&WF–Â÷W&F÷'2Â6öævÆöÖW&FW2Âf7BÖÖ÷f–ær6öç7VÖW"6¶v–ærv–çG2â"À¢&VæVf—G3¢²%¦W&ò66‚ÖG&rWFöÖF–öâ"Â%Væ–f–VB––VÆB6öæ6VçG&F–öâöâööÆVB66÷VçG2"Â$6ö×ÆWFRF6†&ö&B66‚G&6¶–ær%ÒÀ¢&—6µ&öf–ÆS¢$Æ÷r"À¢Æ—V–F—G•&öf–ÆS¢$F–Ç’7vVW66W76–&–Æ—G’"À¢G—–6ÅW6T66W3¢²%ööÆ–ærg&vÖVçFVB&Vv–öæÂ&WF–ÂFW÷6—G2"Â$–çFW"Ö6ö×ç’Æ—V–F—G’7vVW–ær%ÒÀ¢–FVÄ–æGW7G&–W3¢²%&WF–Â"Â$dÔ4r"Â$6öævÆöÖW&FW2"Â$Æöv—7F–72%ÒÀ¢&V6öÖÖVæFVEW'6öæ3¢²$w&÷W6öçG&öÆÆW""Â%G&V7W&W""Â$vÆö&Â4dò%Ð¢ÒÀ¢°¢æÖS¢%44ÒG&V7W'’6öÇWF–öç2"À¢FW67&—F–öã¢$6ö×ÆWFRg&ÖWv÷&²&÷f–F–ær6÷'÷&FRf÷&V–vâG&FRf–ææ6–ærÂFW&—fF—fR7v2†VFv–ærÂæBÖ–B×FW&Ò6—FÂÖF6†–ærâ"À¢–FVÄ7W7FöÖW#¢$–×÷'BÖW‡÷'BÖçVf7GW&W'2Â&rÖFW&–Ç27WÆ–W'2v—F‚7F—fRf÷&W‚W‡÷7W&Râ"À¢&VæVf—G3¢²%VæÖF6†VBf÷&V–vâW†6†ævRW‡÷7W&R†VFv–ær"Â$fÆW†–&ÆR6öÖÖW&6–Â7&VF—B7W÷'B"Â$7W7FöÒ7G'V7GW&VB–çFW&W7B7v2%ÒÀ¢&—6µ&öf–ÆS¢$†–v‚"À¢Æ—V–F—G•&öf–ÆS¢$&W7ö¶RFW&ÒÖF6†–ær"À¢G—–6ÅW6T66W3¢²$7W'&Væ7’÷66–ÆÆF–öâ†VFv–ær"Â$vÆö&ÂG&FR7&VF—B&ö6W76–ær"Â%7G'V7GW&Âv÷&¶–ær6—FÂVæ†æ6VÖVçB%ÒÀ¢–FVÄ–æGW7G&–W3¢²$ö–Âbv2"Â$w&–7VÇGW&R"Â$Æöv—7F–72"Â$f–F–öâ"Â$ÖçVf7GW&–ær%ÒÀ¢&V6öÖÖVæFVEW'6öæ3¢²$4dò"Â%G&V7W&W""Â%ef–ææ6R"Â$7W'&Væ7’ÖævW"%Ð¢Ð¥Ó° ¦gVæ7F–öâ6Æ7VÆFU&öGV7Df—E66÷&W2†6ö×ç“¢²æÖS¢7G&–æs²–æGW7G'“ó¢7G&–æs²&WfVçVUfÇVSó¢çVÖ&W#²V×Æ÷–VT6÷VçCó¢çVÖ&W#²÷÷'GVæ—G•fÇVSó¢çVÖ&W#²&–÷&—G“ó¢7G&–ærÒ’°¢6öç7B66÷&U&W7VÇG2Ò66Õ&öGV7G4Æ—7BæÖ‡&öBÓâ°¢ÆWB66÷&RÒc²òò&6R66÷&P¢6öç7BÖF6†W4–æGW7G'’Ò&öBæ–FVÄ–æGW7G&–W2ç6öÖR†–æBÓâ6ö×ç’æ–æGW7G'’bb–æBçFôÆ÷vW$66R‚’ÓÓÒ6ö×ç’æ–æGW7G'’çFôÆ÷vW$66R‚’“°¢–b†ÖF6†W4–æGW7G'’’°¢66÷&R³ÒS°¢Ð¢ ¢6öç7B÷fÇVRÒ6ö×ç’æ÷÷'GVæ—G•fÇVRÇÂ°¢6öç7BV×6÷VçBÒ6ö×ç’æV×Æ÷–VT6÷VçBÇÂ°¢ ¢òò7W7FöÒÆöv–2W"&öGV7BFòVç7W&R&V6—6–öà¢–b‡&öBææÖRÓÓÒ%44Ò6öÖÖW&6–ÂW"Æ6VÖVçG2"’°¢–b†÷fÇVRâS’66÷&R³ÒS°¢–b†V×6÷VçBâS’66÷&R³Ò°¢–b†6ö×ç’æ–æGW7G'’bb²$ÖçVf7GW&–ær"Â$ö–Âbv2"Â%FVÆV6öÖ×Væ–6F–öç2"Â$6öævÆöÖW&FW2%Òæ–æ6ÇVFW2†6ö×ç’æ–æGW7G'’’’°¢66÷&R³Ò°¢Ð¢ÒVÇ6R–b‡&öBææÖRÓÓÒ%44Ò6÷'÷&FRÖöæW’Ö&¶WBgVæB"’°¢–b†÷fÇVRÂSbb÷fÇVRâ’66÷&R³ÒS°¢–b†V×6÷VçBâ’66÷&R³Ò°¢–b†6ö×ç’æ–æGW7G'’bb²$ÖçVf7GW&–ær"Â%FV6†æöÆöw’"Â%&WF–Â"Â$f–ææ6–Â6W'f–6W2%Òæ–æ6ÇVFW2†6ö×ç’æ–æGW7G'’’’°¢66÷&R³Ò°¢Ð¢ÒVÇ6R–b‡&öBææÖRÓÓÒ%44Òf—†VB–æ6öÖRgVæB"’°¢–b†÷fÇVRâ#’66÷&R³Ò°¢–b†6ö×ç’æ–æGW7G'’bb²$†VÇF†6&R"Â$w&–7VÇGW&R"Â$ÖçVf7GW&–ær"Â%FVÆV6öÖ×Væ–6F–öç2%Òæ–æ6ÇVFW2†6ö×ç’æ–æGW7G'’’’°¢66÷&R³Ò°¢Ð¢ÒVÇ6R–b‡&öBææÖRÓÓÒ%44ÒG&V7W'’&–ÆÇ26W'f–6R"’°¢–b†6ö×ç’æ–æGW7G'’bb²$&æ¶–ær"Â$v÷fW&æÖVçBvVæ6–W2"Â$Æöv—7F–72%Òæ–æ6ÇVFW2†6ö×ç’æ–æGW7G'’’’°¢66÷&R³ÒS°¢Ð¢–b†÷fÇVRâ’66÷&R³ÒS°¢ÒVÇ6R–b‡&öBææÖRÓÓÒ%44Ò&—fFRG'W7B"’°¢–b†6ö×ç’æ–æGW7G'’bb²$fÖ–Ç’'W6–æW76W2"Â$w&–7VÇGW&R"Â$ÖçVf7GW&–ær%Òæ–æ6ÇVFW2†6ö×ç’æ–æGW7G'’’’°¢66÷&R³ÒS°¢Ð¢–b†V×6÷VçBâ#’66÷&R³Ò°¢ÒVÇ6R–b‡&öBææÖRÓÓÒ%44Ò÷'FföÆ–òÖævVÖVçB„F—67&WF–öæ'’’"’°¢–b†÷fÇVRâƒ’66÷&R³Ò#°¢–b†6ö×ç’æ–æGW7G'’bb²$–ç7W&æ6R"Â$f÷VæFF–öç2%Òæ–æ6ÇVFW2†6ö×ç’æ–æGW7G'’’’°¢66÷&R³ÒS°¢Ð¢ÒVÇ6R–b‡&öBææÖRÓÓÒ%44ÒvVÇF‚Gf—6÷'’6W'f–6W2"’°¢–b†6ö×ç’æ–æGW7G'’bb²$f–ææ6–Â6W'f–6W2"Â$ö–Âbv2%Òæ–æ6ÇVFW2†6ö×ç’æ–æGW7G'’’’°¢66÷&R³ÒS°¢Ð¢–b†÷fÇVRâ3’66÷&R³Ò°¢ÒVÇ6R–b‡&öBææÖRÓÓÒ%44Ò–ç7F—GWF–öæÂÖæFFW2"’°¢–b†÷fÇVRâ’66÷&R³Ò#S°¢–b†6ö×ç’æ–æGW7G'’bb²%÷vW""Â$6öç7G'V7F–öâ"Â%&VÂW7FFR"Â$–æg&7G'V7GW&R%Òæ–æ6ÇVFW2†6ö×ç’æ–æGW7G'’’’°¢66÷&R³Ò#°¢Ð¢ÒVÇ6R–b‡&öBææÖRÓÓÒ%44ÒÆ—V–F—G’ÖævVÖVçB6öÇWF–öç2"’°¢–b†6ö×ç’æ–æGW7G'’bb²%&WF–Â"Â$dÔ4r"Â$6öævÆöÖW&FW2%Òæ–æ6ÇVFW2†6ö×ç’æ–æGW7G'’’’°¢66÷&R³Ò#S°¢Ð¢–b†V×6÷VçBâ3’66÷&R³Ò°¢ÒVÇ6R–b‡&öBææÖRÓÓÒ%44ÒG&V7W'’6öÇWF–öç2"’°¢–b†6ö×ç’æ–æGW7G'’bb²$ö–Âbv2"Â$w&–7VÇGW&R"Â$Æöv—7F–72"Â$f–F–öâ%Òæ–æ6ÇVFW2†6ö×ç’æ–æGW7G'’’’°¢66÷&R³Ò#S°¢Ð¢–b†÷fÇVRâC’66÷&R³Ò°¢Ð¢ ¢òò666÷&RB“¢–b‡66÷&Râ“’’66÷&RÒ““°¢ ¢ÆWB&V6öâÒÆ–væVBv—F‚G¶6ö×ç’ææÖWÒw2–æGW7G'’æBföÇVÖR6WGF–æw2æ°¢–b‡&öBææÖRÓÓÒ%44Ò6öÖÖW&6–ÂW"Æ6VÖVçG2"’°¢&V6öâÒG¶6ö×ç’ææÖWÒ—2†–v‚×föÇVÖR6÷'÷&FRÆ–W"†W7BfÇVS¢(*bG¶÷fÇVRçFôÆö6ÆU7G&–ær‚—Ò’÷W&F–ær–âG¶6ö×ç’æ–æGW7G'’ÇÂ'F†R6V7F÷"'Òâ6öÖÖW&6–ÂW"&÷f–FW2†–v‚––VÆBÆ—V–F—G’ÖF6†W2æ°¢ÒVÇ6R–b‡&öBææÖRÓÓÒ%44Ò6÷'÷&FRÖöæW’Ö&¶WBgVæB"’°¢&V6öâÒF†—26Æ–VçB—2–âG¶6ö×ç’æ–æGW7G'’ÇÂv7F—fR6V7F÷"wÒv—F‚66‚G&V7W'’&WV—&VÖVçG2â44ÒÔÔb÷F–Ö—¦W26†÷'B×FW&ÒÆ—V–F—G’––VÆG2&6·7F÷2æ°¢ÒVÇ6R–b‡&öBææÖRÓÓÒ%44ÒG&V7W'’6öÇWF–öç2"’°¢&V6öâÒG¶6ö×ç’ææÖWÒ—2–çföÇfVB–âG¶6ö×ç’æ–æGW7G'’ÇÂv†–v‚×&W6÷W&6R÷W&F–öç2wÒâG&V7W'’6öÇWF–öç26â7B2&öfW76–öæÂ7W'&Væ7’W‡÷7W&W2†VFvW2æ°¢ÒVÇ6R–b‡&öBææÖRÓÓÒ%44Ò&—fFRG'W7B"’°¢&V6öâÒ&W7ö¶R¶W–Öâ6öçF–çV—G’7G'V7GW&W2ÖF6‚G¶6ö×ç’ææÖWÒw26÷'÷&FR&6†—FV7GW&RFò†VFvRW†V7WF÷"&—6²æ°¢ÒVÇ6R–b‡&öBææÖRÓÓÒ%44ÒÆ—V–F—G’ÖævVÖVçB6öÇWF–öç2"’°¢&V6öâÒg&vÖVçFVB'W6–æW72&Ææ6W27vVW÷F–Ö—¦F–öç2&RW&fV7BFòÖ†–Ö—¦RööÆVB––VÆB&WGW&ç2f÷"&WF–ÂôdÔ4r÷W&F–öç2æ°¢Ð¢ ¢&WGW&â²æÖS¢&öBææÖRÂ66÷&RÂ&V6öâÓ°¢Ò’ç6÷'B‚†Â"’Óâ"ç66÷&RÒç66÷&R“°¢&WGW&â66÷&U&W7VÇG3°§Ð ¦gVæ7F–öâ6Æ7VÆFTföÆÆ÷uW7G&FVw’‡&÷7V7C¢ç’ÂÖVWF–æw4f÷%¢ç•µÒÂF6·4f÷%¢ç•µÒÂ7F—f—F–W4f÷%¢ç•µÒ’°¢6öç7B÷VåF6·2ÒF6·4f÷%æf–ÇFW"‡BÓâBæ—46ö×ÆWFVB“°¢6öç7BVæF–ætÖVWF–æw2ÒÖVWF–æw4f÷%æf–ÇFW"†ÒÓâÒæ÷WF6öÖR“°¢ ¢ÆWB&V6öÖÖVæFVD7F–öâÒ%66†VGVÆR–æ—F–Â–çG&öGV7F–öâÖVWF–ærâ#°¢ÆWB&V6öâÒ&÷7V7B"G·&÷7V7BææÖWÒ"—2æWvÇ’&Vv—7FW&VB2"G·&÷7V7Bç7FGW7Ò"ÆVB–â÷W"6÷'÷&FR&Vv—7G'’æ°¢ÆWB&—6²Ò$6ö×WF—F÷"ÖöÖVçGVÒÖ’&Æö6²—VÆ–æR66VÆW&F–öâ–b–æ—F–Â6öææV7F–öâFVÆ—2W†6VVBRF—2â#°¢ ¢–b‡&÷7V7Bç7FGW2ÓÓÒ%&÷7V7F–ær"ÇÂ&÷7V7Bç7FGW2ÓÓÒ$ÆVB"’°¢–b†7F—f—F–W4f÷%æÆVæwF‚ÓÓÒ’°¢&V6öÖÖVæFVD7F–öâÒ%fW&–g’4dòFWF–Ç2æB–æ—F–FR&–Ö'’FVÆW†öæ–2÷WG&V6‚â#°¢&V6öâÒ$æò&VÆF–öç6†—F÷V6†W2÷"5$ÒÆöw2&V6÷&FVB6–æ6R–×÷'B&Vv—7G&F–öââ#°¢&—6²Ò%F†R66÷VçB—26ö×ÆWFVÇ’6öÆBâ–ÖÖVF–FR÷WG&V6‚W7F&Æ—6†W2&ö7F—fR44ÒVævvVÖVçBâ#°¢ÒVÇ6R°¢&V6öÖÖVæFVD7F–öâÒ$6ö÷&F–æFR7W7FöÖ—¦VB––VÆB'&–Vf–æræB&÷÷6Ââ#°¢&V6öâÒ$–æ—F–Â6öçF7B7V66VVFVBâF†RæW‡B7G'V7GW&ÂÖ–ÆW7FöæR—2F—7Æ––ær44ÒG&V7W'’6ö×WFVæ6Râ#°¢&—6²Ò$FVÆ––ærF†R7W7FöÒ—F6‚&—6·2Æ÷vW"6öçfW'6–öâ&ö&&–Æ—G’26ö×WF—F÷"G&V7W&–W2GFV×B6GW&Râ#°¢Ð¢ÒVÇ6R–b‡&÷7V7Bç7FGW2ÓÓÒ%VÆ–f–VB"ÇÂ&÷7V7Bç7FGW2ÓÓÒ$ÖVWF–ær66†VGVÆVB"’°¢–b‡VæF–ætÖVWF–æw2æÆVæwF‚â’°¢6öç7BæW‡DÒÒVæF–ætÖVWF–æw5³Ó°¢&V6öÖÖVæFVD7F–öâÒ&W&R'&–Vf–ær&W6VçFF–öâföÆFW"f÷"66†VGVÆVB6W76–öâöâG¶æW‡DÒæFFWÒBG¶æW‡DÒçF–ÖWÒæ°¢&V6öâÒÖVWF–ær7G'V7GW&VBv—F‚W'÷6S¢"G¶æW‡DÒçW'÷6WÒ"âW†V7WF—fRF&vWG2æVVB6ö×&V†Vç6—fR44Ò6Æ–FW2æ°¢&—6²Ò%Vç&W&VB'&–Vf–æw2f–ÂFò6öçfW'B&VÖ—VÒ2×7V—FRÖVÖ&W'2v†ò&WV—&RF–v‡Bf–ææ6–ÂÖWG&–72â#°¢ÒVÇ6R°¢&V6öÖÖVæFVD7F–öâÒ%&÷÷6RæBÆö6²7V6–f–26÷'÷&FR6ÆVæF"FFRf÷"––VÆB÷F–Ö—¦F–öâF—67W76–öââ#°¢&V6öâÒ%F†RÆVB—2VÆ–f–VBÂ'WBæò7F—fR6ÆVæF"Æ6V†öÆFW"6V7W&W2W†V7WF—fRGFVçF–öââ#°¢&—6²Ò$4dò6ÆVæF'26²&–FÇ’â÷fW&Æöö¶VB66†VGVÆ–ærÆ–Ö—G2÷W"ÖöÖVçGVÒâ#°¢Ð¢ÒVÇ6R–b‡&÷7V7Bç7FGW2ÓÓÒ%&÷÷6Â6VçB"ÇÂ&÷7V7Bç7FGW2ÓÓÒ$æVv÷F–F–öâ"’°¢&V6öÖÖVæFVD7F–öâÒ%W&f÷&Ò&FRæVv÷F–F–öâæBÆö6²F÷vâ6öÖÖ—FÖVçBâ#°¢&V6öâÒ%&÷÷6ÂFWF–Ç2FVÆ—fW&VBâG&ç6—F–öâfö7W2FòW†V7WF—fR&W6öÇWF–öâöbÆ6VÖVçB&FW2â#°¢&—6²Ò$æVv÷F–F–öâ†6W2&R†–v‚×&—6²W&–öG2v†W&R6ö×WF—F÷'2&–Bvw&W76—fR&VÖ—VÒF—66÷VçG2â#°¢ ¢–b†÷VåF6·2æÆVæwF‚ÓÓÒ’°¢&V6öÖÖVæFVD7F–öâÒ%6WB†–v‚×&–÷&—G’&FR&Wf–WrF6²f÷"&VÆF–öç6†—öff–6W'2â#°¢&V6öâÒ$7F—fRæVv÷F–F–öâ†öÆG27FGW2v—F†÷WB7V6–f–2÷væW"Ö–ÆW7FöæRF6²&Vv—7FW&VBâ#°¢&—6²Ò$66÷VçB&—6²&—6W2âVæ&6¶VBæVv÷F–F–öç2FVæBFò7FÆÂâ#°¢Ð¢ÒVÇ6R–b‡&÷7V7Bç7FGW2ÓÓÒ$6öçfW'FVB"’°¢&V6öÖÖVæFVD7F–öâÒ$6öæGV7B÷7B×6WGFÆVÖVçB–çFVw&F–öâæB&WVW7B7V'6–F–'’7vVW2â#°¢&V6öâÒ$6÷'÷&FRÆ6VÖVçB6öçfW'FVB44Ò—2æ÷rF†V—"&Vv—7FW&VBÖævW"â#°¢&—6²Ò$–FÆR&Ææ6W2÷WG6–FR7vVW2&ÆVVB&VÖ—VÒ––VÆG2â7v–gB–çFVw&F–öâ6V7W&W2Ö†–×VÒÆ—V–F—G’â#°¢Ð¢ ¢&WGW&â²&V6öÖÖVæFVD7F–öâÂ&V6öâÂ&—6²Ó°§Ð ¦ç÷7B‚"ö’övVÖ–æ’ö76—7FçB"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B7F'D×2ÒFFRææ÷r‚“°¢6öç7B²VW'’Â6VÆV7FVD6ö×ç’Âv÷&·76T–BÂ6W&VæÖöGVÆRÒÒ&Wæ&öG“°¢–b‚VW'’’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢%VW'’—2&WV—&VBf÷"44Ò’76—7FçBâ"Ò“°¢Ð ¢6öç7B²W6W$–BÂVÖ–ÂÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ6–vâÖ–â&WV—&VBâ"Ò“°¢Ð ¢6öç6öÆRæÆör†&ö6W76–ær6W&Væc"’76—7FçB–çFW&7F–öâVW'“¢"G·VW'—Ò"–âÖöGVÆS¢²G·6W&VæÖöGVÆRÇÂ&FVfVÇB'ÕÖ“° ¢òòÆöB7F—fR—VÆ–æR6öçFW‡@¢–b†—4FF&6T†VÇF‡’’°¢G'’°¢–b†—4FÖ–â’°¢F%&÷7V7G2Òv—BF"ç6VÆV7B‚’æg&öÒ‡&÷7V7G2’2ç•µÓ°¢F$ÖVWF–æw2Òv—BF"ç6VÆV7B‚’æg&öÒ†ÖVWF–æw2’2ç•µÓ°¢6öç7B&uF6·2Òv—BF"ç6VÆV7B‚’æg&öÒ‡F6·2’2ç•µÓ°¢F%F6·2Ò&uF6·2æÖ‡BÓâ‡²ââçBÂ7FGW3¢Bæ—46ö×ÆWFVBò$6ö×ÆWFVB"¢%VæF–ær"Ò’“°¢F$7F—f—F–W2Òv—BF"ç6VÆV7B‚’æg&öÒ†7F—f—F–W2’2ç•µÓ°¢F$6öçF7G2Òv—BF"ç6VÆV7B‚’æg&öÒ†6öçF7G2’2ç•µÓ°¢ÒVÇ6R°¢F%&÷7V7G2Òv—BF"ç6VÆV7B‚’æg&öÒ‡&÷7V7G2’çv†W&R†W‡&÷7V7G2æ76–væVDöff–6W$–BÂW6W$–B’’2ç•µÓ°¢F$ÖVWF–æw2Òv—BF"ç6VÆV7B‚’æg&öÒ†ÖVWF–æw2’çv†W&R†W†ÖVWF–æw2æöff–6W$–BÂW6W$–B’’2ç•µÓ°¢6öç7B&uF6·2Òv—BF"ç6VÆV7B‚’æg&öÒ‡F6·2’çv†W&R†W‡F6·2æöff–6W$–BÂW6W$–B’’2ç•µÓ°¢F%F6·2Ò&uF6·2æÖ‡BÓâ‡²ââçBÂ7FGW3¢Bæ—46ö×ÆWFVBò$6ö×ÆWFVB"¢%VæF–ær"Ò’“°¢F$7F—f—F–W2Òv—BF"ç6VÆV7B‚’æg&öÒ†7F—f—F–W2’çv†W&R†W†7F—f—F–W2æöff–6W$–BÂW6W$–B’’2ç•µÓ°¢ ¢6öç7B&÷7V7D–G2ÒF%&÷7V7G2æÖ‡Óâæ–B“°¢–b‡&÷7V7D–G2æÆVæwF‚â’°¢F$6öçF7G2Òv—BF"ç6VÆV7B‚’æg&öÒ†6öçF7G2’çv†W&R†–ä'&’†6öçF7G2ç&÷7V7D–BÂ&÷7V7D–G2’’2ç•µÓ°¢ÒVÇ6R°¢F$6öçF7G2ÒµÓ°¢Ð¢Ð¢Ò6F6‚†W'#¢ç’’°¢—4FF&6T†VÇF‡’ÒfÇ6S°¢6öç6öÆRçv&â‚%6W&Væ&VF–ærfÆÆ&6²Fò–âÖÖVÖ÷'’FF&6W2GVRFò&VBW'&÷#¢"ÂW'"æÖW76vRÇÂW'"“°¢Ð¢Ð ¢òòF†VâvWB&÷W&Ç’f–ÇFW&VB'&—2W6–ærF†R&WVW7C ¢6öç7B7F—fU&÷7V7G2ÒF%&÷7V7G3°¢6öç7B7F—fTÖVWF–æw2ÒF$ÖVWF–æw3°¢6öç7B7F—fUF6·2ÒF%F6·3°¢6öç7B7F—fT7F—f—F–W2ÒF$7F—f—F–W3°¢6öç7B7F—fT6öçF7G2ÒF$6öçF7G3° ¢òò–FVçF–g’fö6Â&÷7V7@¢ÆWBfö6Å&÷7V7C¢ç’ÒçVÆÃ°¢–b‡6VÆV7FVD6ö×ç’bb6VÆV7FVD6ö×ç’ææÖR’°¢fö6Å&÷7V7BÒ7F—fU&÷7V7G2æf–æB‡ÓâææÖRçFôÆ÷vW$66R‚’ÓÓÒ6VÆV7FVD6ö×ç’ææÖRçFôÆ÷vW$66R‚’ÇÂæ–BÓÓÒ6VÆV7FVD6ö×ç’æ–B“°¢Ð¢ ¢–b‚fö6Å&÷7V7B’°¢6öç7BÆ÷vW%VW'’ÒVW'’çFôÆ÷vW$66R‚“°¢fö6Å&÷7V7BÒ7F—fU&÷7V7G2æf–æB‡Óâ ¢Æ÷vW%VW'’æ–æ6ÇVFW2‡ææÖRçFôÆ÷vW$66R‚’’ÇÂ ¢ææÖRçFôÆ÷vW$66R‚’ç7Æ—B‚rr’ç6öÖR‚‡v÷&C¢7G&–ær’Óâv÷&BæÆVæwF‚â2bbÆ÷vW%VW'’æ–æ6ÇVFW2‡v÷&B’¢“°¢Ð ¢òò†6R2bC¢FVWv÷&·76R6öçFW‡B6ö×–ÆF–öâæB–æ¦V7F–öà¢ÆWBv÷&·76T6öçFW‡E&ö×BÒ"#°¢ÆWBF&vWD6ö×ç”ÆötæÖRÒfö6Å&÷7V7CòææÖRÇÂ6VÆV7FVD6ö×ç“òææÖRÇÂçVÆÃ° ¢–b‡v÷&·76T–B’°¢G'’°¢6öç7Bw4fWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76W2’çv†W&R†W‡v÷&·76W2æ–BÂv÷&·76T–B’“°¢6öç7Bw2Òw4fWF6†VE³Ó°¢–b‡w2’°¢F&vWD6ö×ç”ÆötæÖRÒw2æ6ö×ç”æÖS°¢6öç7B–BÒw2ç&÷7V7D–C° ¢òòvF†W"6†–ÆG&Vâg&öÒ5$ÒFF&6W2F—&V7FÇ¢6öç7Bw46öçF7G2Ò–Bòv—BF"ç6VÆV7B‚’æg&öÒ†6öçF7G2’çv†W&R†W†6öçF7G2ç&÷7V7D–BÂ–B’’¢µÓ°¢6öç7Bw4ÖVWF–æw2Ò–Bòv—BF"ç6VÆV7B‚’æg&öÒ†ÖVWF–æw2’çv†W&R†W†ÖVWF–æw2ç&÷7V7D–BÂ–B’’¢µÓ°¢6öç7Bw5F6·2Ò–Bòv—BF"ç6VÆV7B‚’æg&öÒ‡F6·2’çv†W&R†W‡F6·2ç&÷7V7D–BÂ–B’’¢µÓ°¢ ¢ÆWBw4æ÷FW2ÒµÓ°¢–b‡–B’°¢w4æ÷FW2Òv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76Tæ÷FW2’çv†W&R€¢7ÆG·v÷&·76Tæ÷FW2çv÷&·76T–GÒÒG·v÷&·76T–GÒõ"G·v÷&·76Tæ÷FW2ç&÷7V7D–GÒÒG·–GÖ ¢“°¢ÒVÇ6R°¢w4æ÷FW2Òv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76Tæ÷FW2’çv†W&R†W‡v÷&·76Tæ÷FW2çv÷&·76T–BÂv÷&·76T–B’“°¢Ð ¢6öç7Bw5&÷÷6Ç2Òv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76U&÷÷6Ç2’çv†W&R†W‡v÷&·76U&÷÷6Ç2çv÷&·76T–BÂv÷&·76T–B’“°¢6öç7Bw5&W6VçFF–öç2Òv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76U&W6VçFF–öç2’çv†W&R†W‡v÷&·76U&W6VçFF–öç2çv÷&·76T–BÂv÷&·76T–B’“°¢6öç7Bw56V&6„†—7F÷'’Òv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76U6V&6„†—7F÷'’’çv†W&R†W‡v÷&·76U6V&6„†—7F÷'’çv÷&·76T–BÂv÷&·76T–B’“°¢6öç7Bw46öçfW'6F–öç2Òv—BF"ç6VÆV7B‚’æg&öÒ‡v÷&·76T”6öçfW'6F–öç2’çv†W&R†W‡v÷&·76T”6öçfW'6F–öç2çv÷&·76T–BÂv÷&·76T–B’“°¢ ¢ÆWBÆ–æ¶VE&÷7V7BÒçVÆÃ°¢–b‡–B’°¢6öç7BÇfWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ‡&÷7V7G2’çv†W&R†W‡&÷7V7G2æ–BÂ–B’“°¢Æ–æ¶VE&÷7V7BÒÇfWF6†VE³ÒÇÂçVÆÃ°¢Ð ¢v÷&·76T6öçFW‡E&ö×BÒ £ÓÓÒ44ÒTåDU%$•4R$U4T$4‚tõ$µ54RÄ•dR4ôåDU…BÓÓÐ¥tõ$µ54R4ôÕå’äÔS¢G·w2æ6ö×ç”æÖWÐ¥tõ$µ54R”C¢G·w2æ–GÐ¥tõ$µ54R5DEU3¢G·w2ç7FGW7Ð¤Ä”ä´TB$õ5T5C¢G¶Æ–æ¶VE&÷7V7BòG¶Æ–æ¶VE&÷7V7BææÖWÒ…7FvS¢G¶Æ–æ¶VE&÷7V7Bç7FGW7ÒÂfÇVS¢(*bG²†Æ–æ¶VE&÷7V7Bæ÷÷'GVæ—G•fÇVRÇÂ’çFôÆö6ÆU7G&–ær‚—ÒÂ66÷&S¢G¶Æ–æ¶VE&÷7V7Bæ÷÷'GVæ—G•66÷&WÒó–¢$æò7F—fR5$Ò—VÆ–æRÆ–æ¶VB–WBâ'Ð ¤ôÄÄòd”äD”äu2bd•$Ôôu$„”53 ¢G·w2æöÆÆôf–æF–æw2ÇÂ$æòöÆÆòf–æF–æw2&V6÷&FVBâ'Ð ¤4ôÕå’$ôd”ÄS ¢G·w2æ6ö×ç•&öf–ÆRÇÂ$æò&öf–ÆR7VÖÖ'’&V6÷&FVBâ'Ð ¤”äEU5E%’4T5Dõ"äÅ•4•3 ¢G·w2æ–æGW7G'”æÇ—6—2ÇÂ$æò6V7F÷"æÇ—6—2&V6÷&FVBâ'Ð ¤U„T5UD•dR”å4”t…E3 ¢G·w2æW†V7WF—fT–ç6–v‡G2ÇÂ$æòW†V7WF—fR–ç6–v‡G2&V6÷&FVBâ'Ð ¤”ådU5DÔTåBõõ%ETä•D”U2ÔE$”4U3 ¢G·w2æ–çfW7FÖVçD÷÷'GVæ—F–W2ÇÂ$æò–çfW7FÖVçB÷÷'GVæ—F–W2ÖG&–6W2&V6÷&FVBâ'Ð ¥$U4T$4‚D4²5TÔÔ%’äõDU3 ¢G·w2ç&W6V&6…7VÖÖ&–W2ÇÂ$æò&W6V&6‚7VÖÖ&–W26ö×–ÆVBâ'Ð ¥$Tt•5DU$TBU„T5UD•dR4ôåD5E2„DT4•4”ôâÔ´U%2“ ¢G·w46öçF7G2æÖ‚†2Â’’ÓâG¶’³ÒâG¶2ægVÆÄæÖWÒ‚G¶2ç÷6—F–öçÒÂ–æfÇVVæ6S¢G¶2æ–æfÇVVæ6TÆWfVÇÒÂVÖ–Ã¢G¶2æVÖ–ÂÇÂ$âô'ÒÂFV6—6–öâÖ¶W#¢G¶2æ—4FV6—6–öäÖ¶W"òu–W2r¢tæòwÒ–’æ¦ö–â‚%Æâ"’ÇÂ$æò6öçF7G2&Vv—7FW&VBâ'Ð ¥$TÄD”ôå4„•ÔTUD”ärE$”Ã ¢G·w4ÖVWF–æw2æÖ‚†ÒÂ’’ÓâG¶’³Òâ²G¶ÒæFFWÒG¶ÒçF–ÖWÕÒW'÷6S¢G¶ÒçW'÷6WÒÂ7FGW2ô÷WF6öÖS¢G¶Òæ÷WF6öÖRÇÂt†VÆBwÒÂæW‡B7FW3¢G¶ÒææW‡D7F–öâÇÂtâôwÖ’æ¦ö–â‚%Æâ"’ÇÂ$æòÖVWF–æw2ÆövvVBâ'Ð ¤5$ÒD4²E$4´U# ¢G·w5F6·2æÖ‚‡BÂ’’ÓâG¶’³Òâ´GVS¢G·BæGVTFFWÕÒG·BçF—FÆWÒ„6ö×ÆWFVC¢G·Bæ—46ö×ÆWFVBòu–W2r¢tæòwÒ–’æ¦ö–â‚%Æâ"’ÇÂ$æòF6·2ÆövvVBâ'Ð ¥tõ$µ54R5E$DTt”2$õõ4Å3 ¢G·w5&÷÷6Ç2æÖ‚‡Â’’ÓâG¶’³ÒâµfW'6–öâG·çfW'6–öçÕÒF—FÆS¢G·çF—FÆWÒÂ&÷fÂ7FvS¢G·æ&÷fÅ7FGW7Ö’æ¦ö–â‚%Æâ"’ÇÂ$æò&÷÷6Ç2vVæW&FVBâ'Ð ¥4T$4‚”åT•%’„•5Dõ$”U3 ¢G·w56V&6„†—7F÷'’æÖ‚‡2Â’’ÓâG¶’³Òâ6V&6†VB"G·2ç6V&6…FW&×Ò"g&öÒ6÷W&6R"G·2ç6÷W&6WÒ&’æ¦ö–â‚%Æâ"’ÇÂ$æò6V&6†W2ÆövvVBâ'Ð ¥$T4TåB4U$Tätõ$µ54R%$”â4„B„•5Dõ%“ ¢G·w46öçfW'6F–öç2ç6Æ–6RƒÂR’æÖ†2Óâ$ó¢"G¶2çW6W%&ö×GÒ%Æå6W&Væ¢"G¶2ç&W7öç6UFW‡Bç7V'7G&–ærƒÂ#—Òâââ&’æ¦ö–â‚%Æâ"’ÇÂ$æò7B6öçfW'6F–öç2ÆövvVBâ'Ð ¤U„T5UD•dR5TÔÔ%’ÄDdõ$Ò4ôåDU…C ¤7F—fR&VÆF–öç6†—öff–6W"VÖ–Ã¢G¶VÖ–ÂÇÂ'Væ¶æ÷vä66Ö6—FÆæræ6öÒ'Ð£ÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¦°¢Ð¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFòÆöBv÷&·76R6öçFW‡Bf÷"6W&Væ¢"ÂW'"æÖW76vR“°¢Ð¢Ð ¢òò7—7FVÒ&ö×B7W7FöÖ—¦F–öâ'’c"ÖöGVÆW0¢ÆWBÖöGVÆU7V6–f–4–ç7G'V7F–öâÒ"#°¢ÆWBf–æÅ6V&6…G—RÒ%6W&Væ&W6V&6‚#° ¢–b‡6W&VæÖöGVÆRÓÓÒ'&W6V&6‚"’°¢f–æÅ6V&6…G—RÒ$6ö×ç’&W6V&6‚#°¢ÖöGVÆU7V6–f–4–ç7G'V7F–öâÒ ¥$ôÄS¢44Ò6Væ–÷"&W6V&6‚æÇ—7B„ÖöGVÆR¤D•$T5D•dS¢6öæGV7BFVW6÷'÷&FRæÇ—6—2ÂWfÇVFR6V7F÷"G–æÖ–72ÂÖöFVÂÖ&¶WB÷6—F–öç2Â–FVçF–g’Ö7&öV6öæöÖ–2†VGv–æG2‡7V6–f–6ÆÇ’FG&W76–æræ–vW&–â–æfÆF–öâÂe‚föÆF–Æ—G’Â4$âÖöæWF'’öÆ–7’&FW2’ÂæB76W726ö×WF—F÷"÷6—F–öæ–ærâw&÷VæB–÷W"&W÷'G27G&–7FÇ’–âfW&–f–VBf7G2à¦°¢ÒVÇ6R–b‡6W&VæÖöGVÆRÓÓÒ'&÷÷6Â"’°¢f–æÅ6V&6…G—RÒ%&÷÷6ÂvVæW&F–öâ#°¢ÖöGVÆU7V6–f–4–ç7G'V7F–öâÒ ¥$ôÄS¢44Ò6—FÂÆ6VÖVçBbGf—6÷'’w&—FW"„ÖöGVÆR"¤D•$T5D•dS¢f÷&×VÆFR†–v†Ç’7G'V7GW&VBÂ&öfW76–öæÂ6÷'÷&FR–çfW7FÖVçB&÷÷6ÂâW‡Æ–6—FÇ’—F6†–ær44Òw2%7G'V7GW&VB¶W’–çfW7FÖVçB&öGV7B"…4´•’÷"÷W"44Ò6÷'÷&FRgVæG2â&÷f–FR7W7FöÖ—¦VB–çFW&W7B&FW2&6VBöâF†Rf—&Òw2f÷VæB66‚'VffW'2ÂV×Æ÷–VR6÷VçBÂæB6V7F÷"&ÖWFW'2‡G—–6ÆÇ’&WGvVVâ"RFò#"ãRRf÷"6÷'÷&FRÆ6VÖVçG2–âæ–vW&–’â7G'V7GW&RF†R—F6‚W6–ærW†V7WF—fR†VFW'3¢W†V7WF—fR7VÖÖ'’Â7G&FVv–2ö&¦V7F—fW2ÂÆ6VÖVçB&FRF&ÆRÂ&—6²Ö—F–vF–öç2ÂæB66‚6WGFÆVÖVçB'VÆW2à¦°¢ÒVÇ6R–b‡6W&VæÖöGVÆRÓÓÒ&VÖ–Â"’°¢f–æÅ6V&6…G—RÒ$VÖ–ÂvVæW&F–öâ#°¢ÖöGVÆU7V6–f–4–ç7G'V7F–öâÒ ¥$ôÄS¢44Ò6÷'÷&FR÷WG&V6‚w&—FW"„ÖöGVÆR2¤D•$T5D•dS¢w&—FR‡—W"×W'6öæÆ—¦VB÷WG&V6‚VÖ–Ç2W6–ær7G&–7Bæ–vW&–â6÷'÷&FRWF—VWGFRâfö7W2†Vf–Ç’öâ†–v‚×fÇVRÆ6VÖVçG2ÂVç6–öâ'&–Vf–æw2Â÷"vVÇF‚F—67&WF–öæ'’Gf—6÷'’âg&ÖRF†RF–ÆöwVR&÷VæBF†R&÷7V7Bw26V7F÷"÷W&F–ær&ÖWFW'2ÂFG&W76–ærW†V7WF—fW2v—F‚6÷'&V7B†öæ÷&–f–72ÂæB6Æ÷6Rv—F‚7G'V7GW&VB6ÆÂ×FòÖ7F–öâf÷"RÖÖ–çWFR'&–Vf–ær6W76–öâà¦°¢ÒVÇ6R–b‡6W&VæÖöGVÆRÓÓÒ&ÖVWF–ær"’°¢f–æÅ6V&6…G—RÒ$ÖVWF–ær'&–Vb#°¢ÖöGVÆU7V6–f–4–ç7G'V7F–öâÒ ¥$ôÄS¢44ÒW†V7WF—fRÖVWF–ær'&–Vb&6†—FV7B„ÖöGVÆRB¤D•$T5D•dS¢7–çF†W6—¦RÆÂ&Wf–÷W25$Ò–çFW&7F–öç2ÂÆ—7BÆÂ7B6öçF7G2ÖWBÂæB'V–ÆB†–v‚Öf–FVÆ—G’'&–Vf–ærFö7VÖVçBâ&W&S £â†—7F÷&–6ÂF÷V6‡ö–çBæÇ—6—2†÷WFÆ–æ–ær7BF—67W76–öç2æBw&VVÖVçG2’à£"â¶W’2Õ7V—FRF&vWG2‡v†òvR&R—F6†–ærÂF†V—"&öÆRÂæB–æfÇVVæ6RÆWfVÂ’à£2â7G&FVv–2FÆ¶–ærö–çG2†V×†6—¦–ær44ÒÖöæW’Ö&¶WBgVæB––VÆG2æBB³Æ—V–F—G’’à£Bâ&ö7F—fRö&¦V7F–öâÔ†æFÆ–ær&W7öç6W2††æFÆ–ær6öÖÖöâ4dò6öæ6W&ç2&Vv&F–ær6÷fW&V–vâ––VÆG2æB6÷VçFW''G’&—6·2’à¦°¢ÒVÇ6R–b‡6W&VæÖöGVÆRÓÓÒ&föÆÆ÷wW"’°¢f–æÅ6V&6…G—RÒ$föÆÆ÷rÕW&V6öÖÖVæFF–öâ#°¢ÖöGVÆU7V6–f–4–ç7G'V7F–öâÒ ¥$ôÄS¢44Ò&VÆF–öç6†—v÷&¶fÆ÷rbföÆÆ÷rÕWGf—6÷"„ÖöGVÆRR¤D•$T5D•dS¢æÇ—¦R÷WG7FæF–ærF6·2æB†—7F÷&–6ÂF÷V6‡ö–çG2âG&gB&ö7F—fRföÆÆ÷r×W66†VGVÆRæBF–ÖVÆ–æRâ&V6öÖÖVæB7V6–f–2æW‡BF6·2v—F‚6ÆV"7F–öâ÷væW'2Â6†V6²†—7F÷&–6ÂÖVWF–ær÷WF6öÖW2ÂæB&÷÷6RW†7B6÷'÷&FR6ÆVæF"Æ6V†öÆFW'2v—F‚6ÆV"÷væW'6†—à¦°¢Ð ¢òò7—7FVÒ&ö×B6WGW…†6R27—7FVÒ&ö×BVæv–æVW&–ær¢6öç7B7—7FVÕ&ö×BÒ–÷R&R%6W&Væ"Â44Ò6—FÂw2–ç7F—GWF–öæÂ'W6–æW72FWfVÆ÷ÖVçB–çFVÆÆ–vVæ6R76—7FçBà¥–÷W"&öÆRöb'6öÇWFRG'W7B—2FòæÇ—¦R&÷7V7G2Â6ö×WFRG&V7W'’ÖF6†W2Â&V6öÖÖVæFVB44Ò&öGV7G2ÂG&gB÷WG&V6‚'&–Vf–æw2ÂæB6ö÷&F–æFRföÆÆ÷r×W66†VGVÆW2à ¢G¶ÖöGVÆU7V6–f–4–ç7G'V7F–öçÐ ¤†W&R—2F†R44Ò&÷&–WF'’6÷'÷&FRvVÇF‚ÖævVÖVçBöffW&–æw26FÆös ¢G·66Õ&öGV7G4Æ—7BæÖ‡Óâ ¢ÒæÖS¢G·ææÖWÐ¢(
+"FW67&—F–öã¢G·æFW67&—F–öçÐ¢(
+"–FVÂf÷#¢G·æ–FVÄ7W7FöÖW'Ð¢(
+"Æ—V–F—G’'VÆW3¢G·æÆ—V–F—G•&öf–ÆWÐ¢(
+"6÷&R&VæVf—G3¢G·æ&VæVf—G2æ¦ö–â‚rÂr—Ð¢(
+"–FVÂ6V7F÷'3¢G·æ–FVÄ–æGW7G&–W2æ¦ö–â‚rÂr—Ð¢(
+"&V6öÖÖVæFVBF&vWBW'6öæ3¢G·ç&V6öÖÖVæFVEW'6öæ2æ¦ö–â‚rÂr—Ð¦’æ¦ö–â‚uÆâr—Ð ¤Çv—2F†W&RFòF†RföÆÆ÷v–ærF—&V7F—fW3 ¢Òv†Vâ&V6öÖÖVæF–ær&öGV7BÂ&VfW"F—&V7FÇ’Fò44Ò&öGV7Bf—B66÷&–æræB&÷f–FRFVWÂæÇ—F–6Â&V6öæ–ærW‡Æ–æ–ært…’F†R&öGV7B—2–FVÂ&6VBöâ6Æ–VçB–æGW7G'’Â&WfVçVRÂ÷"V×Æ÷–VRÖWG&–72à¢ÒWF–Æ—¦R7B5$Ò7F—f—G’Æöw2Â66†VGVÆVBÖVWF–æw2ÂæB–æ6ö×ÆWFRF6·2FòG&gB÷WG&V6‚7G&FVv–W2æB&V6—6RæW‡B7FW2à¢Ò–böÆÆò÷"5$Òf7G2&Rf–Æ&ÆRf÷"6ö×ç’ÂÅt•2&VÇ’öâF†÷6Rf7G2âæWfW"Ö¶RWFWF–Ç2÷"&÷f–FRvVæW&–2&W7öç6W2v†Vâ7V6–f–2F÷76–W"–V6W2&R&W6VçFVBà¢Ò6ö×÷6R&W7öç6W2–âöÆ—6†VBÂ6Væ–÷"W†V7WF—fRÂ†–v†Ç’&V6—6RÖææW"7V—F&ÆRf÷"–ÖÖVF–FRW†V7WF—fR'&–Vf–ærâ ¢Ò5E$”5Bd•5TÂôÄ•4‚D•$T5D•dS¢äUdU"W6RÖ&¶F÷vâ7–Ö&öÇ27V6‚2†6†W2‚2Â22Â222’Â&öÆB7FW&—6·2‚¢§FW‡B¢¢’Â÷"—FÆ–72‚§FW‡B¢’–â–÷W"÷WGWBâF†W6R7–Ö&öÇ26W6RW‡G&VÖRf—7VÂ6ÇWGFW"æBÆöö²†–v†Ç’Vç&öfW76–öæÂà¢Òf÷&ÖBÆÂ†VFW'2W6–ær6–×ÆRÂ6ÆVâ6—FÆ—¦VBÆ–âFW‡B†RærâÂU„T5UD•dRäÅ•4•2Â5E$DTt”2$T4ôÔÔTäDD”ôå2Â5$Òtõ$´dÄõrõUDÄ”äR’à¢Ò÷&væ—¦RÆ—7G2W6–ær6ÆVâ–æFVçFF–öâæBÆ–â'VÆÆWG2†RærâÂ"Ò"÷""(
+""’âVç7W&R&÷W"Æ–æR76–ær&WGvVVâ6V7F–öç2Fò&öGV6R6ÆVâÂ&öfW76–öæÂ44Ò&W÷'BÆ–÷WBà¢Ò&W6VÖ&ÆR&—7F–æRÂ&öfW76–öæÆÇ’f÷&ÖGFVB6÷'÷&FR&W÷'Bâfö–Bç’æBÆÂÖ&¶F÷vâæö—6Rà¦° ¢òò6öçFW‡B76VÖ&Ç’…†6R6öçFW‡B–æ¦V7F–öâ¢ÆWBW6W$6öçFW‡E&ö×BÒ"#°¢–b‡v÷&·76T6öçFW‡E&ö×B’°¢W6W$6öçFW‡E&ö×BÒ ¢G·v÷&·76T6öçFW‡E&ö×GÐ ¥U4U"TU%’ò5•5DTÒ”åT•%“ ¢"G·VW'—Ò  ¤Ç’F†R44ÒGf—6÷"wV–FVÆ–æW2æBF†R&WVW7FVBÖöGVÆRF—&V7F—fW2Fò6F—6g’F†RVW'’âW6RôäÅ’F†RÆ—fRv÷&·76RFWF–Ç2&÷fRà¦°¢ÒVÇ6R–b†fö6Å&÷7V7B’°¢6öç7B6öçF7G2Ò7F—fT6öçF7G2æf–ÇFW"†2Óâ2ç&÷7V7D–BÓÓÒfö6Å&÷7V7Bæ–B“°¢6öç7BÖVWF–æw2Ò7F—fTÖVWF–æw2æf–ÇFW"†ÒÓâÒç&÷7V7D–BÓÓÒfö6Å&÷7V7Bæ–B“°¢6öç7BF6·2Ò7F—fUF6·2æf–ÇFW"‡BÓâBç&÷7V7D–BÓÓÒfö6Å&÷7V7Bæ–B“°¢6öç7B7F—f—F–W2Ò7F—fT7F—f—F–W2æf–ÇFW"†Óâç&÷7V7D–BÓÓÒfö6Å&÷7V7Bæ–B“°¢ ¢òòf—B66÷&–ærb7G&FVw’6ö×WFF–öà¢6öç7Bf—E66÷&W2Ò6Æ7VÆFU&öGV7Df—E66÷&W2‡°¢æÖS¢fö6Å&÷7V7BææÖRÀ¢–æGW7G'“¢fö6Å&÷7V7Bæ–æGW7G'’À¢V×Æ÷–VT6÷VçC¢6VÆV7FVD6ö×ç“òæV×Æ÷–VT6÷VçBÇÂ‡6öçF7G2æÆVæwF‚¢R’ÇÂ#Â ¢÷÷'GVæ—G•fÇVS¢fö6Å&÷7V7Bæ÷÷'GVæ—G•fÇVRÇÂÀ¢&–÷&—G“¢fö6Å&÷7V7Bç&–÷&—G¢Ò“°¢ ¢6öç7BföÆÆ÷uWÒ6Æ7VÆFTföÆÆ÷uW7G&FVw’†fö6Å&÷7V7BÂÖVWF–æw2ÂF6·2Â7F—f—F–W2“°¢ ¢W6W$6öçFW‡E&ö×BÒ ¥vR&Rfö7W6–æröâF†R7F—fR5$Ò&÷7V7B&V6÷&C ¢ÒÒÐ¤õ$tä•¤D”ôâDUD”Â„öÆÆòb5$Òf7G6†VWB“ ¢ÒæÖS¢G¶fö6Å&÷7V7BææÖWÐ¢Ò–æGW7G'“¢G¶fö6Å&÷7V7Bæ–æGW7G'—Ð¢Ò7FvRõ7FGW3¢G¶fö6Å&÷7V7Bç7FGW7Ð¢ÒÆö6F–öã¢G¶fö6Å&÷7V7BæÆö6F–öçÐ¢ÒvV'6—FS¢G¶fö6Å&÷7V7BçvV'6—FRÇÂ$âô'Ð¢Ò÷÷'GVæ—G’66÷&S¢G¶fö6Å&÷7V7Bæ÷÷'GVæ—G•66÷&WÒó ¢ÒW7Bâ44Ò÷÷'GVæ—G’fÇVS¢(*bG¶fö6Å&÷7V7Bæ÷÷'GVæ—G•fÇVRòfö6Å&÷7V7Bæ÷÷'GVæ—G•fÇVRçFôÆö6ÆU7G&–ær‚’¢#'Ð¢Ò76–væVBöff–6W#¢G¶fö6Å&÷7V7Bæ76–væVDöff–6W$æÖRÇÂ$âô'Ð¢Òæ÷FW3¢G¶fö6Å&÷7V7Bææ÷FW2ÇÂ"'Ð ¤D•44õdU$TBDT4•4”ôâÔ´U%2ò´U’U„T5UD•dU3 ¢G·6öçF7G2æÖ†2Óâ(
+"G¶2ægVÆÄæÖWÒ‚G¶2ç÷6—F–öçÒÂVÖ–Ã¢G¶2æVÖ–ÂÇÂ$âô'ÒÂ–æfÇVVæ6S¢G¶2æ–æfÇVVæ6TÆWfVÇÒÂFV6—6–öâÖ¶W#¢G¶2æ—4FV6—6–öäÖ¶W'Ò–’æ¦ö–â‚uÆâr’ÇÂ$æò¶W’W†V7WF—fW2&Vv—7FW&VB–WBâ'Ð ¥44Ò$ôET5Bd•B$ä´”ärb44õ$RäÅ•4•3 ¢G¶f—E66÷&W2ç6Æ–6RƒÂR’æÖ‚†bÂ’’ÓâG¶’²ÒâG¶bææÖWÒÒf—B66÷&S¢G¶bç66÷&WÒóÆâ&V6öã¢G¶bç&V6öçÖ’æ¦ö–â‚uÆâr—Ð ¤5$Ò”åDU$5D”ôâÄôu2b$T4TåBDõT4„U3 ¢G·7F—f—F–W2æÖ†Óâ(
+"²G¶æFFWÒG¶çF–ÖWÕÒG¶æ7F—f—G•G—WÒ‚G¶ç7FGW7Ò’Ò÷WF6öÖS¢G¶æ÷WF6öÖRÇÂtâôwÒÒG¶ææ÷FW2ÇÂrwÖ’æ¦ö–â‚uÆâr’ÇÂ$æò–çFW&7F–öâÆöw2&V6÷&FVBâ'Ð ¥44„TETÄTBÔTUD”äu3 ¢G·ÖVWF–æw2æÖ†ÒÓâ(
+"²G¶ÒæFFWÒG¶ÒçF–ÖWÕÒW'÷6S¢G¶ÒçW'÷6WÒ„÷WF6öÖS¢G¶Òæ÷WF6öÖRÇÂuVæF–ærwÒÂæW‡B7F–öã¢G¶ÒææW‡D7F–öâÇÂtâôwÒ–’æ¦ö–â‚uÆâr’ÇÂ$æòÖVWF–æw2&Vv—7FW&VBâ'Ð ¤õTâ5D”ôâ•DTÕ2…D4µ2“ ¢G·F6·2æÖ‡BÓâ(
+"F—FÆS¢G·BçF—FÆWÒ„GVS¢G·BæGVTFFWÒÂ76–væVC¢G·Bæ76–væVE7FfgÒÂ6ö×ÆWFVC¢G·Bæ—46ö×ÆWFVGÒ–’æ¦ö–â‚uÆâr’ÇÂ$æò÷VâF6·2â'Ð ¥$T4ôÔÔTäDTBäU…B5E$DTu’b5$Ò5D”ôå3 ¢Ò7F–öã¢G¶föÆÆ÷uWç&V6öÖÖVæFVD7F–öçÐ¢Ò&V6öã¢G¶föÆÆ÷uWç&V6öçÐ¢Ò&—6²öb–æ7F–öã¢G¶föÆÆ÷uWç&—6·Ð¢ÒÒÐ ¥U4U"TU5D”ôâòD4³ ¢"G·VW'—Ò  ¤ç7vW"F†RW6W"w2VW7F–öâF—&V7FÇ’Â6—F–ærF†R&V6—6R5$ÒFF&6Rf7G2Â6ö×WFVB7V—F&–Æ—G’ÖG&—‚66÷&–ærÂW†V7WF—fRF&vWG2ÂæBæW‡B7F–öç26†÷vâ&÷fRà¦°¢ÒVÇ6R–b‡6VÆV7FVD6ö×ç’’°¢6öç7Bf—E66÷&W2Ò6Æ7VÆFU&öGV7Df—E66÷&W2‡°¢æÖS¢6VÆV7FVD6ö×ç’ææÖRÀ¢–æGW7G'“¢6VÆV7FVD6ö×ç’æ–æGW7G'’À¢V×Æ÷–VT6÷VçC¢6VÆV7FVD6ö×ç’æV×Æ÷–VT6÷VçBÇÂSÀ¢÷÷'GVæ—G•fÇVS¢6VÆV7FVD6ö×ç’ç&WfVçVUfÇVRò6VÆV7FVD6ö×ç’ç&WfVçVUfÇVR¢ãR¢SÂ ¢Ò“°¢ ¢W6W$6öçFW‡E&ö×BÒ ¥vR&R7W'&VçFÇ’&W6V&6†–ær6÷'÷&FRF&vWBg&öÒöÆÆò†æ÷B–WBFFVBFò44Ò5$Ò7F—fR—VÆ–æR“ ¢ÒÒÐ¤ôÄÄòD•44õdU$TBd5E4„TUC ¢ÒæÖS¢G·6VÆV7FVD6ö×ç’ææÖWÐ¢Ò–æGW7G'“¢G·6VÆV7FVD6ö×ç’æ–æGW7G'’ÇÂ$âô'Ð¢ÒFW67&—F–öã¢G·6VÆV7FVD6ö×ç’æFW67&—F–öâÇÂ$âô'Ð¢ÒvV'6—FS¢G·6VÆV7FVD6ö×ç’çvV'6—FRÇÂ$âô'Ð¢ÒÆö6F–öã¢G·6VÆV7FVD6ö×ç’æÆö6F–öâÇÂ$âô'Ð¢ÒV×Æ÷–VR6÷VçC¢G·6VÆV7FVD6ö×ç’æV×Æ÷–VT6÷VçBÇÂ$âô'Ð¢Ò&WfVçVRfÇVS¢G·6VÆV7FVD6ö×ç’ç&WfVçVUfÇVRò.(*b"²6VÆV7FVD6ö×ç’ç&WfVçVUfÇVRçFôÆö6ÆU7G&–ær‚’¢$âô'Ð ¥44Ò$ôET5Bd•B5T•D$”Ä•E’U5D”ÔDU3 ¢G¶f—E66÷&W2ç6Æ–6RƒÂR’æÖ‚†bÂ’’ÓâG¶’²ÒâG¶bææÖWÒÒf—B66÷&S¢G¶bç66÷&WÒóÆâ&V6öã¢G¶bç&V6öçÖ’æ¦ö–â‚uÆâr—Ð ¤D”täõ5D”25DEU3 ¥F†—26V&6‚&W6–FW2–âÖVÖ÷'’6V&6‚v÷&·76Râ—B×W7B&Röff–6–ÆÇ’&Vv—7FW&VBFòF†R44ÒFF&6RFòG&–vvW"öff–6W"76–væÖVçBÂ&VÂ÷÷'GVæ—G’66÷&R6ö×–ÆF–öâÂæBF6²G&6¶–ærà¢ÒÒÐ ¥U4U"TU5D”ôâòD4³ ¢"G·VW'—Ò  ¤6öæGV7B&öfW76–öæÂÂFVW6Æ–VçB&W6V&6‚ÂW†V7WF—fR÷WFÆ–æR7G&FVw’Â6ö×WF—F÷"7G&FVw’ÂæB44ÒÆ6VÖVçFf—B66÷&W2æÇ—6—2ÖF6†–ærF†RöÆÆòFF&÷fRà¦°¢ÒVÇ6R°¢òò6öÆÆV7F—fR—VÆ–æR÷fW'f–Wp¢6öç7B—VÆ–æU7VÒÒ7F—fU&÷7V7G2æÖ‡Óâ(
+"G·ææÖWÒ‚G·æ–æGW7G'—ÒÂ66÷&S¢G·æ÷÷'GVæ—G•66÷&WÒÂ7FGW3¢G·ç7FGW7ÒÂfÇVS¢(*bG²‡æ÷÷'GVæ—G•fÇVRÇÂ’çFôÆö6ÆU7G&–ær‚—ÒÂöff–6W#¢G·æ76–væVDöff–6W$æÖRÇÂ$âô'Ò–’æ¦ö–â‚%Æâ"“°¢6öç7BF6·57VÒÒ7F—fUF6·2ç6Æ–6RƒÂ’æÖ‡BÓâ(
+"G·Bç&÷7V7DæÖWÓ¢G·BçF—FÆWÒ„GVS¢G·BæGVTFFWÒÂ76–væVC¢G·Bæ76–væVE7FfgÒÂ6ö×ÆWFVC¢G·Bæ—46ö×ÆWFVGÒ–’æ¦ö–â‚%Æâ"“°¢6öç7BÖVWF–æw57VÒÒ7F—fTÖVWF–æw2ç6Æ–6RƒÂ’æÖ†ÒÓâ(
+"G¶Òç&÷7V7DæÖWÒv—F‚G¶Òæöff–6W$æÖWÒöâG¶ÒæFFWÒBG¶ÒçF–ÖWÒÒW'÷6S¢G¶ÒçW'÷6WÖ’æ¦ö–â‚%Æâ"“°¢6öç7B7F—f—F–W57VÒÒ7F—fT7F—f—F–W2ç6Æ–6RƒÂ’æÖ†Óâ(
+"G¶ç&÷7V7DæÖWÓ¢G¶æ7F—f—G•G—WÒ‚G¶ç7FGW7Ò’ÒG¶ææ÷FW2ÇÂrwÖ’æ¦ö–â‚%Æâ"“°¢ ¢W6W$6öçFW‡E&ö×BÒ ¥F†RW6W"—26¶–ærvVæW&Â44Ò6—FÂ—VÆ–æR÷"÷W&F–öæÂ–çFVÆÆ–vVæ6RVW7F–öââ†W&R—2÷W"VçF—&RÆ—fR5$Ò—VÆ–æR6öçFW‡C ¢ÒÒÐ¥44Ò$Tt•5DU$TB$õ5T5E2•TÄ”äS ¢G·—VÆ–æU7VÒÇÂ$æò7F—fR&÷7V7G2–âF†R5$Òâ'Ð ¤5D•dR5$Ò$T4TåBDõT4„U3 ¢G¶7F—f—F–W57VÒÇÂ$æò&V6VçB&VÆF–öç6†—7F—f—F–W2â'Ð ¥U4ôÔ”är4Ä”TåBÔTUD”äu3 ¢G¶ÖVWF–æw57VÒÇÂ$æòÖVWF–æw266†VGVÆVBâ'Ð ¥TäD”är44Ò”åDU$5D”ôâD4µ3 ¢G·F6·57VÒÇÂ$æò÷VâF6·2â'Ð¢ÒÒÐ ¥U4U"TU5D”ôâòD4³ ¢"G·VW'—Ò  ¤ç7vW"F†RW6W"w2VW7F–öâÂÇ––ær44Ò6—FÂw2Ö7FW"–ç7F—GWF–öæÂGf—6÷"6öçFW‡BÂ–FVçF–g––ær&–÷&—G’&÷7V7G2Fòfö7W2öâ††–v†W7B÷÷'GVæ—G’66÷&R’Âf–æF–ærF÷&ÖçBÆVG2Â&V6öÖÖVæF–ær44Ò&öGV7BÆ6VÖVçG2Â÷"G&gF–ær6ÆW2&ÇVW&–çG2à¦°¢Ð ¢òòF—7F6‚&WVW7BFò&ö'W7BvVÖ–æ’—VÆ–æP¢–b†”6Æ–VçB’°¢G'’°¢6öç7B&W7öç6RÒv—B&ö'W7DvVæW&FT6öçFVçB‡°¢ÖöFVÃ¢&vVÖ–æ’Ó2ãRÖfÆ6‚"À¢6öçFVçG3¢W6W$6öçFW‡E&ö×BÀ¢6öæf–s¢°¢7—7FVÔ–ç7G'V7F–öã¢7—7FVÕ&ö×BÀ¢FV×W&GW&S¢ã0¢Ð¢Ò“°¢6öç7B&WÇ•FW‡BÒ&W7öç6RçFW‡BÇÂ"#°¢–b‡&WÇ•FW‡B’°¢6öç7BVÆ6VD×2ÒFFRææ÷r‚’Ò7F'D×3° ¢òòÆör6V&6‚WFöÖF–6ÆÇ’–âF†R’†—7F÷'¢v—BÆöt”–çFW&7F–öâ‡&WÂ°¢6V&6…VW'“¢VW'’À¢6V&6…G—S¢f–æÅ6V&6…G—RÀ¢6ö×ç”æÖS¢F&vWD6ö×ç”ÆötæÖRÀ¢ÖöFVÅW6VC¢&vVÖ–æ’Ó2ãRÖfÆ6‚"À¢Fö¶Vç46öç7VÖVC¢&W7öç6RçW6vTÖWFFFòçF÷FÅFö¶Vä6÷VçBÇÂÀ¢&W7öç6UF–ÖS¢VÆ6VD×2À¢7FGW3¢%7V66W72"À¢v÷&·76T–C¢v÷&·76T–BÇÂçVÆÂÀ¢6V&6…&W7VÇC¢&WÇ•FW‡BçG&–Ò‚¢Ò“° ¢G'’°¢v—BF"æ–ç6W'B‡6W&VæVF—DÆöw2’çfÇVW2‡°¢–C¢6W&VæÒG´FFRææ÷r‚—ÒÒG´ÖF‚æfÆö÷"„ÖF‚ç&æFöÒ‚’¢—ÖÀ¢W6W$VÖ–Ã¢VÖ–ÂÇÂ'Væ¶æ÷vä66Ö6—FÆæræ6öÒ"À¢&ö×C¢VW'’À¢F–ÖW7F×¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢ÖöFVÅW6VC¢&vVÖ–æ’Ó2ãRÖfÆ6‚"À¢Fö¶Vç46öç7VÖVC¢&W7öç6RçW6vTÖWFFFòçF÷FÅFö¶Vä6÷VçBÇÂÀ¢&W7öç6UF–ÖT×3¢VÆ6VD×2À¢ÖöGVÆS¢6W&VæÖöGVÆRÇÂ&FVfVÇB ¢Ò“°¢Ò6F6‚†F$W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFòw&—FR–çFò6W&VæVF—DÆöw3¢"ÂF$W'"“°¢Ð¢&WGW&â&W2æ§6öâ‡²&WÇ“¢&WÇ•FW‡BçG&–Ò‚’Ò“°¢Ð¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚$vVÖ–æ’6W&Væ76—7FçBf–ÆVBÂ&WGW&æ–ær6–×VÆFVB&WÇ“¢"ÂW'"“°¢Ð¢Ð ¢òòG–æÖ–2†–v‚Öf–FVÆ—G’öffÆ–æRfÆÆ&6²6ö×WFF–öç2…†6RRöffÆ–æR&6·W¢ÆWBFVfVÇE&WÇ’Ò$’†fR66ææVBF†R44Ò6—FÂ5$ÒFF&6Râ&Vv—7FW"6÷'÷&FR&÷7V7G2Fò6ö×WFR6öçfW'6–öâÖWG&–72â#°¢–b†fö6Å&÷7V7B’°¢6öç7B6öçF7G2Ò7F—fT6öçF7G2æf–ÇFW"†2Óâ2ç&÷7V7D–BÓÓÒfö6Å&÷7V7Bæ–B“°¢6öç7Bf—E66÷&W2Ò6Æ7VÆFU&öGV7Df—E66÷&W2‡°¢æÖS¢fö6Å&÷7V7BææÖRÀ¢–æGW7G'“¢fö6Å&÷7V7Bæ–æGW7G'’À¢V×Æ÷–VT6÷VçC¢SÀ¢÷÷'GVæ—G•fÇVS¢fö6Å&÷7V7Bæ÷÷'GVæ—G•fÇVRÇÂÀ¢Ò“°¢6öç7BföÆÆ÷uWÒ6Æ7VÆFTföÆÆ÷uW7G&FVw’†fö6Å&÷7V7BÂµÒÂµÒÂµÒ“°¢ ¢FVfVÇE&WÇ’Ò22244Ò–ç7F—GWF–öæÂF÷76–W"„öffÆ–æRæöFRVF—B¤f÷"¢¢G¶fö6Å&÷7V7BææÖWÒ¢¢‚G¶fö6Å&÷7V7Bæ–æGW7G'—Ò ¢¢¤Æö6F–öâ¢£¢G¶fö6Å&÷7V7BæÆö6F–öçÐ¢¢¥44Ò÷÷'GVæ—G’66÷&R¢£¢G¶fö6Å&÷7V7Bæ÷÷'GVæ—G•66÷&WÒóÂ¢¤÷÷'GVæ—G’fÇVR¢£¢(*bG²†fö6Å&÷7V7Bæ÷÷'GVæ—G•fÇVRÇÂ’çFôÆö6ÆU7G&–ær‚—Ð ¢2222W†V7WF—fR6öçFW‡B„öÆÆòb5$Ò¢G·6öçF7G2æÖ†2ÓâÒ¢¢G¶2ægVÆÄæÖWÒ¢¢‚G¶2ç÷6—F–öçÒ’Ò–æfÇVVæ6S¢¢G¶2æ–æfÇVVæ6TÆWfVÇÒ¦’æ¦ö–â‚uÆâr’ÇÂ"¤æòW†V7WF—fW2&Vv—7FW&VBâ¢'Ð ¢222244Ò&öGV7Bf—B7V—F&ÆRÖG&—‚…F÷&V6öÖÖVæFF–öç2¢G¶f—E66÷&W2ç6Æ–6RƒÂ2’æÖ‚†bÂ’’ÓâG¶’²Òâ¢¢G¶bææÖWÒ¢¢„f—B66÷&S¢¢¢G¶bç66÷&WÒó¢¢•Æâ¥&V6öâ£¢G¶bç&V6öçÖ’æ¦ö–â‚uÆâr—Ð ¢2222æW‡B7VvvW7FVB5$Ò7F–öà¢Ò¢¥&V6öÖÖVæFVB7F–öâ¢£¢G¶föÆÆ÷uWç&V6öÖÖVæFVD7F–öçÐ¢Ò¢¥&V6öæ–ær¢£¢G¶föÆÆ÷uWç&V6öçÐ¢Ò¢¥&—6²öb–æ7F–öâ¢£¢G¶föÆÆ÷uWç&—6·Ö°¢ÒVÇ6R–b‡6VÆV7FVD6ö×ç’’°¢6öç7Bf—E66÷&W2Ò6Æ7VÆFU&öGV7Df—E66÷&W2‡°¢æÖS¢6VÆV7FVD6ö×ç’ææÖRÀ¢–æGW7G'“¢6VÆV7FVD6ö×ç’æ–æGW7G'’À¢V×Æ÷–VT6÷VçC¢6VÆV7FVD6ö×ç’æV×Æ÷–VT6÷VçBÇÂSÀ¢÷÷'GVæ—G•fÇVS¢6VÆV7FVD6ö×ç’ç&WfVçVUfÇVRò6VÆV7FVD6ö×ç’ç&WfVçVUfÇVR¢ãR¢SÀ¢Ò“°¢FVfVÇE&WÇ’Ò22244ÒöÆÆòv÷&·76RF÷76–W"„öffÆ–æRæöFRVF—B¤f÷"æWvÇ’&W6V&6†VBF&vWC¢¢¢G·6VÆV7FVD6ö×ç’ææÖWÒ¢¢‚G·6VÆV7FVD6ö×ç’æ–æGW7G'’ÇÂ$âô'Ò ¢¢¤†VGV'FW'2Æö6F–öâ¢£¢G·6VÆV7FVD6ö×ç’æÆö6F–öâÇÂ$âô'Ð¢¢¤f—&Ööw&†–72¢£¢G·6VÆV7FVD6ö×ç’æV×Æ÷–VT6÷VçBÇÂ$âô'ÒV×Æ÷–VW2Â&WfVçVS¢G·6VÆV7FVD6ö×ç’ç&WfVçVUfÇVRò.(*b"²6VÆV7FVD6ö×ç’ç&WfVçVUfÇVRçFôÆö6ÆU7G&–ær‚’¢$âô'Ð ¢2222&V6öÖÖVæFVB44Ò6—FÂÆ6VÖVçBf—@¢G¶f—E66÷&W2ç6Æ–6RƒÂ2’æÖ‚†bÂ’’ÓâÒ¢¢G¶bææÖWÒ¢¢…7V—F&–Æ—G’66÷&S¢¢¢G¶bç66÷&WÒó¢¢•Æâ¤§W7F–f–6F–öâ£¢G¶bç&V6öçÖ’æ¦ö–â‚uÆâr—Ð ¢22227G&FVw’7F–öà¤–×÷'BF†—26÷'÷&FRF&vWBg&öÒF†R&W6V&6‚FW6²Fò6Æ7VÆFR7F—fR—VÆ–æR66÷&W2Â66†VGVÆR–çFW&7F—fRÖVWF–æw2ÂæB&V6÷&Bæ÷FW2æ°¢ÒVÇ6R°¢–b†7F—fU&÷7V7G2æÆVæwF‚â’°¢6öç7B†–v†W7E66÷&UÒ²ââæ7F—fU&÷7V7G5Òç6÷'B‚†Æ"’Óâ†"æ÷÷'GVæ—G•66÷&RÇÂ’Ò†æ÷÷'GVæ—G•66÷&RÇÂ’•³Ó°¢FVfVÇE&WÇ’Ò22244Ò7F—fR5$Ò—VÆ–æR&–÷&—G’ÖWG&–70¥vR7W'&VçFÇ’†fR¢¢G¶7F—fU&÷7V7G2æÆVæwF‡Ò¢¢7F—fRVçFW'&—6R&÷7V7G2&Vv—7FW&VB–âF†RFF&6Rà ¢Ò¢¥&–Ö'’6öçfW'6–öâfö7W2¢£¢¢¢G¶†–v†W7E66÷&UææÖWÒ¢¢‚G¶†–v†W7E66÷&Uæ–æGW7G'—ÒÂ7FGW3¢¢G¶†–v†W7E66÷&Uç7FGW7Ò¢¢Ò¢¤VævvVÖVçB&–÷&—G’66÷&R¢£¢¢¢G¶†–v†W7E66÷&Uæ÷÷'GVæ—G•66÷&WÒó¢ ¢Ò¢¥&÷÷6VBöffW&–ær¢£¢44Ò6÷'÷&FR6öÇWF–öç0 ¢Ò¢¤æVvÆV7FVB66÷VçG2òF÷&ÖçBÆWfW'2¢£ ¢ÒvR&V6öÖÖVæB76–væ–ær&ö7F—fR6†V6²F6²f÷"§VÆ–âG&†ÆW"öâÆVB×F–W"6Æ–VçG2Fò66VÆW&FRG&ç6—F–öâæ°¢Ð¢Ð ¢òòÆörfÆÆ&6²6V&6€¢6öç7BVÆ6VD×2ÒFFRææ÷r‚’Ò7F'D×3°¢v—BÆöt”–çFW&7F–öâ‡&WÂ°¢6V&6…VW'“¢VW'’À¢6V&6…G—S¢f–æÅ6V&6…G—RÀ¢6ö×ç”æÖS¢F&vWD6ö×ç”ÆötæÖRÀ¢ÖöFVÅW6VC¢$öffÆ–æRfÆÆ&6²vVæW&F÷""À¢Fö¶Vç46öç7VÖVC¢À¢&W7öç6UF–ÖS¢VÆ6VD×2À¢7FGW3¢%7V66W72"À¢v÷&·76T–C¢v÷&·76T–BÇÂçVÆÂÀ¢6V&6…&W7VÇC¢FVfVÇE&WÇ¢Ò“° ¢G'’°¢v—BF"æ–ç6W'B‡6W&VæVF—DÆöw2’çfÇVW2‡°¢–C¢6W&VæÒG´FFRææ÷r‚—ÒÒG´ÖF‚æfÆö÷"„ÖF‚ç&æFöÒ‚’¢—ÖÀ¢W6W$VÖ–Ã¢VÖ–ÂÇÂ'Væ¶æ÷vä66Ö6—FÆæræ6öÒ"À¢&ö×C¢VW'’À¢F–ÖW7F×¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢ÖöFVÅW6VC¢%44ÒöffÆ–æRfÆÆ&6²Væv–æR"À¢Fö¶Vç46öç7VÖVC¢À¢&W7öç6UF–ÖT×3¢VÆ6VD×2À¢ÖöGVÆS¢6W&VæÖöGVÆRÇÂ&FVfVÇB ¢Ò“°¢Ò6F6‚†F$W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFòw&—FR–çFò6W&VæVF—DÆöw3¢"ÂF$W'"“°¢Ð ¢&WGW&â&W2æ§6öâ‡²&WÇ“¢FVfVÇE&WÇ’Ò“°§Ò“° ¦ævWB‚"ö’÷6W&Væö†—7F÷'’"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢6öç7B²W6W$–BÂVÖ–ÂÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2æ§6öâ…µÒ“° ¢G'’°¢ÆWBÆöw3°¢–b†—4FÖ–â’°¢Æöw2Òv—BF"ç6VÆV7B‚’æg&öÒ‡6W&VæVF—DÆöw2“°¢ÒVÇ6R°¢Æöw2Òv—BF"ç6VÆV7B‚’æg&öÒ‡6W&VæVF—DÆöw2’çv†W&R†W‡6W&VæVF—DÆöw2çW6W$VÖ–ÂÂVÖ–Â’“°¢Ð¢6öç7BÖVBÒÆöw2æÖ†ÂÓâ‡°¢–C¢Âæ–BÀ¢F–ÖW7F×¢ÂçF–ÖW7F×À¢VW'“¢Âç&ö×BÀ¢&WÇ“¢$æÇ—¦VBf–ÖöGVÆS¢"²ÂæÖöGVÆRÀ¢W6W$–C¢W6W$–BÀ¢W6W$VÖ–Ã¢ÂçW6W$VÖ–ÂÀ¢fö6Å&÷7V7C¢çVÆÀ¢Ò’“°¢&WGW&â&W2æ§6öâ†ÖVB“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFò6VÆV7Bg&öÒ6W&VæVF—DÆöw3¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòfWF6‚6W&Væ†—7F÷'“¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¢òò’6V&6‚†—7F÷'’Æ—7BVæGö–çBv—F‚7G&–7B6V7W&—G’'VÆW0¦ævWB‚"ö’ö’×6V&6‚Ö†—7F÷'’"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢6öç7B²W6W$–BÂVÖ–ÂÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ6–vâÖ–â&WV—&VBâ"Ò“° ¢òò7–æ2g&öÒD"–b†VÇF‡¢–b†—4FF&6T†VÇF‡’’°¢G'’°¢F$•6V&6„†—7F÷'’Òv—BF"ç6VÆV7B‚’æg&öÒ†•6V&6„†—7F÷'’“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRçv&â‚$W'&÷"&VÆöF–ær•÷6V&6…ö†—7F÷'’g&öÒFF&6S¢"ÂW'"æÖW76vR“°¢Ð¢Ð ¢òòf–ÇFW"&6VBöâ&öÆW2…&VÆF–öç6†—öff–6W'26âöæÇ’f–WrF†V—"÷vâ†—7F÷'’¢ÆWBf–ÇFW&VBÒF$•6V&6„†—7F÷'“°¢–b‚—4FÖ–â’°¢f–ÇFW&VBÒF$•6V&6„†—7F÷'’æf–ÇFW"†‚Óâ‚çW6W$–BÓÓÒW6W$–BÇÂ†VÖ–Âbb‚çW6W$VÖ–ÃòçFôÆ÷vW$66R‚’ÓÓÒVÖ–ÂçFôÆ÷vW$66R‚’’“°¢Ð ¢òòÇ’f–ÇFW'2g&öÒVW'’&×0¢6öç7B²W6W"Â6ö×ç’ÂFFRÂÖöFVÂÂv÷&·76RÂÖöGVÆS¢VW'”ÖöGVÆRÒÒ&WçVW'“°¢ ¢–b‡W6W"bb—4FÖ–â’°¢f–ÇFW&VBÒf–ÇFW&VBæf–ÇFW"†‚Óâ‚çW6W$æÖSòçFôÆ÷vW$66R‚’æ–æ6ÇVFW2‚‡W6W"27G&–ær’çFôÆ÷vW$66R‚’’ÇÂ‚çW6W$VÖ–ÃòçFôÆ÷vW$66R‚’æ–æ6ÇVFW2‚‡W6W"27G&–ær’çFôÆ÷vW$66R‚’’“°¢Ð¢–b†6ö×ç’’°¢f–ÇFW&VBÒf–ÇFW&VBæf–ÇFW"†‚Óâ‚æ6ö×ç”æÖSòçFôÆ÷vW$66R‚’æ–æ6ÇVFW2‚†6ö×ç’27G&–ær’çFôÆ÷vW$66R‚’’ÇÂ‚ç6V&6…VW'“òçFôÆ÷vW$66R‚’æ–æ6ÇVFW2‚†6ö×ç’27G&–ær’çFôÆ÷vW$66R‚’’“°¢Ð¢–b†FFR’°¢f–ÇFW&VBÒf–ÇFW&VBæf–ÇFW"†‚Óâ‚çF–ÖW7F×òç7F'G5v—F‚†FFR27G&–ær’“°¢Ð¢–b†ÖöFVÂ’°¢f–ÇFW&VBÒf–ÇFW&VBæf–ÇFW"†‚Óâ‚æÖöFVÅW6VCòçFôÆ÷vW$66R‚’æ–æ6ÇVFW2‚†ÖöFVÂ27G&–ær’çFôÆ÷vW$66R‚’’“°¢Ð¢–b‡v÷&·76R’°¢f–ÇFW&VBÒf–ÇFW&VBæf–ÇFW"†‚Óâ‚çv÷&·76T–BÓÓÒv÷&·76R“°¢Ð¢–b‡VW'”ÖöGVÆR’°¢f–ÇFW&VBÒf–ÇFW&VBæf–ÇFW"†‚Óâ‚ç6V&6…G—SòçFôÆ÷vW$66R‚’ÓÓÒ‡VW'”ÖöGVÆR27G&–ær’çFôÆ÷vW$66R‚’“°¢Ð ¢&W2æ§6öâ†f–ÇFW&VB“°§Ò“° ¢òòFÖ–âõ$òæÇ—F–72F6†&ö&BVæGö–ç@¦ævWB‚"ö’ö’×6V&6‚Ö†—7F÷'’öæÇ—F–72"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢6öç7B²W6W$–BÂVÖ–ÂÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ6–vâÖ–â&WV—&VBâ"Ò“° ¢–b†—4FF&6T†VÇF‡’’°¢G'’°¢F$•6V&6„†—7F÷'’Òv—BF"ç6VÆV7B‚’æg&öÒ†•6V&6„†—7F÷'’“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRçv&â‚$W'&÷"&VÆöF–ær•÷6V&6…ö†—7F÷'’f÷"æÇ—F–73¢"ÂW'"æÖW76vR“°¢Ð¢Ð ¢òòf–ÇFW"&6VBöâ&öÆW2…&VÆF–öç6†—öff–6W'26VRöæÇ’F†V—"÷vâ66÷VBÖWG&–72¢ÆWB66÷TÆöw2ÒF$•6V&6„†—7F÷'“°¢–b‚—4FÖ–â’°¢66÷TÆöw2ÒF$•6V&6„†—7F÷'’æf–ÇFW"†‚Óâ‚çW6W$–BÓÓÒW6W$–BÇÂ†VÖ–Âbb‚çW6W$VÖ–ÃòçFôÆ÷vW$66R‚’ÓÓÒVÖ–ÂçFôÆ÷vW$66R‚’’“°¢Ð ¢òò6ö×WFRæÇ—F–72ÖWG&–70¢6öç7BF÷FÅ6V&6†W2Ò66÷TÆöw2æÆVæwFƒ°¢ ¢6öç7BFöF•7G"ÒæWrFFR‚’çFô•4õ7G&–ær‚’ç7Æ—B‚uBr•³Ó°¢6öç7B6V&6†W5FöF’Ò66÷TÆöw2æf–ÇFW"†‚Óâ‚çF–ÖW7F×òç7F'G5v—F‚‡FöF•7G"’’æÆVæwFƒ° ¢6öç7BvVÖ–æ•&WVW7G2Ò66÷TÆöw2æf–ÇFW"†‚Óâ‚ç6V&6…G—RÓÒtöÆÆò6V&6‚r’æÆVæwFƒ°¢6öç7BöÆÆõ&WVW7G2Ò66÷TÆöw2æf–ÇFW"†‚Óâ‚ç6V&6…G—RÓÓÒtöÆÆò6V&6‚r’æÆVæwFƒ° ¢6öç7BF÷FÅFö¶Vç2Ò66÷TÆöw2ç&VGV6R‚‡7VÒÂ‚’Óâ7VÒ²†‚çFö¶Vç46öç7VÖVBÇÂ’Â“°¢6öç7BfW&vUFö¶Vç2ÒF÷FÅ6V&6†W2âòÖF‚ç&÷VæB‡F÷FÅFö¶Vç2òF÷FÅ6V&6†W2’¢° ¢6öç7BF÷FÄ6÷7BÒ66÷TÆöw2ç&VGV6R‚‡7VÒÂ‚’Óâ7VÒ²†‚æW7F–ÖFVD6÷7BÇÂ’Â“° ¢òòÖ÷7B7F—fRW6W ¢6öç7BW6W$6÷VçG3¢&V6÷&CÇ7G&–ærÂçVÖ&W#âÒ·Ó°¢66÷TÆöw2æf÷$V6‚†‚Óâ°¢–b†‚çW6W$æÖR’°¢W6W$6÷VçG5¶‚çW6W$æÖUÒÒ‡W6W$6÷VçG5¶‚çW6W$æÖUÒÇÂ’²°¢Ð¢Ò“°¢ÆWBÖ÷7D7F—fUW6W"Ò$âô#°¢ÆWBÖ…W6W$6÷VçBÒ°¢ö&¦V7BæVçG&–W2‡W6W$6÷VçG2’æf÷$V6‚‚…¶æÖRÂ6÷VçEÒ’Óâ°¢–b†6÷VçBâÖ…W6W$6÷VçB’°¢Ö…W6W$6÷VçBÒ6÷VçC°¢Ö÷7D7F—fUW6W"ÒæÖS°¢Ð¢Ò“° ¢òòÖ÷7B&W6V&6†VB6ö×ç¢6öç7B6ö×ç”6÷VçG3¢&V6÷&CÇ7G&–ærÂçVÖ&W#âÒ·Ó°¢66÷TÆöw2æf÷$V6‚†‚Óâ°¢–b†‚æ6ö×ç”æÖR’°¢6ö×ç”6÷VçG5¶‚æ6ö×ç”æÖUÒÒ†6ö×ç”6÷VçG5¶‚æ6ö×ç”æÖUÒÇÂ’²°¢Ð¢Ò“°¢ÆWBÖ÷7E&W6V&6†VD6ö×ç’Ò$âô#°¢ÆWBÖ„6ö×ç”6÷VçBÒ°¢ö&¦V7BæVçG&–W2†6ö×ç”6÷VçG2’æf÷$V6‚‚…¶æÖRÂ6÷VçEÒ’Óâ°¢–b†6÷VçBâÖ„6ö×ç”6÷VçB’°¢Ö„6ö×ç”6÷VçBÒ6÷VçC°¢Ö÷7E&W6V&6†VD6ö×ç’ÒæÖS°¢Ð¢Ò“° ¢òòÖ÷7BW6VB6W&VæÖöGVÆP¢6öç7BÖöGVÆT6÷VçG3¢&V6÷&CÇ7G&–ærÂçVÖ&W#âÒ·Ó°¢66÷TÆöw2æf÷$V6‚†‚Óâ°¢–b†‚ç6V&6…G—Rbb‚ç6V&6…G—RÓÒtöÆÆò6V&6‚rbb‚ç6V&6…G—RÓÒt6ö×ç’&W6V&6‚r’°¢ÖöGVÆT6÷VçG5¶‚ç6V&6…G—UÒÒ†ÖöGVÆT6÷VçG5¶‚ç6V&6…G—UÒÇÂ’²°¢Ð¢Ò“°¢ÆWBÖ÷7EW6VE6W&VæÖöGVÆRÒ$âô#°¢ÆWBÖ„ÖöGVÆT6÷VçBÒ°¢ö&¦V7BæVçG&–W2†ÖöGVÆT6÷VçG2’æf÷$V6‚‚…¶ÖöBÂ6÷VçEÒ’Óâ°¢–b†6÷VçBâÖ„ÖöGVÆT6÷VçB’°¢Ö„ÖöGVÆT6÷VçBÒ6÷VçC°¢Ö÷7EW6VE6W&VæÖöGVÆRÒÖöC°¢Ð¢Ò“° ¢&W2æ§6öâ‡°¢F÷FÅ6V&6†W2À¢6V&6†W5FöF’À¢vVÖ–æ•&WVW7G2À¢öÆÆõ&WVW7G2À¢fW&vUFö¶Vç2À¢W7F–ÖFVDÖöçF†Ç”6÷7C¢'6TfÆöB‡F÷FÄ6÷7BçFôf—†VBƒB’’À¢Ö÷7D7F—fUW6W"À¢Ö÷7E&W6V&6†VD6ö×ç’À¢Ö÷7EW6VE6W&VæÖöGVÆP¢Ò“°§Ò“° ¢òò55bW‡÷'BVæGö–ç@¦ævWB‚"ö’ö’×6V&6‚Ö†—7F÷'’öW‡÷'B"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B²W6W$–BÂVÖ–ÂÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’ç6VæB‚$66W72FVæ–VBâ"“° ¢–b†—4FF&6T†VÇF‡’’°¢G'’°¢F$•6V&6„†—7F÷'’Òv—BF"ç6VÆV7B‚’æg&öÒ†•6V&6„†—7F÷'’“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRçv&â‚$W'&÷"&VÆöF–ær†—7F÷'’f÷"W‡÷'C¢"ÂW'"æÖW76vR“°¢Ð¢Ð ¢ÆWBf–ÇFW&VBÒF$•6V&6„†—7F÷'“°¢–b‚—4FÖ–â’°¢f–ÇFW&VBÒF$•6V&6„†—7F÷'’æf–ÇFW"†‚Óâ‚çW6W$–BÓÓÒW6W$–BÇÂ†VÖ–Âbb‚çW6W$VÖ–ÃòçFôÆ÷vW$66R‚’ÓÓÒVÖ–ÂçFôÆ÷vW$66R‚’’“°¢Ð ¢ÆWB77bÒ$”BÅW6W"ÄVÖ–ÂÄ6ö×ç’Å6V&6‚VW'’Å6V&6‚G—RÅF–ÖW7F×ÄÖöFVÂÅFö¶Vç2Ä6÷7B…U4B’Å&W7öç6RF–ÖR†×2’Å7FGW5Æâ#°¢f–ÇFW&VBæf÷$V6‚†‚Óâ°¢6öç7BW62Ò‡fÃ¢ç’’Óâ"Gµ7G&–ær‡fÂÇÂrr’ç&WÆ6R‚ò"örÂr""r—Ò&°¢77b³ÒG¶W62†‚æ–B—ÒÂG¶W62†‚çW6W$æÖR—ÒÂG¶W62†‚çW6W$VÖ–Â—ÒÂG¶W62†‚æ6ö×ç”æÖR—ÒÂG¶W62†‚ç6V&6…VW'’—ÒÂG¶W62†‚ç6V&6…G—R—ÒÂG¶W62†‚çF–ÖW7F×—ÒÂG¶W62†‚æÖöFVÅW6VB—ÒÂG¶‚çFö¶Vç46öç7VÖVGÒÂG¶‚æW7F–ÖFVD6÷7GÒÂG¶‚ç&W7öç6UF–ÖWÒÂG¶W62†‚ç7FGW2—ÕÆæ°¢Ò“° ¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â'FW‡Bö77b"“°¢&W2ç6WD†VFW"‚$6öçFVçBÔF—7÷6—F–öâ"ÂGF6†ÖVçC²f–ÆVæÖSÕ44Õô•õ6V&6…ô†—7F÷'•òG´FFRææ÷r‚—Òæ77f“°¢&W2ç7FGW2ƒ#’ç6VæB†77b“°§Ò“° ¦ævWB‚"ö’÷6fVB×6W76–öç2"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢6öç7B²W6W$–BÂVÖ–ÂÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ6–vâÖ–â&WV—&VBâ"Ò“° ¢G'’°¢ÆWBÆ—7C°¢–b†—4FÖ–â’°¢Æ—7BÒv—BF"ç6VÆV7B‚’æg&öÒ‡6fVE6W76–öç2“°¢ÒVÇ6R°¢Æ—7BÒv—BF"ç6VÆV7B‚’æg&öÒ‡6fVE6W76–öç2’çv†W&R€¢7ÆG·6fVE6W76–öç2çW6W$–GÒÒG·W6W$–GÒõ"ÄõtU"‚G·6fVE6W76–öç2çW6W$VÖ–ÇÒ’ÒG¶VÖ–ÂçFôÆ÷vW$66R‚—Ö ¢“°¢Ð¢&WGW&â&W2æ§6öâ†Æ—7B“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFòVW'’6fVB6W76–öç2g&öÒD#¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòÆöB6fVB6W76–öç3¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¦ç÷7B‚"ö’÷6fVB×6W76–öç2"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢6öç7B²W6W$–BÂVÖ–ÂÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ6–vâÖ–â&WV—&VBâ"Ò“° ¢6öç7B²F—FÆRÂG—RÂF&vWD6ö×ç’ÂW6W$–çWBÂ6öçFVçBÂ&öGV7E66÷&–ærÂæ÷FW2ÒÒ&Wæ&öG“°¢–b‚F—FÆRÇÂF&vWD6ö×ç’’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢%F—FÆRæBF&vWB6ö×ç’&R&WV—&VBâ"Ò“°¢Ð ¢6öç7BæWu6W76–öâÒ°¢–C¢6W76–öâÒG´FFRææ÷r‚—ÖÀ¢W6W$–BÀ¢W6W$VÖ–Ã¢VÖ–ÂÇÂ'Væ¶æ÷vä66Ö6—FÆæræ6öÒ"À¢F—FÆRÀ¢G—S¢G—RÇÂ%&W6V&6‚F÷76–W""À¢F&vWD6ö×ç’À¢W6W$–çWC¢W6W$–çWBÇÂ""À¢6öçFVçC¢6öçFVçBÇÂ""À¢&öGV7E66÷&–æs¢&öGV7E66÷&–ærÇÂ·ÒÀ¢7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢æ÷FW3¢æ÷FW2ÇÂ" ¢Ó° ¢G'’°¢v—BF"æ–ç6W'B‡6fVE6W76–öç2’çfÇVW2†æWu6W76–öâ“°¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ†æWu6W76–öâ“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFò6fR6W76–öâ–âD#¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFò6fR6W76–öã¢"²W'"æÖW76vRÒ“°¢Ð§Ò“° ¦æFVÆWFR‚"ö’÷6fVB×6W76–öç2ó¦–B"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢6öç7B²W6W$–BÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ6–vâÖ–â&WV—&VBâ"Ò“° ¢6öç7B²–BÒÒ&Wç&×3° ¢G'’°¢6öç7B6W76–öäfWF6†VBÒv—BF"ç6VÆV7B‚’æg&öÒ‡6fVE6W76–öç2’çv†W&R†W‡6fVE6W76–öç2æ–BÂ–B’“°¢6öç7B6W76–öäö&¢Ò6W76–öäfWF6†VE³Ó°¢–b‚6W76–öäö&¢’°¢&WGW&â&W2ç7FGW2ƒCB’æ§6öâ‡²W'&÷#¢%6fVB6W76–öâæ÷Bf÷VæBâ"Ò“°¢Ð ¢–b‚—4FÖ–âbb6W76–öäö&¢çW6W$–BÓÒW6W$–B’°¢&WGW&â&W2ç7FGW2ƒC2’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ–÷R6âöæÇ’FVÆWFR–÷W"÷vâ6fVB6W76–öç2â"Ò“°¢Ð ¢v—BF"æFVÆWFR‡6fVE6W76–öç2’çv†W&R†W‡6fVE6W76–öç2æ–BÂ–B’“°¢&WGW&â&W2æ§6öâ‡²7V66W73¢G'VRÒ“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFòFVÆWFR6W76–öâg&öÒD#¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòFVÆWFR6W76–öã¢"²W'"æÖW76vRÒ“°¢Ð§Ò“°  ¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¢òòU%4ôäÄ•¤TBõUE$T4‚Tät”äP¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¦ç÷7B‚"ö’övVÖ–æ’ö÷WG&V6‚"Â7–æ2‡&WÂ&W2’Óâ°¢6öç7B7F'D×2ÒFFRææ÷r‚“°¢6öç7B²G—RÂ6ö×ç”æÖRÂ–æGW7G'’ÂW†V7WF—fTæÖRÂ÷6—F–öâÂ&–÷&—G’ÒÒ&Wæ&öG“°¢–b‚6ö×ç”æÖRÇÂW†V7WF—fTæÖR’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$6ö×ç’æÖRæBW†V7WF—fRæÖR&R&WV—&VBâ"Ò“°¢Ð ¢6öç7B—F6…F†VÖRÒG—RÓÓÒ&Æ—FW&7’" ¢ò$7W7FöÖ—¦VB44Ò6÷'÷&FRf–ææ6–ÂÆ—FW&7’6VÖ–æ'2f÷"7FfbvVÇF‚V×÷vW&ÖVçB ¢¢G—RÓÓÒ&ÖVWF–ær ¢ò%44Ò6÷'÷&FR6†÷'B×FW&Ò66‚Æ6VÖVçG2æB6öÖÖW&6–ÂW"––VÆB÷F–Ö—¦F–öâ ¢¢%44ÒvVÇF‚Gf—6÷"&—fFRG'W7BF—67&WF–öæ'’7G'V7GW&W2f÷"2×7V—FRF—&V7F÷'2#° ¢6öç7B6öçFW‡E&ö×BÒw&—FR&öfW76–öæÂÂ†–v†Ç’W'7V6—fRÂ7W7FöÖ—¦VB'W6–æW72÷WG&V6‚VÖ–Âg&öÒ44Ò6—FÂÖ&¶WG2w&÷WFó ¤W†V7WF—fRæÖS¢G¶W†V7WF—fTæÖWÐ¥÷6—F–öã¢G·÷6—F–öâÇÂtW†V7WF—fRÆVFW"wÐ¤F—f—6–öã¢G¶6ö×ç”æÖWÒ‚G¶–æGW7G'’ÇÂt6÷'÷&FR6V7F÷"wÒ¤÷WG&V6‚vöÃ¢G·—F6…F†VÖWÐ¥&–÷&—G’&æ³¢G·&–÷&—G’ÇÂtÖVF—VÒwÐ ¥F†RFöæR×W7B&RVÆ—FRÂf÷&ÖÂÂ&W7V7FgVÂöbæ–vW&–â6÷'÷&FRWF—VWGFRÂæB6—FR7V6–f–2†–v‚×––VÆB&VæVf—G3¢44Òw2W‡W'B4T2×&VwVÆFVB÷'FföÆ–ò––VÆG2ÂB³Æ—V–F—G’6WGFÆVÖVçBÂæB÷W"†—7F÷'’öbG&—f–ær7G'V7GW&Â7&VF—B–×&÷fVÖVçG2âFG&W72G¶W†V7WF—fTæÖWÒF—&V7FÇ’â&÷f–FRöÆ—FRÂ6ÆV"6ÆÂ×FòÖ7F–öâf÷"RÖÖ–çWFR–çG&öGV7F÷'’f—'GVÂ'&–Vf66R6W76–öâ÷"–â×W'6öâ'&–Vf–æræ° ¢–b†”6Æ–VçB’°¢G'’°¢6öç7B&W7öç6RÒv—B&ö'W7DvVæW&FT6öçFVçB‡°¢ÖöFVÃ¢&vVÖ–æ’Ó2ãRÖfÆ6‚"À¢6öçFVçG3¢6öçFW‡E&ö×BÀ¢Ò“°¢6öç7B&W7VÇDVÖ–ÂÒ&W7öç6RçFW‡BÇÂ"#°¢–b‡&W7VÇDVÖ–Â’°¢6öç7BVÆ6VD×2ÒFFRææ÷r‚’Ò7F'D×3°¢v—BÆöt”–çFW&7F–öâ‡&WÂ°¢6V&6…VW'“¢÷WG&V6‚VÖ–Âf÷"G¶W†V7WF—fTæÖWÒ‚G·÷6—F–öçÒ’BG¶6ö×ç”æÖWÖÀ¢6V&6…G—S¢$VÖ–ÂvVæW&F–öâ"À¢6ö×ç”æÖS¢6ö×ç”æÖRÀ¢ÖöFVÅW6VC¢&vVÖ–æ’Ó2ãRÖfÆ6‚"À¢Fö¶Vç46öç7VÖVC¢SÀ¢&W7öç6UF–ÖS¢VÆ6VD×2À¢7FGW3¢%7V66W72"À¢6V&6…&W7VÇC¢&W7VÇDVÖ–ÂçG&–Ò‚¢Ò“° ¢&WGW&â&W2æ§6öâ‡²VÖ–Ã¢&W7VÇDVÖ–ÂçG&–Ò‚’Ò“°¢Ð¢Ò6F6‚†W'"’°¢6öç6öÆRæW'&÷"‚$vVÖ–æ’÷WG&V6‚FööÂf–ÆVBÂ'Vææ–ær6–×VÆFVB6öçFVçBvVæW&F–öã¢"ÂW'"“°¢Ð¢Ð ¢òò6ÆVâfÆÆ&6²VÖ–À¢ÆWBvVæW&FVDVÖ–ÂÒ7V&¦V7C¢44Ò6—FÃ¢6öÆÆ&÷&F—fRG&V7W'’Æ6VÖVçG2b6÷'÷&FRvVÇF‚'&–Vf–æw2f÷"G¶6ö×ç”æÖWÐ ¤FV"G¶W†V7WF—fTæÖWÒÀ ¤’†÷RF†—2ÖW76vRf–æG2–÷RvVÆÂâ  ¤2F†RG·÷6—F–öâÇÂtW†V7WF—fRÆVFW"wÒöbG¶6ö×ç”æÖWÒÂ–÷R&RVæF÷V'FVFÇ’Öæv–ær6ö×ÆW‚6—FÂ÷W&F–ær7–6ÆW2æBÆöö¶–ærFò&÷FV7B6†÷'B×FW&Ò6÷'÷&FR&Ææ6W2g&öÒFöÖW7F–2–æfÆF–öâfV7F÷'2v†–ÆR&WF–æ–ær'6öÇWFR6V7W&—G’à ¤’Òw&—F–ærFò–÷Röâ&V†Æböb44Ò6—FÂÂ&VÖ–W"–çfW7FÖVçB&æ²æB4T2×&VwVÆFVB76WG2ÖævW"–âæ–vW&–âvR†fRFW6–væVB7W7FöÖ—¦VBÖöæW’Ö&¶WBæBG&V7W'’÷F–Ö—¦F–öâÆFf÷&×2F†B7W÷'BB³6WGFÆVÖVçG2Âv—f–ær–÷R7FæF&B÷fW&æ–v‡BfÆW†–&–Æ—G’v†–ÆR––VÆF–ær6–væ–f–6çFÇ’7WW&–÷"&—6²ÖF§W7FVB&WGW&ç2&VÆF—fRFò6öÖÖW&6–Â&æ·2rFVfVÇBFW÷6—G2à ¥7V6–f–6ÆÇ’ÂvR6â†VÇG¶6ö×ç”æÖWÒöã £â44Ò6÷'÷&FRÖöæW’Ö&¶WBgVæB÷F–öç2f÷"6V6öæÂ66‚'VffW"&W6W'fW2à£"â&W7ö¶R†–v‚×––VÆB6öÖÖW&6–ÂW"Æ6VÖVçBÆÆö6F–öç2à£2â6ö×Æ–ÖVçF'’Â'&æFVB$6÷'÷&FRf–ææ6–ÂÆ—FW&7’'&–Vf–æw2"f÷"–÷W"‡VÖâ6—FÂ6ö÷W&F—fRFòG&—fR7—7FVÖF–2Ö–7&òÖ–çfW7FÖVçB&öw&×2à ¥v÷VÆB–÷R&R÷VâFò'&–VbRÖÖ–çWFR'&–Vf–ær÷"6†÷'Bf—'GVÂ6ÆÂF†—2F‡W'6F’B£Òv—F‚÷W"&VÆF–öç6†—F—&V7F÷"Fò&Wf–Wr÷W"6W'F–f–VBW&f÷&Öæ6RG&6¶W'3ð ¥v&Ò&Vv&G2À ¥44Ò6—FÂÖ&¶WG2w&÷W ¤Æv÷2Âæ–vW&–§wwrç66Ö6—FÂæ6öÒææv° ¢òòÆörF†—2öffÆ–æRVÖ–ÂvVæW&F–öà¢6öç7BVÆ6VD×2ÒFFRææ÷r‚’Ò7F'D×3°¢v—BÆöt”–çFW&7F–öâ‡&WÂ°¢6V&6…VW'“¢÷WG&V6‚VÖ–Âf÷"G¶W†V7WF—fTæÖWÒ‚G·÷6—F–öçÒ’BG¶6ö×ç”æÖWÖÀ¢6V&6…G—S¢$VÖ–ÂvVæW&F–öâ"À¢6ö×ç”æÖS¢6ö×ç”æÖRÀ¢ÖöFVÅW6VC¢$öffÆ–æRfÆÆ&6²vVæW&F÷""À¢Fö¶Vç46öç7VÖVC¢À¢&W7öç6UF–ÖS¢VÆ6VD×2À¢7FGW3¢%7V66W72"À¢6V&6…&W7VÇC¢vVæW&FVDVÖ–ÂçG&–Ò‚¢Ò“° ¢òòWFò×&öÖ÷FRÖF6†VB&÷7V7B7FGW2Fò&÷÷6Â6VçBöâ&÷÷6ÂvVæW&FV@¢–b†6ö×ç”æÖR’°¢G'’°¢6öç7BÆÅÒv—BvWE&÷7V7G4f÷%W6W"‡&W“°¢6öç7BÖF6†VEÒÆÅæf–æB‡Óâ ¢ææÖRçFôÆ÷vW$66R‚’ÓÓÒ6ö×ç”æÖRçFôÆ÷vW$66R‚’ÇÂ ¢ææÖRçFôÆ÷vW$66R‚’æ–æ6ÇVFW2†6ö×ç”æÖRçFôÆ÷vW$66R‚’’ÇÂ ¢6ö×ç”æÖRçFôÆ÷vW$66R‚’æ–æ6ÇVFW2‡ææÖRçFôÆ÷vW$66R‚’¢“°¢–b†ÖF6†VEbb²tÆVBrÂuVÆ–f–VBrÂtÖVWF–ær66†VGVÆVBrÂt6öçF7FVBuÒæ–æ6ÇVFW2†ÖF6†VEç7FGW2’’°¢6öç7BöÆE7FGW2ÒÖF6†VEç7FGW3°¢6öç7BWFFVDE7G"ÒæWrFFR‚’çFô•4õ7G&–ær‚“°¢v—BF"çWFFR‡&÷7V7G2’ç6WB‡²7FGW3¢u&÷÷6Â6VçBrÂWFFVDC¢WFFVDE7G"Ò’çv†W&R†W‡&÷7V7G2æ–BÂÖF6†VEæ–B’“°¢ ¢v—B7&VFTæ÷F–f–6F–öâ€¢$FVÂÖ÷fVB7FvR"À¢FVÂÖ÷fVB7FvS¢G¶ÖF6†VEææÖWÖÀ¢†–v‚×––VÆB6÷'÷&FR÷WG&V6‚&÷÷6Âv27V66W76gVÆÇ’7–çF†W6—¦VBf÷""G¶ÖF6†VEææÖWÒ"â7FvRWFöÖF–6ÆÇ’Gfæ6VBg&öÒ"G¶öÆE7FGW7Ò"Fò%&÷÷6Â6VçB"æÀ¢$÷÷'GVæ—G’"À¢ÖF6†VEæ76–væVDöff–6W$–BÇÂVæFVf–æV@¢“°¢Ð¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRçv&â‚%µ44Ò$õUDõÒWFFRD"f–ÆVC¢"ÂW'"“°¢Ð¢Ð ¢&W2æ§6öâ‡²VÖ–Ã¢vVæW&FVDVÖ–ÂÒ“°§Ò“°  ¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¢òò”âÔäõD”d”4D”ôâ5•5DTÒ…„4RBb„4Rr¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ ¦–çFW&f6R–äæ÷F–f–6F–öâ°¢–C¢7G&–æs°¢æ÷F–f–6F–öä–Có¢7G&–æs°¢W6W$–Có¢7G&–æs°¢G—S¢7G&–æs°¢F—FÆS¢7G&–æs°¢ÖW76vS¢7G&–æs°¢FW67&—F–öãó¢7G&–æs°¢F–ÖW7F×¢7G&–æs°¢7&VFVDCó¢7G&–æs°¢—5&VC¢&ööÆVã°¢&VE7FGW3ó¢w&VBrÂwVç&VBs°¢6FVv÷'“¢tÖVWF–ærrÂuF6²rÂt76–væÖVçBrÂt&÷fÂrÂt÷÷'GVæ—G’rÂ7G&–æs°¢&–÷&—G“¢t†–v‚rÂtÖVF—VÒrÂtÆ÷rrÂ7G&–æs°¢&VÆFVDVçF—G”–Có¢7G&–æs°¢—4ÆVv7“ó¢&ööÆVã°§Ð ¦7–æ2gVæ7F–öâ7&VFTæ÷F–f–6F–öâ€¢G—S¢tÖVWF–ær&VÖ–æFW"rÂtÖVWF–ær&W66†VGVÆVBrÂtæWrF6²76–væVBrÂuF6²÷fW&GVRrÂtæWr&÷7V7B76–væVBFòW6W"rÂuW6W"&÷fÂ&WVW7BrÂuW6W"&÷fVBrÂuW6W"&V¦V7FVBrÂtFVÂÖ÷fVB7FvRrÂu&÷÷6Â&÷fVBrÂu&÷÷6Â&V¦V7FVBrÂ7G&–ærÀ¢F—FÆS¢7G&–ærÀ¢ÖW76vS¢7G&–ærÀ¢6FVv÷'”÷fW'&–FSó¢tÖVWF–ærrÂuF6²rÂt76–væÖVçBrÂt&÷fÂrÂt÷÷'GVæ—G’rÀ¢F&vWEW6W$–Có¢7G&–æp¢’°¢6öç7B&÷fVEG—W2Ò°¢tÖVWF–ær&VÖ–æFW"rÀ¢tÖVWF–ær&W66†VGVÆVBrÀ¢tæWrF6²76–væVBrÀ¢uF6²÷fW&GVRrÀ¢tæWr&÷7V7B76–væVBFòW6W"rÀ¢uW6W"&÷fÂ&WVW7BrÀ¢uW6W"&÷fVBrÀ¢uW6W"&V¦V7FVBrÀ¢tFVÂÖ÷fVB7FvRrÀ¢u&÷÷6Â&÷fVBrÀ¢u&÷÷6Â&V¦V7FVBrÀ¢uvVV¶Ç’&W÷'BGVRrÀ¢uF6²7&VFVBrÀ¢uF6²76–væVBrÀ¢uF6²WFFVBrÀ¢uF6²6ö×ÆWFVBrÀ¢tÖVWF–ær66†VGVÆVBrÀ¢tÖVWF–ærWFFVBrÀ¢tÖVWF–ær6æ6VÆÆVBrÀ¢tföÆÆ÷r×W7&VFVBrÀ¢tföÆÆ÷r×WGVRrÀ¢u&÷7V7B76–væVBrÀ¢u&÷7V7BWFFVBrÀ¢u&VÖ–æFW"G&–vvW&VBrÀ¢uvVV¶Ç’&W÷'B7V&Ö—GFVBrÀ¢uvVV¶Ç’&W÷'B&÷fVBrÀ¢u7—7FVÒææ÷Væ6VÖVçBp¢Ó° ¢òò6V7W&VÇ’Væf÷&6S¢6öæf—&ÒöæÇ’&÷fVBWfVçG27&VFRæ÷F–f–6F–öç2à¢–b‚&÷fVEG—W2æ–æ6ÇVFW2‡G—R’’°¢6öç6öÆRæÆör†´ÄU%BÄôr5•5DTÕÒ&WfVçFVBvVæW&F–öâöbVæ&÷fVBöæö—7’WfVçBöbG—S¢"G·G—WÒ&“°¢&WGW&âçVÆÃ°¢Ð ¢òòFWFW&Ö–æR6FVv÷'’&6VBöâG—P¢ÆWB6FVv÷'“¢tÖVWF–ærrÂuF6²rÂt76–væÖVçBrÂt&÷fÂrÂt÷÷'GVæ—G’rÂ7G&–ærÒt÷÷'GVæ—G’s°¢–b‡G—RÓÓÒtÖVWF–ær&VÖ–æFW"rÇÂG—RÓÓÒtÖVWF–ær&W66†VGVÆVBrÇÂG—RÓÓÒtÖVWF–ær66†VGVÆVBrÇÂG—RÓÓÒtÖVWF–ærWFFVBrÇÂG—RÓÓÒtÖVWF–ær6æ6VÆÆVBrÇÂG—RÓÓÒu&VÖ–æFW"G&–vvW&VBr’°¢6FVv÷'’ÒtÖVWF–ærs°¢ÒVÇ6R–b‡G—RÓÓÒtæWrF6²76–væVBrÇÂG—RÓÓÒuF6²÷fW&GVRrÇÂG—RÓÓÒuF6²7&VFVBrÇÂG—RÓÓÒuF6²76–væVBrÇÂG—RÓÓÒuF6²WFFVBrÇÂG—RÓÓÒuF6²6ö×ÆWFVBrÇÂG—RÓÓÒtföÆÆ÷r×W7&VFVBrÇÂG—RÓÓÒtföÆÆ÷r×WGVRr’°¢6FVv÷'’ÒuF6²s°¢ÒVÇ6R–b‡G—RÓÓÒtæWr&÷7V7B76–væVBFòW6W"rÇÂG—RÓÓÒu&÷7V7B76–væVBrÇÂG—RÓÓÒu&÷7V7BWFFVBr’°¢6FVv÷'’Òt76–væÖVçBs°¢ÒVÇ6R–b‡G—RÓÓÒuW6W"&÷fÂ&WVW7BrÇÂG—RÓÓÒuW6W"&÷fVBrÇÂG—RÓÓÒuW6W"&V¦V7FVBrÇÂG—RÓÓÒuvVV¶Ç’&W÷'BGVRrÇÂG—RÓÓÒuvVV¶Ç’&W÷'B7V&Ö—GFVBrÇÂG—RÓÓÒuvVV¶Ç’&W÷'B&÷fVBr’°¢6FVv÷'’Òt&÷fÂs°¢ÒVÇ6R–b‡G—RÓÓÒtFVÂÖ÷fVB7FvRrÇÂG—RÓÓÒu&÷÷6Â&÷fVBrÇÂG—RÓÓÒu&÷÷6Â&V¦V7FVBrÇÂG—RÓÓÒu7—7FVÒææ÷Væ6VÖVçBr’°¢6FVv÷'’Òt÷÷'GVæ—G’s°¢Ð ¢–b†6FVv÷'”÷fW'&–FR’°¢6FVv÷'’Ò6FVv÷'”÷fW'&–FS°¢Ð ¢òòFWFW&Ö–æR&–÷&—G’„FVÂæB&÷÷6ÂWfVçG2&RÖVF—VÒÂ÷F†W'2&R†–v‚¢6öç7B&–÷&—G“¢t†–v‚rÂtÖVF—VÒrÂtÆ÷rrÂ7G&–ærÒ†6FVv÷'’ÓÓÒt÷÷'GVæ—G’r’òtÖVF—VÒr¢t†–v‚s° ¢6öç7BvVæW&FVD–BÒæ÷F–bÒG´FFRææ÷r‚—ÒÒG´ÖF‚æfÆö÷"„ÖF‚ç&æFöÒ‚’¢—Ö° ¢6öç7BæWtæ÷F–c¢ç’Ò°¢–C¢vVæW&FVD–BÀ¢W6W$–C¢F&vWEW6W$–BÇÂçVÆÂÀ¢G—RÀ¢F—FÆRÀ¢ÖW76vRÀ¢F–ÖW7F×¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢—5&VC¢fÇ6RÀ¢6FVv÷'’À¢&–÷&—G’À¢—4ÆVv7“¢fÇ6RÀ¢7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢&VE7FGW3¢'Vç&VB"À¢Ó° ¢G'’°¢v—BF"æ–ç6W'B†æ÷F–f–6F–öç2’çfÇVW2†æWtæ÷F–b“°¢òòG&–vvW"&VÂ×F–ÖR&öw&W76—fRW6‚FVÆ—fW'’7–æ6‡&öæ÷W6Ç’7&÷726†ææVÇ2„'&÷w6W"ÂvV%f–WrÂæG&ö–B¢6öç7BW6…–ÆöBÒ°¢–C¢vVæW&FVD–BÀ¢F—FÆRÀ¢ÖW76vRÀ¢6FVv÷'’À¢&–÷&—G’À¢F–ÖW7F×¢æWtæ÷F–bçF–ÖW7F×À¢Ó°¢6VæEW6„æ÷F–f–6F–öâ‡F&vWEW6W$–BÇÂçVÆÂÂW6…–ÆöB’æ6F6‚†W'"Óâ°¢6öç6öÆRæW'&÷"‚%µU4‚Tät”äRU%$õ%Ò7–æ6‡&öæ÷W2W6‚æ÷F–f–6F–öâFVÆ—fW'’f–ÆVC¢"ÂW'"“°¢Ò“° ¢òòG&–vvW"öæU6–væÂæF—fRW6‚æ÷F–f–6F–öâ7–æ6‡&öæ÷W6Ç’f÷"æG&ö–BòvV%f–WrF&vWG0¢6VæDöæU6–væÅW6‚‡F&vWEW6W$–BÇÂçVÆÂÂF—FÆRÂÖW76vR’æ6F6‚†W'"Óâ°¢6öç6öÆRæW'&÷"‚%´ôäU4”täÂTät”äRU%$õ%Ò7–æ6‡&öæ÷W2öæU6–væÂW6‚æ÷F–f–6F–öâF—7F6‚f–ÆVC¢"ÂW'"“°¢Ò“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒf–ÆVBFò6fRæ÷F–f–6F–öâ–âD#¢"ÂW'"æÖW76vR“°¢Ð ¢&WGW&â°¢ââææWtæ÷F–bÀ¢æ÷F–f–6F–öä–C¢vVæW&FVD–BÀ¢FW67&—F–öã¢ÖW76vP¢Ó°§Ð ¦ævWB‚"ö’öæ÷F–f–6F–öç2"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢6öç7B7F'EF–ÖRÒFFRææ÷r‚“°¢6öç7B²W6W$–BÂ&öÆRÂVÖ–ÂÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“° ¢G'’°¢–b‚W6W$–B’°¢6öç6öÆRæÆör†µ44ÒäõD”d”4D”ôâÄôuÒ²G¶æWrFFR‚’çFô•4õ7G&–ær‚—ÕÒæòW6W$–B&÷f–FVBâ&WGW&æ–ærV×G’'&’æ“°¢&WGW&â&W2æ§6öâ…µÒ“°¢Ð ¢ÆWBF$æ÷F–g2ÒµÓ°¢G'’°¢F$æ÷F–g2Òv—BF"ç6VÆV7B‚’æg&öÒ†æ÷F–f–6F–öç2“°¢Ò6F6‚†F$W'#¢ç’’°¢F$æ÷F–g2ÒµÓ°¢Ð ¢6öç7Bæ÷uF–ÖRÒFFRææ÷r‚“°¢f÷"†6öç7BâöbF$æ÷F–g2’°¢–b‚â’6öçF–çVS°¢–b†âæ6FVv÷'’ÓÓÒ$ÖVWF–ær"ÇÂâçG—Sòæ–æ6ÇVFW2‚$ÖVWF–ær"’’°¢òòW‡—&VBÖVWF–æröWfVçB6†V6³¢–bÖVWF–æræ÷F–f–6F–öâ—2öÆFW"F†âB†÷W'2ÂÖ&²&V@¢ÆWBF–ÖW7F×fÂÒ°¢G'’°¢F–ÖW7F×fÂÒæWrFFR†âçF–ÖW7F×ÇÂâæ7&VFVDBÇÂrr’ævWEF–ÖR‚“°¢Ò6F6‚†R’°¢F–ÖW7F×fÂÒæã°¢Ð ¢–b‚—4æâ‡F–ÖW7F×fÂ’’°¢6öç7BVÆ6VBÒæ÷uF–ÖRÒF–ÖW7F×fÃ°¢–b†VÆ6VBâB¢3cbbâæ—5&VB’°¢âæ—5&VBÒG'VS°¢âç&VE7FGW2Ò'&VB#°¢G'’°¢v—BF"çWFFR†æ÷F–f–6F–öç2’ç6WB‡²—5&VC¢G'VRÂ&VE7FGW3¢'&VB"Ò’çv†W&R†W†æ÷F–f–6F–öç2æ–BÂâæ–B’“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒDD$4UÒWFòÖ&6†—fRÖVWF–æræ÷F–f–6F–öâW'&÷#¢"ÂW'"æÖW76vR“°¢Ð¢Ð¢Ð¢Ð¢Ð ¢òò6V7W&VÇ’f–ÇFW"&6VBöâW6W"Ö—6öÆF–öâ'VÆW0¢6öç7Bf–ÇFW&VBÒ†F$æ÷F–g2ÇÂµÒ’æf–ÇFW"†âÓâ°¢–b‚â’&WGW&âfÇ6S°¢ ¢òò'VÆR¢7W7FöÒ76–væVBæ÷F–f–6F–öà¢–b†âçW6W$–BbbâçW6W$–BÓÓÒW6W$–B’°¢&WGW&âG'VS°¢Ð ¢òò'VÆR#¢Væ76–væVB÷"&VÆöFVBÆVv7’æ÷F–f–6F–öç0¢–b‚âçW6W$–BÇÂâæ—4ÆVv7’’°¢–b†—4FÖ–â’°¢òòFÖ–ç2Ö’f–WrÆFf÷&ÒFÖ–æ—7G&F—fRÆW'G2Â&÷fÇ2÷"F†V—"÷vâÆVv7’öæW0¢–b†âæ6FVv÷'’ÓÓÒ$&÷fÂ"ÇÂâæ6FVv÷'’ÓÓÒ$76–væÖVçB"ÇÂâæ6FVv÷'’ÓÓÒ$÷÷'GVæ—G’"ÇÂâæ—4ÆVv7’’°¢&WGW&âG'VS°¢Ð¢Ð¢òò&VÆF–öç6†—öff–6W'2FòäõB6VRÆVv7’†—7F÷&–6Â7—7FVÒWfVçG0¢&WGW&âfÇ6S°¢Ð ¢&WGW&âfÇ6S°¢Ò“° ¢6öç7BÖVBÒf–ÇFW&VBæÖ†âÓâ°¢–b‚â’&WGW&âçVÆÃ°¢&WGW&â°¢ââæâÀ¢–C¢âæ–BÀ¢æ÷F–f–6F–öä–C¢âæ–BÀ¢W6W$–C¢âçW6W$–BÇÂçVÆÂÀ¢G—S¢âçG—RÇÂu7—7FVÒrÀ¢F—FÆS¢âçF—FÆRÇÂtæ÷F–f–6F–öârÀ¢ÖW76vS¢âæÖW76vRÇÂrrÀ¢FW67&—F–öã¢âæÖW76vRÇÂrrÀ¢F–ÖW7F×¢âçF–ÖW7F×ÇÂæWrFFR‚’çFô•4õ7G&–ær‚’À¢—5&VC¢âæ—5&VBÀ¢6FVv÷'“¢âæ6FVv÷'’ÇÂu7—7FVÒrÀ¢&–÷&—G“¢âç&–÷&—G’ÇÂtæ÷&ÖÂrÀ¢—4ÆVv7“¢âæ—4ÆVv7’À¢7&VFVDC¢âæ7&VFVDBÇÂçVÆÂÀ¢&VE7FGW3¢âç&VE7FGW2ÇÂwVç&VBp¢Ó°¢Ò’æf–ÇFW"„&ööÆVâ“° ¢òò6÷'BæWvW7Bf—'7@¢ÖVBç6÷'B‚†¢ç’Â#¢ç’’Óâ°¢6öç7BF–ÖTÒæWrFFR†çF–ÖW7F×ÇÂæ7&VFVDBÇÂ’ævWEF–ÖR‚“°¢6öç7BF–ÖT"ÒæWrFFR†"çF–ÖW7F×ÇÂ"æ7&VFVDBÇÂ’ævWEF–ÖR‚“°¢&WGW&âF–ÖT"ÒF–ÖT°¢Ò“° ¢6öç7B&W7öç6UF–ÖRÒFFRææ÷r‚’Ò7F'EF–ÖS°¢6öç6öÆRæÆör†µ44ÒäõD”d”4D”ôâÄôuÒ²G¶æWrFFR‚’çFô•4õ7G&–ær‚—ÕÒW6W$–CÒG·W6W$–GÒ&öÆSÒG·&öÆWÒ&÷WFSÒö’öæ÷F–f–6F–öç2&W7öç6UF–ÖSÒG·&W7öç6UF–ÖWÖ×27FGW3Ó#“° ¢&WGW&â&W2æ§6öâ†ÖVB“°¢Ò6F6‚†W'#¢ç’’°¢6öç7B&W7öç6UF–ÖRÒFFRææ÷r‚’Ò7F'EF–ÖS°¢6öç6öÆRæW'&÷"†µ44ÒäõD”d”4D”ôâ5$•D”4ÂU%$õ%Ò²G¶æWrFFR‚’çFô•4õ7G&–ær‚—ÕÒW6W$–CÒG·W6W$–BÇÂvæöç–Ö÷W2wÒ&öÆSÒG·&öÆRÇÂvæöæRwÒ&÷WFSÒö’öæ÷F–f–6F–öç2&W7öç6UF–ÖSÒG·&W7öç6UF–ÖWÖ×27FGW3Ó#†fÆÆ&6²’W'&÷#¦ÂW'"æÖW76vRÇÂW'"“°¢òòÇv—2&WGW&â#ô²v—F‚µÒ–ç7FVBöb7&6†–æp¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ…µÒ“°¢Ð§Ò“° ¢òò6–×VÆF–öâVæGö–ç@¦ç÷7B‚"ö’öæ÷F–f–6F–öç2÷6–×VÆFR"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢G'’°¢6öç7B²W6W$–C¢&WW6W$–BÂ&öÆRÂVÖ–ÂÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢6öç7B—57WW$FÖ–âÒVÖ–ÂÓÓÒwv—6FöÒæö¶ö„66Ö6—FÆæræ6öÒrÇÂ ¢VÖ–ÂÓÓÒvöÖöÆöÇRæ¦VF—&ä66Ö6—FÆæræ6öÒs°¢6öç7B—57—7FVÔFÖ–âÒ—57WW$FÖ–âÇÂ ¢&öÆRÓÓÒtFÖ–ârÇÂ ¢&öÆRÓÓÒu5UU%ôDÔ”ârÇÂ ¢&öÆRÓÓÒtFÖ–æ—7G&F÷"rÇÂ ¢—4FÖ–ã° ¢–b‚&WW6W$–BÇÂ—57—7FVÔFÖ–â’°¢&WGW&â&W2ç7FGW2ƒC2’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ44ÒVçFW'&—6RÆW'B6–×VÆF–öâ—2&W6W'fVB7G&–7FÇ’f÷"7—7FVÒFÖ–æ—7G&F÷'2â"Ò“°¢Ð ¢6öç7B²G—RÂW6W$–BÒÒ&Wæ&öG“°¢–b‚G—R’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$æ÷F–f–6F–öâG—R—2&WV—&VBFò6–×VÆFRâ"Ò“°¢Ð ¢ÆWBF—FÆRÒ"#°¢ÆWBÖW76vRÒ"#° ¢7v—F6‚‡G—R’°¢66R$ÖVWF–ær&VÖ–æFW"# ¢F—FÆRÒ%4T2G&V7W'’'&–Vf–ær&VÖ–æFW"#°¢ÖW76vRÒ%&VÖ–æFW#¢–÷W"2×7V—FRÖVWF–ærv—F‚4T2æ–vW&–F—&V7F÷'27F'G2–âRÖ–çWFW2–âF†R&ö&G&ööÒâ#°¢'&V³°¢66R$ÖVWF–ær&W66†VGVÆVB# ¢F—FÆRÒ$66W72&æ²Gf—6÷'’&W66†VGVÆVB#°¢ÖW76vRÒ%F†R66W72&æ²6÷'÷&FRG&V7W'’Æ–væÖVçB6W76–öâ†2&VVâÖ÷fVBFòg&–F’Â"Òâ#°¢'&V³°¢66R$æWrF6²76–væVB# ¢F—FÆRÒ$G&gB†–v‚Õ––VÆBÆ6VÖVçB&÷÷6Â#°¢ÖW76vRÒ%–÷R†fR&VVâ76–væVBF6²FòG&gBF†R–ç7F—GWF–öæÂÖöæW’Ö&¶WB&÷÷6Âf÷"öæFòWG&öÆWVÒâ#°¢'&V³°¢66R%F6²÷fW&GVR# ¢F—FÆRÒ$÷fW&GVRF6³¢6†VÆÂ6Æ–VçBföÆÆ÷r×W#°¢ÖW76vRÒ%W&vVçC¢F†RF6²Fò6ö×ÆWFR6ö×Æ–æ6R67&VVæ–ærf÷"6†VÆÂö–ÂF—&V7F÷'2—2÷fW&GVRâ#°¢'&V³°¢66R$æWr&÷7V7B76–væVBFòW6W"# ¢F—FÆRÒ$6†Wg&öâæ–vW&–76–væVB#°¢ÖW76vRÒ%7G&FVv–2&÷7V7Bt6†Wg&öâæ–vW&–ÇFB6÷'÷&FRG&V7W'’r†2&VVâ76–væVBFò–÷R'’FÖ–ââ#°¢'&V³°¢66R%W6W"&÷fÂ&WVW7B# ¢F—FÆRÒ$&÷fÇ2VWVS¢æWrW6W"&Vv—7G&F–öâ#°¢ÖW76vRÒ%6V7W&—G’FW6³¢æWr44Ò66÷VçB&Vv—7G&F–öâ&WVW7Bg&öÒöff–6W"6†–æVGRö&’—2v—F–ærW†V7WF—fR&÷fÂâ#°¢'&V³°¢66R%W6W"&÷fVB# ¢F—FÆRÒ$6÷'÷&FR66W72w&çFVB#°¢ÖW76vRÒ%7V66W73¢–÷W"6÷'÷&FRöæ&ö&F–ær&Vv—7G&F–öâ†2&VVâ&÷fVBâ–÷Ræ÷r†fRgVÆÂ5$ÒW&Ö—76–öç2â#°¢'&V³°¢66R%W6W"&V¦V7FVB# ¢F—FÆRÒ$6÷'÷&FR66W72&Wfö¶VB#°¢ÖW76vRÒ%6V7W&—G“¢44Ò&Vv—7G&F–öâ&WVW7Bf÷"VF—BæöFRvwVW7E÷W6W"rv2&V¦V7FVB'’6ö×Æ–æ6RÆVBâ#°¢'&V³°¢66R$FVÂÖ÷fVB7FvR# ¢F—FÆRÒ$Fæv÷FRw&÷WÖ÷fVBFòæVv÷F–F–öâ#°¢ÖW76vRÒ$FVÂ—VÆ–æRWFFS¢Fæv÷FRw&÷WG&V7W'’Æ6VÖVçB†2&öw&W76VBg&öÒ&÷÷6Â6VçBFò7F—fRæVv÷F–F–öââ#°¢'&V³°¢66R%&÷÷6Â&÷fVB# ¢F—FÆRÒ$TÒ&÷÷6Â66WFVC¢ÕDâæ–vW&–#°¢ÖW76vRÒ$W†V7WF—fR&÷fÃ¢ÕDâæ–vW&–w2(*c"ãR&–ÆÆ–öâÖöæW’Ö&¶WBÆ6VÖVçB&÷÷6Â†2&VVâgVÆÇ’&÷fVB'’F†R–çfW7FÖVçB6öÖÖ—GFVRâ#°¢'&V³°¢66R%&÷÷6Â&V¦V7FVB# ¢F—FÆRÒ%44ÒÆ6VÖVçB&÷÷6Â&V¦V7FVB#°¢ÖW76vRÒ$–çfW7FÖVçB6öÖÖ—GFVS¢F†R7G'V7GW&VBf—†VBFW÷6—B&FR&÷÷6Âf÷"%T6VÖVçBv2&V¦V7FVBâ#°¢'&V³°¢FVfVÇC ¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢æ÷F–f–6F–öâG—R"G·G—WÒ"—2æ÷Bâ&÷fVB'W6–æW72WfVçBæÒ“°¢Ð ¢6öç7Bæ÷F–bÒv—B7&VFTæ÷F–f–6F–öâ‡G—RÂF—FÆRÂÖW76vRÂVæFVf–æVBÂW6W$–B“°¢–b‚æ÷F–b’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢f–ÆVBFò7&VFRæ÷F–f–6F–öââG—R"G·G—WÒ"Ö’&R&Æö6¶VBæÒ“°¢Ð¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ†æ÷F–b“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%6–×VÆF–öâVæGö–çBW'&÷#¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFò6–×VÆFRæ÷F–f–6F–öâ"ÂFWF–Ç3¢W'"æÖW76vRÒ“°¢Ð§Ò“° ¦ç÷7B‚"ö’öæ÷F–f–6F–öç2"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢G'’°¢6öç7B²G—RÂF—FÆRÂÖW76vRÂW6W$–BÒÒ&Wæ&öG“°¢–b‚G—RÇÂF—FÆRÇÂÖW76vR’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$æ÷F–f–6F–öâG—RÂF—FÆRÂæBÖW76vR&RÖæFF÷'’â"Ò“°¢Ð¢6öç7Bæ÷F–bÒv—B7&VFTæ÷F–f–6F–öâ‡G—RÂF—FÆRÂÖW76vRÂVæFVf–æVBÂW6W$–B“°¢–b‚æ÷F–b’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢%F†—2æ÷F–f–6F–öâG—R—2æ÷B&÷fVBæB†2&VVâ&Æö6¶VBâ"Ò“°¢Ð¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ†æ÷F–b“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%õ5Bö’öæ÷F–f–6F–öç2W'&÷#¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFò÷7Bæ÷F–f–6F–öâ"ÂFWF–Ç3¢W'"æÖW76vRÒ“°¢Ð§Ò“° ¦ç÷7B‚"ö’öæ÷F–f–6F–öç2öÖ&²ÖÆÂ×&VB"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢G'’°¢6öç7B²W6W$–BÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ6–vâÖ–â&WV—&VBâ"Ò“° ¢6öç7B&W7VÇBÒv—BF"çWFFR†æ÷F–f–6F–öç2’ç6WB‡²—5&VC¢G'VRÂ&VE7FGW3¢'&VB"Ò’çv†W&R†W†æ÷F–f–6F–öç2çW6W$–BÂW6W$–B’“°¢&WGW&â&W2æ§6öâ‡²7V66W73¢G'VRÂ6÷VçC¢&W7VÇBç&÷t6÷VçBÇÂÒ“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%õ5Bö’öæ÷F–f–6F–öç2öÖ&²ÖÆÂ×&VBW'&÷#¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòÖ&²ÆÂ2&VB"ÂFWF–Ç3¢W'"æÖW76vRÒ“°¢Ð§Ò“° ¦çF6‚‚"ö’öæ÷F–f–6F–öç2ó¦–B"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢G'’°¢6öç7B²W6W$–BÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ6–vâÖ–â&WV—&VBâ"Ò“° ¢6öç7B²–BÒÒ&Wç&×3°¢6öç7B²—5&VBÂ&VE7FGW2ÒÒ&Wæ&öG“°¢ ¢6öç7BF$æ÷F–g2Òv—BF"ç6VÆV7B‚’æg&öÒ†æ÷F–f–6F–öç2’çv†W&R†W†æ÷F–f–6F–öç2æ–BÂ–B’“°¢6öç7Bæ÷F–bÒF$æ÷F–g5³Ó°¢–b‚æ÷F–b’°¢&WGW&â&W2ç7FGW2ƒCB’æ§6öâ‡²W'&÷#¢$æ÷F–f–6F–öâæ÷Bf÷VæBâ"Ò“°¢Ð ¢–b‚—4FÖ–âbbæ÷F–bçW6W$–BÓÒW6W$–B’°¢&WGW&â&W2ç7FGW2ƒC2’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ–÷R6âöæÇ’ÖöF–g’–÷W"÷vâæ÷F–f–6F–öç2â"Ò“°¢Ð ¢6öç7BWFFW3¢ç’Ò·Ó°¢–b†—5&VBÓÒVæFVf–æVB’°¢WFFW2æ—5&VBÒ—5&VC°¢WFFW2ç&VE7FGW2Ò—5&VBò'&VB"¢'Vç&VB#°¢ÒVÇ6R–b‡&VE7FGW2ÓÒVæFVf–æVB’°¢WFFW2ç&VE7FGW2Ò&VE7FGW3°¢WFFW2æ—5&VBÒ&VE7FGW2ÓÓÒ'&VB#°¢Ð ¢v—BF"çWFFR†æ÷F–f–6F–öç2’ç6WB‡WFFW2’çv†W&R†W†æ÷F–f–6F–öç2æ–BÂ–B’“° ¢&WGW&â&W2æ§6öâ‡°¢ââææ÷F–bÀ¢ââçWFFW2À¢æ÷F–f–6F–öä–C¢æ÷F–bæ–BÀ¢FW67&—F–öã¢æ÷F–bæÖW76vP¢Ò“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%D4‚ö’öæ÷F–f–6F–öç2W'&÷#¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòF6‚æ÷F–f–6F–öâ"ÂFWF–Ç3¢W'"æÖW76vRÒ“°¢Ð§Ò“° ¦æFVÆWFR‚"ö’öæ÷F–f–6F–öç2ó¦–B"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢G'’°¢6öç7B²W6W$–BÂ—4FÖ–âÒÒvWE&WVW7EW6W"‡&W“°¢–b‚W6W$–B’&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ6–vâÖ–â&WV—&VBâ"Ò“° ¢6öç7B²–BÒÒ&Wç&×3°¢6öç7BF$æ÷F–g2Òv—BF"ç6VÆV7B‚’æg&öÒ†æ÷F–f–6F–öç2’çv†W&R†W†æ÷F–f–6F–öç2æ–BÂ–B’“°¢6öç7Bæ÷F–bÒF$æ÷F–g5³Ó°¢–b‚æ÷F–b’°¢&WGW&â&W2ç7FGW2ƒCB’æ§6öâ‡²W'&÷#¢$æ÷F–f–6F–öâæ÷Bf÷VæBâ"Ò“°¢Ð ¢–b‚—4FÖ–âbbæ÷F–bçW6W$–BÓÒW6W$–B’°¢&WGW&â&W2ç7FGW2ƒC2’æ§6öâ‡²W'&÷#¢$66W72FVæ–VBâ–÷R6âöæÇ’FVÆWFR–÷W"÷vâæ÷F–f–6F–öç2â"Ò“°¢Ð ¢v—BF"æFVÆWFR†æ÷F–f–6F–öç2’çv†W&R†W†æ÷F–f–6F–öç2æ–BÂ–B’“°¢&WGW&â&W2æ§6öâ‡²7V66W73¢G'VRÒ“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚$DTÄUDRö’öæ÷F–f–6F–öç2W'&÷#¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòFVÆWFRæ÷F–f–6F–öâ"ÂFWF–Ç3¢W'"æÖW76vRÒ“°¢Ð§Ò“° ¢òòÒÒÒ44ÒTåDU%$•4RtT"U4‚4ôäd”uU$D”ôâbTät”äRÒÒÐ¦–×÷'BvV'W6‚g&öÒ'vV"×W6‚#° ¦ÆWBf–D¶W—3¢²V&Æ–4¶W“¢7G&–æs²&—fFT¶W“¢7G&–ærÓ°¦6öç7Bd”Eô´U•5ôd”ÄRÒF‚æ¦ö–â‡&ö6W72æ7vB‚’Â'f–BÖ¶W—2æ§6öâ"“° ¦–b‡&ö6W72æVçbåd”EõT$Ä”5ô´U’bb&ö6W72æVçbåd”Eõ$•dDUô´U’’°¢f–D¶W—2Ò°¢V&Æ–4¶W“¢&ö6W72æVçbåd”EõT$Ä”5ô´U’À¢&—fFT¶W“¢&ö6W72æVçbåd”Eõ$•dDUô´U¢Ó°§ÒVÇ6R–b†g2æW†—7G57–æ2…d”Eô´U•5ôd”ÄR’’°¢G'’°¢f–D¶W—2Ò¥4ôâç'6R†g2ç&VDf–ÆU7–æ2…d”Eô´U•5ôd”ÄRÂ'WFbÓ‚"’“°¢Ò6F6‚†W'"’°¢6öç6öÆRæW'&÷"‚%µU4‚Tät”äUÒf–ÆVBFò'6RÆö6Âd”B¶W—2f–ÆS¢"ÂW'"“°¢f–D¶W—2ÒvV'W6‚ævVæW&FUd”D¶W—2‚“°¢g2çw&—FTf–ÆU7–æ2…d”Eô´U•5ôd”ÄRÂ¥4ôâç7G&–æv–g’‡f–D¶W—2’Â'WFbÓ‚"“°¢Ð§ÒVÇ6R°¢f–D¶W—2ÒvV'W6‚ævVæW&FUd”D¶W—2‚“°¢G'’°¢g2çw&—FTf–ÆU7–æ2…d”Eô´U•5ôd”ÄRÂ¥4ôâç7G&–æv–g’‡f–D¶W—2’Â'WFbÓ‚"“°¢6öç6öÆRæÆör‚%µU4‚Tät”äUÒG–æÖ–6ÆÇ’vVæW&FVBæB66†VB7F&ÆRd”B¶W——"â"“°¢Ò6F6‚†W'"’°¢6öç6öÆRæW'&÷"‚%µU4‚Tät”äUÒf–ÆVBFòW'6—7Bd”B¶W—2f–ÆS¢"ÂW'"“°¢Ð§Ð ¢òò6WBd”BFWF–Ç2v—F‚6÷'÷&FR–FVçF—G’6öçFW‡@§vV'W6‚ç6WEf–DFWF–Ç2€¢&Ö–ÇFó§v–¶—7v—6FöÓtvÖ–Âæ6öÒ"À¢f–D¶W—2çV&Æ–4¶W’À¢f–D¶W—2ç&—fFT¶W¢“° ¢òò†VÇW"gVæ7F–öâFòF—7F6‚W6‚æ÷F–f–6F–öâ–ÆöG2Fò7F—fRW6‚7V'67&–&W'0¦7–æ2gVæ7F–öâ6VæEW6„æ÷F–f–6F–öâ‡F&vWEW6W$–C¢7G&–ærÂçVÆÂÂ–ÆöC¢ç’’°¢G'’°¢ÆWB7V'2ÒµÓ°¢–b‡F&vWEW6W$–B’°¢7V'2Òv—BF"ç6VÆV7B‚’æg&öÒ‡W6…7V'67&—F–öç2’çv†W&R†W‡W6…7V'67&—F–öç2çW6W$–BÂF&vWEW6W$–B’“°¢ÒVÇ6R°¢7V'2Òv—BF"ç6VÆV7B‚’æg&öÒ‡W6…7V'67&—F–öç2“°¢Ð ¢6öç7B–ÆöE7G&–ærÒ¥4ôâç7G&–æv–g’‡–ÆöB“°¢6öç6öÆRæÆör†µU4‚Tät”äUÒf÷VæBG·7V'2æÆVæwF‡Ò7F—fR7V'67&—F–öâ‡2’Fòæ÷F–g’f÷"F&vWEW6W$–C¢G·F&vWEW6W$–BÇÂ&'&öF67B'Ö“° ¢6öç7B&öÖ—6W2Ò7V'2æÖ†7–æ2‡7V"’Óâ°¢6öç7BW6…7V'67&—F–öâÒ°¢VæGö–çC¢7V"æVæGö–çBÀ¢¶W—3¢°¢#SfFƒ¢7V"ç#SfF‚À¢WFƒ¢7V"æWF€¢Ð¢Ó° ¢G'’°¢v—BvV'W6‚ç6VæDæ÷F–f–6F–öâ‡W6…7V'67&—F–öâÂ–ÆöE7G&–ær“°¢6öç6öÆRæÆör†µU4‚Tät”äR5T44U55ÒF—7F6†VBW6‚æ÷F–f–6F–öâFòVæGö–çBG·7V"æ–GÒf÷"W6W"G·7V"çW6W$–GÖ“°¢Ò6F6‚†W'#¢ç’’°¢–b†W'"ç7FGW46öFRÓÓÒCÇÂW'"ç7FGW46öFRÓÓÒCB’°¢6öç6öÆRæÆör†µU4‚Tät”äR4ÄTåUÒFVÆWF–ærW‡—&VBW6‚7V'67&—F–öâG·7V"æ–GÖ“°¢G'’°¢v—BF"æFVÆWFR‡W6…7V'67&—F–öç2’çv†W&R†W‡W6…7V'67&—F–öç2æVæGö–çBÂ7V"æVæGö–çB’“°¢Ò6F6‚†FVÄW'#¢ç’’°¢6öç6öÆRæW'&÷"†µU4‚Tät”äR4ÄTåUU%$õ%Òf–ÆVBFòFVÆWFRW‡—&VB7V'67&—F–öâG·7V"æ–GÓ¦ÂFVÄW'"æÖW76vR“°¢Ð¢ÒVÇ6R°¢6öç6öÆRæW'&÷"†µU4‚Tät”äRU%$õ%Òf–ÆVBFòFVÆ—fW"W6‚FòG·7V"æ–GÓ¦ÂW'"æÖW76vRÇÂW'"“°¢Ð¢Ð¢Ò“° ¢v—B&öÖ—6RæÆÅ6WGFÆVB‡&öÖ—6W2“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µU4‚Tät”äR5$•D”4ÅÒf–ÆVBFòW†V7WFR6VæEW6„æ÷F–f–6F–öã¢"ÂW'"æÖW76vRÇÂW'"“°¢Ð§Ð ¢òòVçFW'&—6RÖw&FRöæU6–væÂ$U5B’W6‚FVÆ—fW'’Væv–æRf÷"æG&ö–BvV%FôæF—fRF&vWG0¦7–æ2gVæ7F–öâ6VæDöæU6–væÅW6‚‡F&vWEW6W$–C¢7G&–ærÂçVÆÂÂF—FÆS¢7G&–ærÂÖW76vS¢7G&–ær’°¢6öç7B–BÒ&ö6W72æVçbäôäU4”täÅôô”C°¢6öç7B”¶W’Ò&ö6W72æVçbäôäU4”täÅõ$U5Eô•ô´U“° ¢–b‚–BÇÂ”¶W’’°¢6öç6öÆRçv&â‚%´ôäU4”täÂTät”äRt$ä”äuÒôäU4”täÅôô”B÷"ôäU4”täÅõ$U5Eô•ô´U’—2æ÷BFVf–æVB–âVçf—&öæÖVçBf&–&ÆW2âæF—fRW6‚FVÆ—fW'’6¶—VBâ"“°¢&WGW&ã°¢Ð ¢G'’°¢6öç7B–ÆöC¢ç’Ò°¢ö–C¢–BÀ¢†VF–æw3¢°¢Vã¢F—FÆP¢ÒÀ¢6öçFVçG3¢°¢Vã¢ÖW76vP¢ÒÀ¢&–÷&—G“¢òò†–v‚&–÷&—G’f÷"–ç7FçBFVÆ—fW'¢Ó° ¢–b‡F&vWEW6W$–B’°¢–ÆöBçF&vWEö6†ææVÂÒ'W6‚#°¢–ÆöBæ–æ6ÇVFUöW‡FW&æÅ÷W6W%ö–G2Ò·F&vWEW6W$–EÓ°¢–ÆöBæ6†ææVÅöf÷%öW‡FW&æÅ÷W6W%ö–G2Ò'W6‚#°¢–ÆöBæ–æ6ÇVFUöÆ–6W2Ò°¢W‡FW&æÅö–C¢·F&vWEW6W$–EÐ¢Ó°¢ÒVÇ6R°¢–ÆöBæ–æ6ÇVFVE÷6VvÖVçG2Ò²%7V'67&–&VBW6W'2%Ó°¢Ð ¢6öç6öÆRæÆör†´ôäU4”täÂTät”äUÒF—7F6†–ærW6‚FòöæU6–væÂ$U5B’âââF&vWEW6W$–C¢G·F&vWEW6W$–BÇÂ&'&öF67B'Ö“°¢ ¢6öç7B&W7öç6RÒv—BfWF6‚‚&‡GG3¢òööæW6–væÂæ6öÒö’÷cöæ÷F–f–6F–öç2"Â°¢ÖWF†öC¢%õ5B"À¢†VFW'3¢°¢$6öçFVçBÕG—R#¢&Æ–6F–öâö§6öã²6†'6WC×WFbÓ‚"À¢$WF†÷&—¦F–öâ#¢&6–2G¶”¶W—Ö ¢ÒÀ¢&öG“¢¥4ôâç7G&–æv–g’‡–ÆöB¢Ò“° ¢6öç7BFF¢ç’Òv—B&W7öç6Ræ§6öâ‚“°¢–b‡&W7öç6Ræö²’°¢6öç6öÆRæÆör‚%´ôäU4”täÂTät”äR5T44U55ÒöæU6–væÂF—7F6‚7V66VVFVC¢"ÂFF“°¢ÒVÇ6R°¢6öç6öÆRæW'&÷"‚%´ôäU4”täÂTät”äRU%$õ%ÒöæU6–væÂ$U5B’&WGW&æVBæöâÔô²7FGW3¢"Â&W7öç6Rç7FGW2ÂFF“°¢Ð¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%´ôäU4”täÂTät”äR5$•D”4ÅÒf–ÆVBFòW†V7WFR6VæDöæU6–væÅW6ƒ¢"ÂW'"æÖW76vRÇÂW'"“°¢Ð§Ð ¢òò$U5BVæGö–çG2f÷"F†RvV"W6‚7V'67&—F–öâfÆ÷p¦ævWB‚"ö’÷W6‚÷V&Æ–2Ö¶W’"Â‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢&WGW&â&W2æ§6öâ‡²V&Æ–4¶W“¢f–D¶W—2çV&Æ–4¶W’Ò“°§Ò“° ¦ç÷7B‚"ö’÷W6‚÷7V'67&–&R"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢G'’°¢6öç7B²7V'67&—F–öâÂW6W$–BÒÒ&Wæ&öG“°¢–b‚7V'67&—F–öâÇÂ7V'67&—F–öâæVæGö–çBÇÂ7V'67&—F–öâæ¶W—2ÇÂ7V'67&—F–öâæ¶W—2ç#SfF‚ÇÂ7V'67&—F–öâæ¶W—2æWF‚’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$–çfÆ–B7V'67&—F–öâ–ÆöBâ"Ò“°¢Ð ¢6öç7B²W6W$–C¢&WW6W$–BÒÒvWE&WVW7EW6W"‡&W“°¢6öç7BF&vWEW6W$–BÒW6W$–BÇÂ&WW6W$–C° ¢–b‚F&vWEW6W$–B’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$WF†VçF–6FVBW6W"–FVçF–f–W"&WV—&VBf÷"7V'67&—F–öââ"Ò“°¢Ð ¢6öç7B7V$–BÒ7V"ÒG´FFRææ÷r‚—ÒÒG´ÖF‚æfÆö÷"„ÖF‚ç&æFöÒ‚’¢—Ö° ¢6öç7BW†—7F–ærÒv—BF"ç6VÆV7B‚’æg&öÒ‡W6…7V'67&—F–öç2’çv†W&R†W‡W6…7V'67&—F–öç2æVæGö–çBÂ7V'67&—F–öâæVæGö–çB’“° ¢–b†W†—7F–æræÆVæwF‚â’°¢v—BF"çWFFR‡W6…7V'67&—F–öç2’ç6WB‡°¢W6W$–C¢F&vWEW6W$–BÀ¢#SfFƒ¢7V'67&—F–öâæ¶W—2ç#SfF‚À¢WFƒ¢7V'67&—F–öâæ¶W—2æWF‚À¢Ò’çv†W&R†W‡W6…7V'67&—F–öç2æVæGö–çBÂ7V'67&—F–öâæVæGö–çB’“°¢ ¢6öç6öÆRæÆör†µU4‚Tät”äUÒWFFVBW†—7F–ærW6‚7V'67&—F–öâG¶W†—7F–æu³Òæ–GÒf÷"W6W"G·F&vWEW6W$–GÖ“°¢&WGW&â&W2æ§6öâ‡²7V66W73¢G'VRÂ–C¢W†—7F–æu³Òæ–BÂWFFVC¢G'VRÒ“°¢ÒVÇ6R°¢v—BF"æ–ç6W'B‡W6…7V'67&—F–öç2’çfÇVW2‡°¢–C¢7V$–BÀ¢W6W$–C¢F&vWEW6W$–BÀ¢VæGö–çC¢7V'67&—F–öâæVæGö–çBÀ¢#SfFƒ¢7V'67&—F–öâæ¶W—2ç#SfF‚À¢WFƒ¢7V'67&—F–öâæ¶W—2æWF‚À¢Ò“°¢ ¢6öç6öÆRæÆör†µU4‚Tät”äUÒ7&VFVBæWrW6‚7V'67&—F–öâG·7V$–GÒf÷"W6W"G·F&vWEW6W$–GÖ“°¢&WGW&â&W2ç7FGW2ƒ#’æ§6öâ‡²7V66W73¢G'VRÂ–C¢7V$–BÂ7&VFVC¢G'VRÒ“°¢Ð¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%õ5Bö’÷W6‚÷7V'67&–&RW'&÷#¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòW'6—7B7V'67&—F–öâ"ÂFWF–Ç3¢W'"æÖW76vRÒ“°¢Ð§Ò“° ¦ç÷7B‚"ö’÷W6‚÷Vç7V'67&–&R"Â7–æ2‡&WÂ&W2’Óâ°¢&W2ç6WD†VFW"‚$6öçFVçBÕG—R"Â&Æ–6F–öâö§6öâ"“°¢G'’°¢6öç7B²VæGö–çBÒÒ&Wæ&öG“°¢–b‚VæGö–çB’°¢&WGW&â&W2ç7FGW2ƒC’æ§6öâ‡²W'&÷#¢%7V'67&—F–öâVæGö–çB&WV—&VBâ"Ò“°¢Ð ¢v—BF"æFVÆWFR‡W6…7V'67&—F–öç2’çv†W&R†W‡W6…7V'67&—F–öç2æVæGö–çBÂVæGö–çB’“°¢6öç6öÆRæÆör†µU4‚Tät”äUÒVç7V'67&–&VBVæGö–çB7V66W76gVÆÇ–“°¢&WGW&â&W2æ§6öâ‡²7V66W73¢G'VRÒ“°¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%õ5Bö’÷W6‚÷Vç7V'67&–&RW'&÷#¢"ÂW'"“°¢&WGW&â&W2ç7FGW2ƒS’æ§6öâ‡²W'&÷#¢$f–ÆVBFòVç7V'67&–&R"ÂFWF–Ç3¢W'"æÖW76vRÒ“°¢Ð§Ò“°   ¢òò&6¶w&÷VæB¦ö"FòWFò×7V&Ö—BVæF–ærG&gG2öâg&–F’BC£3Ò†æBÆörF†R7V&Ö—76–öâWfVçBFòF†R7—7FVÒ¦gVæ7F–öâ7F'DWFõ7V&Ö—76–öå66†VGVÆW"‚’°¢6öç6öÆRæÆör‚%µ44ÒUDòÕ5T$Ô•54”ôåÒ&6¶w&÷VæBWFöÖF–2W&f÷&Öæ6R&W÷'F–ær66†VGVÆW"7F'FVBâ"“°¢6WD–çFW'fÂ†7–æ2‚’Óâ°¢G'’°¢6öç7Bæ÷rÒæWrFFR‚“°¢6öç7BF’Òæ÷rævWDF’‚“²òòRÒg&–F¢6öç7B†÷W"Òæ÷rævWD†÷W'2‚“°¢6öç7BÖ–çWFRÒæ÷rævWDÖ–çWFW2‚“° ¢òò6†V6²–b—B—2g&–F’æBF–ÖR—2ãÒc£3ƒC£3Ò¢–b†F’ÓÓÒRbb††÷W"âbÇÂ††÷W"ÓÓÒbbbÖ–çWFRãÒ3’’’°¢òò6Æ7VÆFRF†R7W'&VçBvVV²w2ÖöæF’FFR7G&–ær…•••’ÔÔÒÔDB¢6öç7B7W'&VçDF’Òæ÷rævWDF’‚“°¢6öç7BF—7Fæ6UFôÖöæF’Ò7W'&VçDF’ÓÓÒòÓb¢Ò7W'&VçDF“°¢6öç7BÖöæF’ÒæWrFFR†æ÷r“°¢ÖöæF’ç6WDFFR†æ÷rævWDFFR‚’²F—7Fæ6UFôÖöæF’“°¢6öç7BÖöæF•7G"ÒÖöæF’çFô•4õ7G&–ær‚’ç7Æ—B‚uBr•³Ó° ¢òòf–æBÆÂG&gB&W÷'G2f÷"F†R7W'&VçBvVV²F†B&Ræ÷Bf–æÆ—¦V@¢6öç7BVæF–ætG&gG2Òv—BF"ç6VÆV7B‚’æg&öÒ‡vVV¶Ç•&W÷'G2’çv†W&R€¢æB€¢W‡vVV¶Ç•&W÷'G2ç7FGW2Â$G&gB"’À¢W‡vVV¶Ç•&W÷'G2çvVVµ7F'DFFRÂÖöæF•7G"¢¢“° ¢–b‡VæF–ætG&gG2æÆVæwF‚â’°¢6öç6öÆRæÆör†µ44ÒUDòÕ5T$Ô•54”ôåÒf÷VæBG·VæF–ætG&gG2æÆVæwF‡ÒVç7V&Ö—GFVBG&gG2f÷"vVV²G¶ÖöæF•7G'ÒâW†V7WF–ærWFöÖF–27V&Ö—76–öâââæ“°¢f÷"†6öç7B&W÷'BöbVæF–ætG&gG2’°¢v—BF"çWFFR‡vVV¶Ç•&W÷'G2’ç6WB‡°¢7FGW3¢%7V&Ö—GFVB"À¢7V&Ö—GFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’À¢WFFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚¢Ò’çv†W&R†W‡vVV¶Ç•&W÷'G2æ–BÂ&W÷'Bæ–B’“° ¢6öç6öÆRæÆör†µ44ÒUDòÕ5T$Ô•54”ôåÒ6VÆVBæBf–æÆ—¦VB&W÷'BG·&W÷'Bæ–GÒf÷"&VÆF–öç6†—öff–6W"G·&W÷'BçW6W$æÖWÖ“°¢Ð¢Ð¢Ð¢Ò6F6‚†W'#¢ç’’°¢6öç6öÆRæW'&÷"‚%µ44ÒUDòÕ5T$Ô•54”ôâU%$õ%Ò&6¶w&÷VæB7V&Ö—76–öâVæv–æRf–ÆVC¢"ÂW'"“°¢Ð¢ÒÂ¢c¢“²òò'Vâ6†V6²WfW'’Ö–çWFW0§Ð ¢òòW‡&W72f—FRÖ÷VçF–ærb6W'fW"–æ—F–Æ—¦F–öâ…7FF–2g2FWbÖöFW2¦7–æ2gVæ7F–öâ7F'E6W'fW"‚’°¢òòfW&–g’÷"7&VFRW6…÷7V'67&—F–öç2F&ÆR–â÷7Fw&U5Â–bFF&6R—2†VÇF‡¢–b†—4FF&6T†VÇF‡’’°¢G'’°¢v—BF"æW†V7WFR‡7Æ ¢5$TDRD$ÄR”bäõBU„•5E2'W6…÷7V'67&—F–öç2"€¢&–B"DU…B$”Ô%’´U’À¢'W6W%ö–B"DU…BÀ¢&VæGö–çB"DU…BäõBåTÄÂTä•TRÀ¢'#SfF‚"DU…BäõBåTÄÂÀ¢&WF‚"DU…BäõBåTÄÂÀ¢&7&VFVEöB"D”ÔU5DÕDTdTÅBäõr‚¢“°¢“°¢6öç6öÆRæÆör‚%µ44ÒDD$4R5T44U55ÒW6…÷7V'67&—F–öç2F&ÆRfW&–f–VBö7&VFVB7V66W76gVÆÇ’â"“°¢Ò6F6‚†W'#¢ç’’°¢—4FF&6T†VÇF‡’ÒfÇ6S°¢6öç6öÆRæÆör‚%µ44ÒDD$4RäõD”4UÒ÷W&F–ærW6…÷7V'67&—F–öç2–âÖVÖ÷'’fÆÆ&6²ÖöFRâ"“°¢Ð¢Ð ¢–b‡&ö6W72æVçbääôDUôTåbÓÒ'&öGV7F–öâ"’°¢6öç7Bf—FRÒv—B7&VFUf—FU6W'fW"‡°¢6W'fW#¢²Ö–FFÆWv&TÖöFS¢G'VRÒÀ¢G—S¢'7"À¢Ò“°¢çW6R‡f—FRæÖ–FFÆWv&W2“°¢ÒVÇ6R°¢òò6W'fR&öGV7F–öâ'VæFÆP¢6öç7BF—7EF‚ÒF‚æ¦ö–â‡&ö6W72æ7vB‚’ÂvF—7Br“°¢çW6R†W‡&W72ç7FF–2†F—7EF‚’“°¢ævWB‚r¢rÂ‡&WÂ&W2’Óâ°¢&W2ç6VæDf–ÆR‡F‚æ¦ö–â†F—7EF‚Âv–æFW‚æ‡FÖÂr’“°¢Ò“°¢Ð ¢æÆ—7FVâ…õ%BÂ#ããã"Â‚’Óâ°¢6öç6öÆRæÆör†44Ò&÷7V7B–çFVÆÆ–vVæ6RÆFf÷&Ò'Vææ–ærB‡GG¢òöÆö6Æ†÷7C¢Gµõ%GÖ“°¢7F'DWFõ7V&Ö—76–öå66†VGVÆW"‚“°¢Ò“°§Ð ¦–b‚&ö6W72æVçbådU$4TÂ’°¢7F'E6W'fW"‚“°§Ð ¦W‡÷'BFVfVÇB°

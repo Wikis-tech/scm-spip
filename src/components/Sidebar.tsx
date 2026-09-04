@@ -38,7 +38,7 @@ const workspaceItems: NavItem[] = [
   { id: 'dashboard', label: 'My Dashboard', icon: BarChart3 },
   { id: 'prospects', label: 'Prospects', icon: Building2 },
   { id: 'pipeline', label: 'Relationship Pipeline', icon: TrendingUp },
-  { id: 'client-360', label: 'Clients', icon: Users2, activeFor: ['client-360', 'crm'] },
+  { id: 'client-360', label: 'Client 360', icon: Users2, activeFor: ['client-360', 'crm'] },
   { id: 'intelligence', label: 'Research', icon: SearchCode, activeFor: ['intelligence', 'workspaces'] },
   { id: 'copilot', label: 'Intelligence Copilot', icon: Bot },
   { id: 'calendar', label: 'Calendar', icon: Calendar },
