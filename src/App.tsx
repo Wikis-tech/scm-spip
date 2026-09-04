@@ -869,8 +869,11 @@ export default function App() {
 
   if (!authReady) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-950 text-white">
-        <div className="text-sm text-slate-300">Loading secure SPIP session...</div>
+      <div className="spip-auth-grid flex min-h-screen items-center justify-center text-white">
+        <div className="flex flex-col items-center gap-4" role="status" aria-live="polite">
+          <div className="h-10 w-10 animate-spin rounded-full border-4 border-white/15 border-t-[#d82d35]" />
+          <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-300">Loading secure SPIP session</div>
+        </div>
       </div>
     );
   }
@@ -889,7 +892,10 @@ export default function App() {
   }
 
   return (
-    <div id="scm-app-layout" className="flex h-screen bg-slate-50 text-slate-800 overflow-hidden font-sans">
+    <div id="scm-app-layout" className="spip-shell flex h-screen overflow-hidden font-sans text-slate-800">
+      <a href="#main-content" className="fixed left-3 top-3 z-[100] -translate-y-24 rounded-lg bg-white px-4 py-2 text-sm font-semibold text-slate-900 shadow-xl transition focus:translate-y-0">
+        Skip to main content
+      </a>
       {/* Sidebar - Handles platform navigation and active role simulations */}
       <Sidebar
         activeTab={activeTab}
@@ -909,12 +915,13 @@ export default function App() {
       {!sidebarCollapsed && (
         <div 
           onClick={handleToggleSidebar}
-          className="fixed inset-0 bg-slate-950/45 md:hidden z-25 transition-opacity duration-350"
+          className="fixed inset-0 z-25 bg-slate-950/55 backdrop-blur-[2px] transition-opacity duration-300 md:hidden"
+          aria-label="Close navigation"
         />
       )}
 
       {/* Main Container */}
-      <div className={`flex-1 flex flex-col min-w-0 overflow-hidden relative transition-all duration-300 ${sidebarCollapsed ? 'pl-0 md:pl-16' : 'pl-0 md:pl-64'}`}>
+      <div className={`relative flex min-w-0 flex-1 flex-col overflow-hidden transition-all duration-300 ${sidebarCollapsed ? 'pl-0 md:pl-[72px]' : 'pl-0 md:pl-[272px]'}`}>
         {/* Header - Holds clocks, status checks and query triggers */}
         <Header
           currentUser={currentUser}
@@ -927,28 +934,28 @@ export default function App() {
         />
 
         {/* Dynamic page content rendering */}
-        <main className="flex-1 overflow-y-auto p-6 focus:outline-none bg-slate-50/50">
-          <div className="max-w-7xl mx-auto">
+        <main id="main-content" className="flex-1 overflow-y-auto bg-transparent p-3 focus:outline-none sm:p-5 lg:p-7">
+          <div className="spip-page-content">
             {getActiveTabScreen()}
           </div>
         </main>
       </div>
 
       {/* Floating Unified Help & Onboarding Trigger (Phase 9 & 10) */}
-      <div className="fixed bottom-6 right-6 z-40 flex items-center gap-2">
+      <div className="fixed bottom-4 right-4 z-40 flex items-center gap-2 sm:bottom-6 sm:right-6">
         <button
           id="global-onboarding-restart-btn"
           onClick={() => setOnboardingActive(true)}
-          className="bg-slate-900 border border-slate-700 hover:bg-slate-800 text-white font-bold text-[10px] px-3 py-2.5 rounded-xl transition-all shadow-lg flex items-center gap-1 cursor-pointer"
+          className="flex items-center gap-1 rounded-xl border border-slate-700 bg-slate-900 px-3 py-2.5 text-[10px] font-bold text-white shadow-lg transition-all hover:bg-slate-800"
           title="Restart Guided Interactive Welcome Tour"
         >
-          <Sparkles className="w-3.5 h-3.5 text-amber-500 animate-pulse" />
+          <Sparkles className="h-3.5 w-3.5 text-amber-400" />
           <span>Tour Guide</span>
         </button>
         <button 
           id="global-help-center-toggle-btn"
           onClick={() => setHelpCenterActive(true)}
-          className="bg-[#b1191f] hover:bg-[#8e1217] text-white font-bold text-xs px-4 py-3 rounded-xl transition-all shadow-lg hover:scale-105 active:scale-95 flex items-center gap-1.5 cursor-pointer animate-pulse"
+          className="flex items-center gap-1.5 rounded-xl bg-[#b1191f] px-4 py-3 text-xs font-bold text-white shadow-lg transition-all hover:bg-[#8e1217] active:translate-y-px"
           title="Open SCM Support & FAQ Help Center"
         >
           <HelpCircle className="w-4 h-4 text-white" />

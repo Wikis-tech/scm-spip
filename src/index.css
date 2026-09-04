@@ -17,17 +17,98 @@
 }
 
 @layer base {
+  :root {
+    color-scheme: light;
+    --scm-red: #b1191f;
+    --scm-red-dark: #861218;
+    --scm-navy: #07192b;
+    --scm-navy-soft: #0d263d;
+    --scm-canvas: #f4f7fa;
+    --scm-border: #dfe6ee;
+    --scm-muted: #64748b;
+    --scm-shadow: 0 1px 2px rgba(7, 25, 43, .04), 0 10px 30px rgba(7, 25, 43, .055);
+  }
+
+  * { box-sizing: border-box; }
+
+  html { background: var(--scm-canvas); }
+
   body {
-    background-color: var(--color-brand-bg);
+    margin: 0;
+    min-width: 320px;
+    background-color: var(--scm-canvas);
     color: var(--color-brand-neutral);
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
   }
   
   h1, h2, h3, h4, h5, h6 {
     font-family: var(--font-display);
     letter-spacing: -0.025em;
   }
+
+  button, input, select, textarea { font: inherit; }
+
+  button:not(:disabled), [role="button"]:not([aria-disabled="true"]) { cursor: pointer; }
+
+  :focus-visible {
+    outline: 3px solid rgba(177, 25, 31, .28);
+    outline-offset: 2px;
+  }
+
+  ::selection { background: rgba(177, 25, 31, .18); color: #07192b; }
+}
+
+@layer components {
+  .spip-shell {
+    background:
+      radial-gradient(circle at 90% -10%, rgba(177, 25, 31, .055), transparent 28rem),
+      var(--scm-canvas);
+  }
+
+  .spip-page-content {
+    width: 100%;
+    max-width: 1536px;
+    margin-inline: auto;
+  }
+
+  .spip-page-content > * { animation: spip-page-enter .24s ease-out both; }
+
+  .spip-page-content :where(input:not([type="checkbox"]):not([type="radio"]), select, textarea) {
+    min-height: 42px;
+    border-color: var(--scm-border);
+    transition: border-color .18s ease, box-shadow .18s ease, background-color .18s ease;
+  }
+
+  .spip-page-content :where(input:not([type="checkbox"]):not([type="radio"]), select, textarea):focus {
+    border-color: rgba(177, 25, 31, .55);
+    box-shadow: 0 0 0 3px rgba(177, 25, 31, .10);
+  }
+
+  .spip-page-content table { width: 100%; border-collapse: separate; border-spacing: 0; }
+  .spip-page-content thead { background: #f6f8fb; }
+  .spip-page-content th {
+    color: #475569;
+    font-size: .68rem;
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+  .spip-page-content th, .spip-page-content td { border-bottom: 1px solid #e8edf3; }
+  .spip-page-content tbody tr { transition: background-color .15s ease; }
+  .spip-page-content tbody tr:hover { background: rgba(248, 250, 252, .8); }
+
+  .spip-auth-grid {
+    background:
+      linear-gradient(135deg, rgba(7,25,43,.98), rgba(9,32,52,.96)),
+      radial-gradient(circle at 15% 20%, rgba(177,25,31,.32), transparent 35rem);
+  }
+}
+
+@keyframes spip-page-enter {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 /* Glassmorphism Classes */
@@ -86,3 +167,16 @@
   animation: fadeIn 0.25s ease-out forwards;
 }
 
+@media (max-width: 767px) {
+  .spip-page-content { padding-bottom: 5rem; }
+  .spip-page-content :where(table) { min-width: 680px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
+}

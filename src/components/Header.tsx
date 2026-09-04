@@ -16,11 +16,12 @@ interface HeaderProps {
 const titles: Record<string, string> = {
   dashboard: 'My Dashboard',
   prospects: 'Prospects',
-  pipeline: 'Prospects',
+  pipeline: 'Relationship Pipeline',
   'client-360': 'Clients',
   crm: 'Clients',
   intelligence: 'Research',
   workspaces: 'Research',
+  copilot: 'Intelligence Copilot',
   calendar: 'Calendar',
   reports: 'Reports',
   'weekly-report': 'Weekly Report',
@@ -58,7 +59,7 @@ export const Header: React.FC<HeaderProps> = ({
       : 'Staff';
 
   return (
-    <header className="sticky top-0 z-20 flex h-16 items-center justify-between border-b border-slate-200 bg-white/95 px-4 shadow-sm backdrop-blur md:px-6">
+    <header className="sticky top-0 z-20 flex h-[68px] items-center justify-between border-b border-slate-200/80 bg-white/90 px-3 shadow-[0_1px_12px_rgba(7,25,43,0.04)] backdrop-blur-xl sm:px-4 md:px-6">
       <div className="flex min-w-0 flex-1 items-center gap-3">
         <button onClick={onToggleSidebar} className="rounded-lg p-2 text-slate-500 transition hover:bg-slate-100 hover:text-slate-900" aria-label="Toggle navigation">
           <Menu className="h-5 w-5" />
@@ -69,13 +70,13 @@ export const Header: React.FC<HeaderProps> = ({
           <p className="hidden truncate text-[10px] text-slate-400 sm:block">{currentUser.fullName} · {accessLabel}</p>
         </div>
 
-        <label className="relative ml-2 hidden max-w-sm flex-1 lg:block">
+        <label className="relative ml-3 hidden max-w-md flex-1 lg:block">
           <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
           <input
             value={searchTerm}
             onChange={(event) => setSearchTerm(event.target.value)}
             placeholder="Search current workspace"
-            className="w-full rounded-xl border border-slate-200 bg-slate-50 py-2 pl-9 pr-3 text-xs text-slate-700 outline-none transition focus:border-slate-400 focus:bg-white"
+            className="w-full rounded-xl border border-slate-200 bg-slate-50/80 py-2.5 pl-9 pr-3 text-xs text-slate-700 outline-none transition focus:border-red-300 focus:bg-white focus:ring-4 focus:ring-red-50"
           />
         </label>
       </div>
@@ -87,7 +88,7 @@ export const Header: React.FC<HeaderProps> = ({
             <Bell className="h-4 w-4" />
           </button>
           {showQuickPanel && (
-            <div className="absolute right-0 mt-2 w-80 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl">
+            <div className="absolute right-0 mt-2 w-[min(20rem,calc(100vw-1.5rem))] overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl">
               <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
                 <div>
                   <div className="text-sm font-bold text-slate-900">Notifications & reminders</div>

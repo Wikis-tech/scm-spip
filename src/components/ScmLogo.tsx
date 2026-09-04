@@ -15,10 +15,10 @@ export const ScmLogo: React.FC<ScmLogoProps> = ({
 }) => {
   // Determine dimensions
   const dimensions = {
-    sm: { svg: 'w-7 h-7', text: 'text-xs text-[10px]' },
-    md: { svg: 'w-9 h-9', text: 'text-base text-[11px]' },
-    lg: { svg: 'w-12 h-12', text: 'text-lg text-xs' },
-    xl: { svg: 'w-16 h-16', text: 'text-2xl text-sm' },
+    sm: { svg: 'h-7 w-7', main: 'text-[11px]', sub: 'text-[8px]' },
+    md: { svg: 'h-9 w-9', main: 'text-sm', sub: 'text-[9px]' },
+    lg: { svg: 'h-12 w-12', main: 'text-base', sub: 'text-[10px]' },
+    xl: { svg: 'h-16 w-16', main: 'text-xl', sub: 'text-xs' },
   }[size];
 
   // Colors based on variant
@@ -148,6 +148,8 @@ export const ScmLogo: React.FC<ScmLogoProps> = ({
       {/* Real SCM Globe Logo Badge */}
       <svg
         className={`${dimensions.svg} shrink-0`}
+        role="img"
+        aria-label="SCM Capital"
         viewBox="0 0 100 100"
         fill="none"
         xmlns="http://www.w3.org/2000/svg"
@@ -186,10 +188,10 @@ export const ScmLogo: React.FC<ScmLogoProps> = ({
       {/* SCM Branding Typography */}
       {showText && (
         <div className="flex flex-col">
-          <span className={`font-display font-black tracking-tight leading-tight ${dimensions.text.split(' ')[0]} ${logoColors.textMain}`}>
+          <span className={`font-display font-black leading-tight tracking-tight ${dimensions.main} ${logoColors.textMain}`}>
             SCM CAPITAL
           </span>
-          <span className={`font-mono font-bold tracking-widest uppercase block ${dimensions.text.split(' ')[1]} ${logoColors.textSub}`}>
+          <span className={`font-mono block font-bold uppercase tracking-widest ${dimensions.sub} ${logoColors.textSub}`}>
             ASSET MANAGEMENT
           </span>
         </div>
