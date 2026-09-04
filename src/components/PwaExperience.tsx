@@ -20,9 +20,14 @@ export const PwaExperience: React.FC = () => {
     window.addEventListener('offline', onOffline);
     if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js', { scope: '/' }).then((registration) => {
       if (registration.waiting) setUpdateReady(registration);
-      registration.addEventListener('updatefound', () => registration.installing?.addEventListener('statechange', () => {
-        if (registration.installing?.state === 'installed' && navigator.serviceWorker.controller) setUpdateReady(registration);
-      }));
+      registration.addEventListener('updatefound', () => {
+        const installingWorker = registration.installing;
+        installingWorker?.addEventListener('statechange', () => {
+          if (installingWorker.state === 'installed' && navigator.serviceWorker.controller) {
+            setUpdateReady(registration);
+          }
+        });
+      });
     }).catch((error) => console.error('[SPIP PWA] Service worker registration failed:', error));
     return () => {
       window.removeEventListener('beforeinstallprompt', onInstall); window.removeEventListener('appinstalled', onInstalled);
