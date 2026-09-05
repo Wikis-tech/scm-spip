@@ -576,7 +576,7 @@ export function registerPhase2Routes(app: Express, supabase: SupabaseClient) {
     const bounds = monthBounds(typeof req.query.month === 'string' ? req.query.month : undefined);
     const { data, error } = await supabase
       .from('weekly_reports')
-      .select('id, user_id, user_name, user_email, week_start_date, week_end_date, status, prospects_added, meetings_held, follow_ups_completed, funds_secured')
+      .select('id, user_id, user_name, user_email, week_start_date, week_end_date, summary, status, submitted_at, prospects_added, meetings_held, follow_ups_completed, funds_secured, products_sold, challenges, next_week_plan')
       .gte('week_start_date', bounds.startDate)
       .lte('week_start_date', bounds.endDate)
       .order('week_start_date', { ascending: false });

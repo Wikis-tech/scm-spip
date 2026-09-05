@@ -186,3 +186,25 @@
     transition-duration: .01ms !important;
   }
 }
+@media print {
+  body.printing-weekly-report * {
+    visibility: hidden !important;
+  }
+
+  body.printing-weekly-report #weekly-report-print-area,
+  body.printing-weekly-report #weekly-report-print-area * {
+    visibility: visible !important;
+  }
+
+  body.printing-weekly-report #weekly-report-print-area {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    border: 0;
+    box-shadow: none;
+  }
+
+  body.printing-weekly-report .weekly-report-print-control {
+    display: none !important;
+  }
+}

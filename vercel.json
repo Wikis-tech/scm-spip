@@ -7,6 +7,12 @@
       "maxDuration": 30
     }
   },
+  "crons": [
+    {
+      "path": "/api/weekly-reports/auto-submit",
+      "schedule": "30 15 * * 5"
+    }
+  ],
   "headers": [
     {
       "source": "/sw.js",
