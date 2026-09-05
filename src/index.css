@@ -72,6 +72,7 @@
     width: 100%;
     max-width: 1536px;
     margin-inline: auto;
+    padding-bottom: 5rem;
   }
 
   .spip-page-content > * { animation: spip-page-enter .24s ease-out both; }

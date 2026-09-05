@@ -1,6 +1,6 @@
 import { Document, Packer, Paragraph } from 'docx';
 import ExcelJS from 'exceljs-hardened';
-import PptxGenJS from 'pptxgenjs';
+import PptxGenJS from '@lofcz/pptxgenjs';
 import { extractDocument } from '../src/server/phase6ArtifactRuntime.js';
 
 async function fixtures() {

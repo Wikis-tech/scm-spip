@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
+    "@lofcz/pptxgenjs": "^4.1.17",
     "@supabase/supabase-js": "^2.112.0",
     "@tailwindcss/vite": "^4.1.14",
     "@types/web-push": "^3.6.4",
@@ -30,7 +31,6 @@
     "nodemailer": "^9.0.0",
     "pdf-lib": "^1.17.1",
     "pg": "^8.21.0",
-    "pptxgenjs": "^4.0.1",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "recharts": "^3.1.2",

@@ -279,7 +279,7 @@ export default function App() {
   // Launch welcome onboarding wizard for first-time session logins
   useEffect(() => {
     if (currentUser) {
-      const hasOnboarded = localStorage.getItem('scm_completed_onboarding');
+      const hasOnboarded = localStorage.getItem(`spip_onboarding_${currentUser.id}_v10`);
       if (hasOnboarded !== 'true') {
         setOnboardingActive(true);
       }
@@ -973,24 +973,24 @@ export default function App() {
       </div>
 
       {/* Floating Unified Help & Onboarding Trigger (Phase 9 & 10) */}
-      <div className="fixed bottom-[calc(5rem+env(safe-area-inset-bottom))] right-3 z-30 flex items-center gap-2 md:bottom-6 md:right-6 md:z-40">
+      <div className="fixed bottom-[calc(5.25rem+env(safe-area-inset-bottom))] right-3 z-30 flex items-center gap-2 md:bottom-5 md:right-5 md:z-40">
         <button
           id="global-onboarding-restart-btn"
           onClick={() => setOnboardingActive(true)}
-          className="flex items-center gap-1 rounded-xl border border-slate-700 bg-slate-900 px-3 py-2.5 text-[10px] font-bold text-white shadow-lg transition-all hover:bg-slate-800"
+          className="flex min-h-11 items-center gap-1 rounded-xl border border-slate-700 bg-slate-900 px-3 text-[10px] font-bold text-white shadow-lg transition-all hover:bg-slate-800"
           title="Restart Guided Interactive Welcome Tour"
         >
           <Sparkles className="h-3.5 w-3.5 text-amber-400" />
-          <span>Tour Guide</span>
+          <span className="hidden sm:inline">Tour Guide</span>
         </button>
         <button 
           id="global-help-center-toggle-btn"
           onClick={() => setHelpCenterActive(true)}
-          className="flex items-center gap-1.5 rounded-xl bg-[#b1191f] px-4 py-3 text-xs font-bold text-white shadow-lg transition-all hover:bg-[#8e1217] active:translate-y-px"
+          className="flex min-h-11 items-center gap-1.5 rounded-xl bg-[#b1191f] px-3 text-xs font-bold text-white shadow-lg transition-all hover:bg-[#8e1217] active:translate-y-px sm:px-4"
           title="Open SCM Support & FAQ Help Center"
         >
           <HelpCircle className="w-4 h-4 text-white" />
-          <span>Help & Support</span>
+          <span className="hidden sm:inline">Help & Support</span>
         </button>
       </div>
 
@@ -999,7 +999,7 @@ export default function App() {
         <OnboardingWizard
           onClose={() => {
             setOnboardingActive(false);
-            localStorage.setItem('scm_completed_onboarding', 'true');
+            localStorage.setItem(`spip_onboarding_${currentUser.id}_v10`, 'true');
           }}
           setActiveTab={setActiveTab}
         />
@@ -1009,7 +1009,9 @@ export default function App() {
       {helpCenterActive && (
         <TrustHelpCenter
           onClose={() => setHelpCenterActive(false)}
-          setActiveTab={setActiveTab}
+          onStartTour={() => setOnboardingActive(true)}
+          currentUser={currentUser}
+          scmFetch={scmFetch}
         />
       )}
 
