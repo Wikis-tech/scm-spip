@@ -114,7 +114,7 @@ export const Client360: React.FC<Client360Props> = ({ currentUser }) => {
           <div>
             <div className="text-[10px] font-black uppercase tracking-[0.22em] text-red-200">Relationship Management</div>
             <h1 className="text-2xl md:text-3xl font-black mt-2">Client 360</h1>
-            <p className="text-sm text-slate-300 mt-2">One relationship view for contacts, meetings, tasks, activity, product interest and conversion history.</p>
+            <p className="text-sm text-slate-300 mt-2 max-w-3xl">The relationship workspace for every company you manage—from active prospect through conversion to funded client. Review contacts, meetings, tasks, product interest, AUM and the full activity history in one place.</p>
           </div>
           <button onClick={() => { loadProspects(); if (selectedId) load360(selectedId); }} className="self-start lg:self-auto rounded-xl border border-white/20 bg-white/10 px-4 py-2.5 text-xs font-bold flex items-center gap-2 hover:bg-white/15">
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} /> Refresh relationship
@@ -127,6 +127,9 @@ export const Client360: React.FC<Client360Props> = ({ currentUser }) => {
       <div className="grid grid-cols-1 xl:grid-cols-[330px_minmax(0,1fr)] gap-5">
         <aside className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden xl:sticky xl:top-20 xl:self-start">
           <div className="p-4 border-b border-slate-200">
+            <div className="mb-3 rounded-xl border border-blue-100 bg-blue-50 p-3 text-[11px] leading-5 text-blue-900">
+              Prospects remain here while you build the relationship. Use <strong>Record conversion</strong> only after the company becomes a funded SCM client.
+            </div>
             <div className="relative">
               <Search className="absolute left-3 top-2.5 w-4 h-4 text-slate-400" />
               <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search relationships..." className="w-full rounded-xl border border-slate-200 bg-slate-50 pl-9 pr-3 py-2 text-sm outline-none focus:border-[#8c1018]" />
@@ -146,7 +149,7 @@ export const Client360: React.FC<Client360Props> = ({ currentUser }) => {
 
         <main className="min-w-0 space-y-5">
           {!p ? (
-            <div className="rounded-2xl border border-slate-200 bg-white p-12 text-center shadow-sm"><Building2 className="w-10 h-10 text-slate-300 mx-auto" /><h2 className="font-black text-slate-800 mt-3">Select a relationship</h2><p className="text-sm text-slate-500 mt-1">Choose a prospect from the directory to open Client 360.</p></div>
+            <div className="rounded-2xl border border-slate-200 bg-white p-12 text-center shadow-sm"><Building2 className="w-10 h-10 text-slate-300 mx-auto" /><h2 className="font-black text-slate-800 mt-3">Select a relationship</h2><p className="text-sm text-slate-500 mt-1">Choose a prospect or converted client from the directory to open the complete relationship record.</p></div>
           ) : (
             <>
               <section className="rounded-2xl border border-slate-200 bg-white p-5 md:p-6 shadow-sm">

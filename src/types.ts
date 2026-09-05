@@ -355,6 +355,10 @@ export interface DiscoveredLead {
   source?: string;
   revenueRange?: string;
   createdAt?: string;
+  enrichmentStatus?: string;
+  lastSyncedAt?: string;
+  apolloOrgId?: string;
+  linkedinUrl?: string;
   existingProspect?: ExistingProspectRef | null;
 }
 
@@ -461,5 +465,4 @@ export interface SerenaAuditLog {
   responseTimeMs: number;
   module: string;
 }
-
 

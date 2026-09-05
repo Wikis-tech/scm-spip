@@ -7,6 +7,7 @@ import {
   ClipboardCheck,
   FileSpreadsheet,
   RefreshCw,
+  Printer,
   Target,
   TrendingUp,
   Users2,
@@ -33,6 +34,11 @@ interface WeeklyRow {
   meetings_held: number;
   follow_ups_completed: number;
   funds_secured: number;
+  summary: string;
+  products_sold: string;
+  challenges: string;
+  next_week_plan: string;
+  submitted_at?: string | null;
 }
 
 interface MonthlyResponse {
@@ -94,6 +100,16 @@ export const ManagementReports: React.FC<ManagementReportsProps> = ({ currentUse
   const [staff, setStaff] = useState<StaffPerformanceResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [selectedReport, setSelectedReport] = useState<WeeklyRow | null>(null);
+
+  const printSelectedReport = () => {
+    if (!selectedReport) return;
+    document.body.classList.add('printing-weekly-report');
+    const cleanup = () => document.body.classList.remove('printing-weekly-report');
+    window.addEventListener('afterprint', cleanup, { once: true });
+    window.print();
+    window.setTimeout(cleanup, 1500);
+  };
 
   const authenticatedFetch = async (url: string) => {
     const { data } = await supabase.auth.getSession();
@@ -176,11 +192,37 @@ export const ManagementReports: React.FC<ManagementReportsProps> = ({ currentUse
             <table className="min-w-full text-left text-sm">
               <thead className="bg-slate-50 text-[10px] uppercase tracking-[0.12em] text-slate-400"><tr><th className="px-5 py-3">Officer</th><th className="px-5 py-3">Week</th><th className="px-5 py-3">Prospects</th><th className="px-5 py-3">Meetings</th><th className="px-5 py-3">Follow-ups</th><th className="px-5 py-3">Funds secured</th><th className="px-5 py-3">Status</th></tr></thead>
               <tbody className="divide-y divide-slate-100">
-                {weekly.map((row) => <tr key={row.id} className="text-slate-600"><td className="px-5 py-4"><div className="font-semibold text-slate-900">{row.user_name}</div><div className="text-xs text-slate-400">{row.user_email}</div></td><td className="px-5 py-4">{row.week_start_date} → {row.week_end_date}</td><td className="px-5 py-4">{row.prospects_added || 0}</td><td className="px-5 py-4">{row.meetings_held || 0}</td><td className="px-5 py-4">{row.follow_ups_completed || 0}</td><td className="px-5 py-4 font-semibold">{money(row.funds_secured || 0)}</td><td className="px-5 py-4"><Status status={row.status} /></td></tr>)}
+                {weekly.map((row) => <tr key={row.id} className="cursor-pointer text-slate-600 hover:bg-slate-50" onClick={() => setSelectedReport(row)}><td className="px-5 py-4"><button className="text-left"><div className="font-semibold text-slate-900">{row.user_name}</div><div className="text-xs text-slate-400">{row.user_email}</div></button></td><td className="px-5 py-4">{row.week_start_date} → {row.week_end_date}</td><td className="px-5 py-4">{row.prospects_added || 0}</td><td className="px-5 py-4">{row.meetings_held || 0}</td><td className="px-5 py-4">{row.follow_ups_completed || 0}</td><td className="px-5 py-4 font-semibold">{money(row.funds_secured || 0)}</td><td className="px-5 py-4"><Status status={row.status} /></td></tr>)}
                 {weekly.length === 0 && <tr><td colSpan={7} className="px-5 py-12 text-center text-sm text-slate-400">No weekly reports for this month.</td></tr>}
               </tbody>
             </table>
           </div>
+        </section>
+      )}
+
+      {tab === 'weekly' && selectedReport && (
+        <section id="weekly-report-print-area" className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+          <div className="flex flex-col gap-4 border-b border-slate-100 pb-5 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <div className="text-xs font-semibold uppercase tracking-[0.14em] text-[#b1191f]">SCM Capital weekly activity report</div>
+              <h2 className="mt-2 text-xl font-bold text-slate-950">{selectedReport.user_name}</h2>
+              <p className="mt-1 text-sm text-slate-500">{selectedReport.user_email} · {selectedReport.week_start_date} to {selectedReport.week_end_date}</p>
+            </div>
+            <button onClick={printSelectedReport} className="weekly-report-print-control inline-flex w-fit items-center gap-2 rounded-xl bg-slate-950 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800"><Printer className="h-4 w-4" />Print report</button>
+          </div>
+          <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <ReportMetric label="Prospects gained" value={selectedReport.prospects_added || 0} />
+            <ReportMetric label="Meetings held" value={selectedReport.meetings_held || 0} />
+            <ReportMetric label="Follow-ups" value={selectedReport.follow_ups_completed || 0} />
+            <ReportMetric label="Funds secured" value={money(selectedReport.funds_secured || 0)} />
+          </div>
+          <div className="mt-6 space-y-5 text-sm leading-6 text-slate-700">
+            <ReportSection title="Weekly summary" text={selectedReport.summary} />
+            <ReportSection title="Products sold or recommended" text={selectedReport.products_sold} />
+            <ReportSection title="Challenges and support required" text={selectedReport.challenges} />
+            <ReportSection title="Next-week plan" text={selectedReport.next_week_plan} />
+          </div>
+          <div className="mt-6 border-t border-slate-100 pt-4 text-xs text-slate-500">Status: {selectedReport.status} · Submitted: {selectedReport.submitted_at ? new Date(selectedReport.submitted_at).toLocaleString('en-NG') : 'Not recorded'}</div>
         </section>
       )}
 
@@ -221,3 +263,7 @@ const TabButton = ({ active, onClick, icon: Icon, label }: { active: boolean; on
 const Kpi = ({ label, value, icon: Icon }: { label: string; value: string; icon: any }) => <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><div className="flex items-start justify-between gap-3"><div><div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-400">{label}</div><div className="mt-2 break-words text-xl font-bold text-slate-950">{value}</div></div><div className="rounded-xl bg-slate-100 p-2.5 text-slate-700"><Icon className="h-5 w-5" /></div></div></div>;
 
 const Status = ({ status }: { status: string }) => <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold ${String(status).toLowerCase() === 'reviewed' ? 'bg-emerald-50 text-emerald-700' : String(status).toLowerCase() === 'submitted' ? 'bg-blue-50 text-blue-700' : 'bg-slate-100 text-slate-600'}`}>{status}</span>;
+
+const ReportMetric = ({ label, value }: { label: string; value: string | number }) => <div className="rounded-xl border border-slate-200 bg-slate-50 p-3"><div className="text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-400">{label}</div><div className="mt-2 text-lg font-bold text-slate-950">{value}</div></div>;
+
+const ReportSection = ({ title, text }: { title: string; text?: string }) => <div><h3 className="font-bold text-slate-950">{title}</h3><p className="mt-1 whitespace-pre-wrap">{text || 'Not provided.'}</p></div>;

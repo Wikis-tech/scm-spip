@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { CheckCircle2, FileText, RefreshCw, Save, Send } from 'lucide-react';
 import { UserProfile } from '../types';
 import { supabase } from '../lib/supabase';
@@ -28,12 +28,13 @@ export interface ReportData {
 }
 
 const weekRange = () => {
-  const now = new Date();
-  const day = now.getDay();
+  const localDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Lagos', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+  const now = new Date(`${localDate}T00:00:00.000Z`);
+  const day = now.getUTCDay();
   const monday = new Date(now);
-  monday.setDate(now.getDate() + (day === 0 ? -6 : 1 - day));
+  monday.setUTCDate(now.getUTCDate() + (day === 0 ? -6 : 1 - day));
   const friday = new Date(monday);
-  friday.setDate(monday.getDate() + 4);
+  friday.setUTCDate(monday.getUTCDate() + 4);
   return {
     start: monday.toISOString().slice(0, 10),
     end: friday.toISOString().slice(0, 10),
@@ -63,6 +64,8 @@ export const WeeklyReport: React.FC<WeeklyReportProps> = ({ currentUser }) => {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [feedback, setFeedback] = useState<{ tone: 'success' | 'error'; text: string } | null>(null);
+  const [submissionWindow, setSubmissionWindow] = useState({ allowed: false, timeZone: 'Africa/Lagos', autoSubmitTime: '16:30' });
+  const autoPrepared = useRef(false);
 
   const authenticatedFetch = async (url: string, options: RequestInit = {}) => {
     const { data } = await supabase.auth.getSession();
@@ -78,13 +81,19 @@ export const WeeklyReport: React.FC<WeeklyReportProps> = ({ currentUser }) => {
   const loadReports = async () => {
     setLoading(true);
     try {
-      const response = await authenticatedFetch('/api/weekly-reports');
+      const [response, windowResponse] = await Promise.all([
+        authenticatedFetch('/api/weekly-reports'),
+        authenticatedFetch('/api/weekly-reports/submission-window'),
+      ]);
       const payload = await response.json().catch(() => []);
+      const windowPayload = await windowResponse.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload?.error || 'Unable to load your weekly reports.');
+      if (windowResponse.ok) setSubmissionWindow(windowPayload);
       const rows = Array.isArray(payload) ? payload : [];
       setReports(rows);
-      if (rows.length > 0) {
-        const report = rows[0];
+      const currentRange = weekRange();
+      const report = rows.find((row: ReportData) => row.weekStartDate === currentRange.start) || rows[0];
+      if (report) {
         setSelectedId(report.id);
         setForm({
           weekStartDate: report.weekStartDate,
@@ -139,6 +148,15 @@ export const WeeklyReport: React.FC<WeeklyReportProps> = ({ currentUser }) => {
     }
   };
 
+  useEffect(() => {
+    if (loading || autoPrepared.current) return;
+    const current = weekRange();
+    if (!reports.some((report) => report.weekStartDate === current.start)) {
+      autoPrepared.current = true;
+      generateCurrentWeek();
+    }
+  }, [loading, reports]);
+
   const save = async (status: 'Draft' | 'Submitted') => {
     setFeedback(null);
     if (!form.summary.trim() || !form.productsSold.trim() || !form.challenges.trim() || !form.nextWeekPlan.trim()) {
@@ -186,7 +204,7 @@ export const WeeklyReport: React.FC<WeeklyReportProps> = ({ currentUser }) => {
         <div>
           <div className="text-xs font-semibold uppercase tracking-[0.16em] text-[#b1191f]">Reporting</div>
           <h1 className="mt-2 text-2xl font-bold tracking-tight text-slate-950">Weekly Report</h1>
-          <p className="mt-2 text-sm text-slate-500">Record progress, challenges and priorities for management review.</p>
+          <p className="mt-2 text-sm text-slate-500">SPIP gathers your week from CRM records. Review and edit the draft; submission opens every Friday.</p>
         </div>
         <button onClick={generateCurrentWeek} disabled={saving} className="inline-flex w-fit items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50">
           <RefreshCw className={`h-4 w-4 ${saving ? 'animate-spin' : ''}`} /> Prepare current week
@@ -194,6 +212,12 @@ export const WeeklyReport: React.FC<WeeklyReportProps> = ({ currentUser }) => {
       </section>
 
       {feedback && <div className={`rounded-xl border px-4 py-3 text-sm ${feedback.tone === 'success' ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-red-200 bg-red-50 text-red-800'}`}>{feedback.text}</div>}
+
+      <div className={`rounded-xl border px-4 py-3 text-sm ${submissionWindow.allowed ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
+        {submissionWindow.allowed
+          ? 'Friday submission is open. Submit after checking the automatically gathered figures.'
+          : `Save and edit your draft now. Manual submission opens on Friday; any outstanding report is submitted automatically at ${submissionWindow.autoSubmitTime} (Africa/Lagos).`}
+      </div>
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[260px,minmax(0,1fr)]">
         <aside className="h-fit rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
@@ -236,7 +260,7 @@ export const WeeklyReport: React.FC<WeeklyReportProps> = ({ currentUser }) => {
           {!locked && (
             <div className="mt-6 flex flex-wrap justify-end gap-2 border-t border-slate-100 pt-5">
               <button disabled={saving} onClick={() => save('Draft')} className="inline-flex items-center gap-2 rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"><Save className="h-4 w-4" /> Save draft</button>
-              <button disabled={saving} onClick={() => save('Submitted')} className="inline-flex items-center gap-2 rounded-xl bg-[#b1191f] px-4 py-2.5 text-sm font-semibold text-white hover:bg-[#94151a] disabled:opacity-50"><Send className="h-4 w-4" /> Submit report</button>
+              <button disabled={saving || !submissionWindow.allowed} title={!submissionWindow.allowed ? 'Submission opens on Friday (Africa/Lagos time).' : undefined} onClick={() => save('Submitted')} className="inline-flex items-center gap-2 rounded-xl bg-[#b1191f] px-4 py-2.5 text-sm font-semibold text-white hover:bg-[#94151a] disabled:cursor-not-allowed disabled:opacity-50"><Send className="h-4 w-4" /> Submit report</button>
             </div>
           )}
         </section>

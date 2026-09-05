@@ -1,81 +1,31 @@
-// SCM Prospect Intelligence Platform - Enterprise Service Worker
-
-self.addEventListener('install', (event) => {
-  console.log('[SCM Service Worker] Installed successfully.');
-  self.skipWaiting();
+const CACHE_VERSION = 'spip-shell-v9-1';
+const SHELL = ['/', '/offline.html', '/manifest.webmanifest', '/icons/spip-icon.svg'];
+self.addEventListener('install', (event) => event.waitUntil(caches.open(CACHE_VERSION).then((cache) => cache.addAll(SHELL))));
+self.addEventListener('activate', (event) => event.waitUntil(Promise.all([caches.keys().then((keys) => Promise.all(keys.filter((key) => key !== CACHE_VERSION).map((key) => caches.delete(key)))), self.clients.claim()])));
+self.addEventListener('message', (event) => { if (event.data?.type === 'SKIP_WAITING') self.skipWaiting(); });
+self.addEventListener('fetch', (event) => {
+  const request = event.request;
+  if (request.method !== 'GET') return;
+  const url = new URL(request.url);
+  if (url.origin !== self.location.origin || url.pathname.startsWith('/api/')) return;
+  if (request.mode === 'navigate') { event.respondWith(fetch(request).catch(() => caches.match('/offline.html'))); return; }
+  if (['script', 'style', 'image', 'font'].includes(request.destination)) event.respondWith(caches.match(request).then((cached) => cached || fetch(request).then((response) => {
+    if (response.ok && response.type === 'basic') caches.open(CACHE_VERSION).then((cache) => cache.put(request, response.clone()));
+    return response;
+  })));
 });
-
-self.addEventListener('activate', (event) => {
-  console.log('[SCM Service Worker] Activated successfully.');
-  event.waitUntil(self.clients.claim());
-});
-
-// Listen for Web Push events from the server
 self.addEventListener('push', (event) => {
-  console.log('[SCM Service Worker] Push notification event received.');
-  
-  if (!event.data) {
-    console.warn('[SCM Service Worker] Push received but contained no payload data.');
-    return;
-  }
-
-  try {
-    const data = event.data.json();
-    console.log('[SCM Service Worker] Push event data parsed:', data);
-
-    const title = data.title || 'SCM Capital Alert';
-    const options = {
-      body: data.message || 'New strategic intelligence alert from SCM Prospect Intelligence Platform.',
-      icon: '/assets/icon.png', // Fallback to icon
-      badge: '/assets/badge.png', // Fallback badge
-      vibrate: [100, 50, 100],
-      data: {
-        id: data.id,
-        url: '/' // Home page URL
-      },
-      tag: 'scm-alert-' + (data.id || 'generic'),
-      renotify: true
-    };
-
-    event.waitUntil(
-      self.registration.showNotification(title, options)
-    );
-  } catch (err) {
-    console.error('[SCM Service Worker] Error parsing push data or showing notification:', err);
-    
-    // Fallback if payload isn't valid JSON
-    const text = event.data.text();
-    event.waitUntil(
-      self.registration.showNotification('SCM Capital Alert', {
-        body: text || 'You have a new update in your SCM Prospect Intelligence account.',
-        icon: '/assets/icon.png',
-        vibrate: [100, 50, 100]
-      })
-    );
-  }
+  if (!event.data) return;
+  let data = {};
+  try { data = event.data.json(); } catch { data = { message: event.data.text() }; }
+  event.waitUntil(self.registration.showNotification(data.title || 'SCM Capital Alert', { body: data.message || 'You have a new SPIP update.', icon: '/icons/spip-icon.svg', badge: '/icons/spip-icon.svg', tag: `scm-alert-${data.id || 'general'}`, renotify: true, data: { url: data.url || '/' } }));
 });
-
-// Handle clicking on background notifications
 self.addEventListener('notificationclick', (event) => {
-  console.log('[SCM Service Worker] Notification clicked:', event.notification.tag);
   event.notification.close();
-
-  // URL to navigate or focus on
-  const urlToOpen = new URL('/', self.location.origin).href;
-
-  event.waitUntil(
-    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windowClients) => {
-      // Check if there is already a window open with this app URL
-      for (let i = 0; i < windowClients.length; i++) {
-        const client = windowClients[i];
-        if (client.url === urlToOpen && 'focus' in client) {
-          return client.focus();
-        }
-      }
-      // If no window is open, open a new one
-      if (self.clients.openWindow) {
-        return self.clients.openWindow(urlToOpen);
-      }
-    })
-  );
+  const target = new URL(event.notification.data?.url || '/', self.location.origin).href;
+  event.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(async (clients) => {
+    const existing = clients.find((client) => client.url.startsWith(self.location.origin));
+    if (existing) { await existing.navigate(target); return existing.focus(); }
+    return self.clients.openWindow?.(target);
+  }));
 });

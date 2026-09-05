@@ -5,6 +5,7 @@ import { Document, HeadingLevel, Packer, Paragraph, TextRun } from 'docx';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import ExcelJS from 'exceljs-hardened';
 import mammoth from 'mammoth';
+import JSZip from 'jszip';
 import { authenticatePhase6, phase6Supabase } from './phase6AiRuntime.js';
 
 const nodeRequire = createRequire(import.meta.url);
@@ -31,10 +32,23 @@ function extensionForMime(mime: string, filename: string) {
   if (ext) return ext;
   if (mime.includes('wordprocessingml')) return 'docx';
   if (mime.includes('spreadsheetml')) return 'xlsx';
+  if (mime.includes('presentationml')) return 'pptx';
   if (mime.includes('csv')) return 'csv';
   if (mime.includes('json')) return 'json';
   if (mime.startsWith('text/')) return 'txt';
   return 'bin';
+}
+
+const SOURCE_MIME: Record<string, string> = {
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  csv: 'text/csv', txt: 'text/plain', md: 'text/markdown', json: 'application/json',
+};
+
+function normalizedSourceMime(filename: string, supplied: string) {
+  const ext = extensionForMime(supplied, filename);
+  return { ext, mime: SOURCE_MIME[ext] || '' };
 }
 
 function parseSections(content: string): Section[] {
@@ -251,13 +265,13 @@ export async function generateArtifact(req: any) {
   return { status: 201, body: { id: artifact.id, format, title, fileName, signedUrl: signed?.signedUrl || null } };
 }
 
-async function extractDocument(buffer: Buffer, filename: string, mimeType: string) {
+export async function extractDocument(buffer: Buffer, filename: string, mimeType: string) {
   const ext = extensionForMime(mimeType, filename);
   if (ext === 'docx') {
     const result = await mammoth.extractRawText({ buffer });
     return result.value.trim();
   }
-  if (ext === 'xlsx' || ext === 'xls') {
+  if (ext === 'xlsx') {
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.load(buffer as any);
     const parts: string[] = [];
@@ -276,8 +290,27 @@ async function extractDocument(buffer: Buffer, filename: string, mimeType: strin
     });
     return parts.join('\n\n').trim();
   }
+  if (ext === 'pptx') {
+    const zip = await JSZip.loadAsync(buffer);
+    const slides = Object.keys(zip.files)
+      .filter((name) => /^ppt\/slides\/slide\d+\.xml$/i.test(name))
+      .sort((a, b) => Number(a.match(/slide(\d+)/i)?.[1] || 0) - Number(b.match(/slide(\d+)/i)?.[1] || 0));
+    const extracted: string[] = [];
+    for (const [index, name] of slides.entries()) {
+      const xml = await zip.file(name)?.async('string');
+      const text = String(xml || '')
+        .replace(/<a:br\s*\/?\s*>/gi, '\n')
+        .replace(/<\/a:p>/gi, '\n')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+        .replace(/[ \t]+/g, ' ').replace(/\n\s+/g, '\n').trim();
+      if (text) extracted.push(`SLIDE ${index + 1}\n${text}`);
+    }
+    if (!extracted.length) throw new Error('No readable slide text was found in this PPTX file.');
+    return extracted.join('\n\n');
+  }
   if (['txt', 'md', 'csv', 'json'].includes(ext) || mimeType.startsWith('text/')) return buffer.toString('utf8').trim();
-  throw new Error('This file type is not yet extractable. Use DOCX, XLSX, CSV, TXT, MD or JSON as source material.');
+  throw new Error('This file type is not extractable. Use DOCX, PPTX, XLSX, CSV, TXT, MD or JSON as source material.');
 }
 
 export async function ingestDocument(req: any) {
@@ -285,17 +318,25 @@ export async function ingestDocument(req: any) {
   if (!identity) return { status: 401, body: { error: 'Authentication required.' } };
 
   const filename = safeName(req.body?.filename || 'source.txt', 'source.txt');
-  const mimeType = String(req.body?.mimeType || 'application/octet-stream').slice(0, 160);
+  const suppliedMime = String(req.body?.mimeType || 'application/octet-stream').slice(0, 160);
   const base64 = String(req.body?.base64 || '');
   const workspaceId = String(req.body?.workspaceId || '').trim() || null;
   const conversationId = String(req.body?.conversationId || '').trim() || null;
   if (!base64) return { status: 400, body: { error: 'No file data received.' } };
+
+  const sourceType = normalizedSourceMime(filename, suppliedMime);
+  if (!sourceType.mime) return { status: 415, body: { error: 'Unsupported source file. Use DOCX, PPTX, XLSX, CSV, TXT, MD or JSON.' } };
+  const mimeType = sourceType.mime;
 
   const buffer = Buffer.from(base64, 'base64');
   if (!buffer.length || buffer.length > MAX_UPLOAD_BYTES) return { status: 413, body: { error: 'Source files must be smaller than 5 MB.' } };
   if (conversationId) {
     const { data: conversation } = await phase6Supabase.from('spip_ai_conversations').select('id').eq('id', conversationId).eq('user_id', identity.id).maybeSingle();
     if (!conversation) return { status: 404, body: { error: 'Conversation not found.' } };
+  }
+  if (workspaceId) {
+    const { data: workspace } = await phase6Supabase.from('workspaces').select('id').eq('id', workspaceId).eq('owner_user_id', identity.id).maybeSingle();
+    if (!workspace) return { status: 404, body: { error: 'Workspace not found for this user.' } };
   }
 
   let extractedText = '';

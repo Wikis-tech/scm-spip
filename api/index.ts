@@ -10,7 +10,8 @@ import {
   providerStatus,
   runPhase6Assistant,
 } from '../src/server/phase6AiRuntime.js';
-import { generateArtifact, ingestDocument } from '../src/server/phase6ArtifactRuntime.js';
+import { ingestDocument } from '../src/server/phase6ArtifactRuntime.js';
+import { generateArtifactV2 } from '../src/server/phase6ArtifactRuntimeV2.js';
 
 const require = createRequire(import.meta.url);
 const serverModule = require('../dist/server.cjs');
@@ -195,6 +196,152 @@ async function dispatchDueReminders() {
   return result;
 }
 
+function lagosWeekRange(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Africa/Lagos',
+    weekday: 'short',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date);
+  const value = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value || '';
+  const localDate = `${value('year')}-${value('month')}-${value('day')}`;
+  const localMidnight = new Date(`${localDate}T00:00:00.000Z`);
+  const weekday = value('weekday');
+  const daysFromMonday: Record<string, number> = { Mon: 0, Tue: 1, Wed: 2, Thu: 3, Fri: 4, Sat: 5, Sun: 6 };
+  const monday = new Date(localMidnight);
+  monday.setUTCDate(monday.getUTCDate() - (daysFromMonday[weekday] ?? 0));
+  const friday = new Date(monday);
+  friday.setUTCDate(friday.getUTCDate() + 4);
+  return {
+    weekday,
+    hour: Number(value('hour')),
+    minute: Number(value('minute')),
+    start: monday.toISOString().slice(0, 10),
+    end: friday.toISOString().slice(0, 10),
+  };
+}
+
+async function autoSubmitWeeklyReports() {
+  const clock = lagosWeekRange();
+  if (clock.weekday !== 'Fri' || clock.hour < 16 || (clock.hour === 16 && clock.minute < 30)) {
+    return { skipped: true, reason: 'OUTSIDE_FRIDAY_DEADLINE', timeZone: 'Africa/Lagos' };
+  }
+
+  const [profileResult, prospectResult, meetingResult, taskResult, activityResult, reportResult] = await Promise.all([
+    supabase.from('profiles').select('id, full_name, email, department, permission_level, status').eq('status', 'ACTIVE').eq('permission_level', 'STAFF'),
+    supabase.from('prospects').select('id, name, assigned_officer_id, status, actual_revenue, created_at, updated_at'),
+    supabase.from('meetings').select('id, officer_id, prospect_name, purpose, date'),
+    supabase.from('tasks').select('id, officer_id, due_date, is_completed'),
+    supabase.from('activities').select('id, officer_id, date, activity_type'),
+    supabase.from('weekly_reports').select('*').eq('week_start_date', clock.start),
+  ]);
+  for (const result of [profileResult, prospectResult, meetingResult, taskResult, activityResult, reportResult]) {
+    if (result.error) throw result.error;
+  }
+
+  const within = (value: any) => {
+    const day = String(value || '').slice(0, 10);
+    return day >= clock.start && day <= clock.end;
+  };
+  const existingByUser = new Map((reportResult.data || []).map((row: any) => [row.user_id, row]));
+  const now = new Date().toISOString();
+  let submitted = 0;
+  let alreadySubmitted = 0;
+
+  for (const profile of profileResult.data || []) {
+    const existing: any = existingByUser.get(profile.id);
+    if (existing && existing.status !== 'Draft') {
+      alreadySubmitted += 1;
+      continue;
+    }
+
+    const weeklyProspects = (prospectResult.data || []).filter((row: any) => row.assigned_officer_id === profile.id && within(row.created_at));
+    const weeklyMeetings = (meetingResult.data || []).filter((row: any) => row.officer_id === profile.id && within(row.date));
+    const weeklyTasks = (taskResult.data || []).filter((row: any) => row.officer_id === profile.id && row.is_completed && within(row.due_date));
+    const weeklyActivities = (activityResult.data || []).filter((row: any) => row.officer_id === profile.id && within(row.date));
+    const conversions = (prospectResult.data || []).filter((row: any) => row.assigned_officer_id === profile.id && ['Won', 'Converted'].includes(String(row.status)) && within(row.updated_at));
+    const fundsSecured = conversions.reduce((sum: number, row: any) => sum + Number(row.actual_revenue || 0), 0);
+    const prospectNames = weeklyProspects.map((row: any) => row.name).filter(Boolean).slice(0, 8);
+    const meetingNames = weeklyMeetings.map((row: any) => row.prospect_name || row.purpose).filter(Boolean).slice(0, 8);
+    const activityTypes = Array.from(new Set(weeklyActivities.map((row: any) => row.activity_type).filter(Boolean))).slice(0, 8);
+    const generatedSummary = [
+      `Automatically submitted at the Friday 4:30 PM deadline. SPIP recorded ${weeklyProspects.length} new prospect(s), ${weeklyMeetings.length} meeting(s), ${weeklyTasks.length} completed follow-up(s), ${weeklyActivities.length} activity record(s) and ${conversions.length} conversion(s) this week.`,
+      prospectNames.length ? `New prospects: ${prospectNames.join(', ')}.` : 'No new prospects were recorded.',
+      meetingNames.length ? `Meetings: ${meetingNames.join(', ')}.` : 'No meetings were recorded.',
+      activityTypes.length ? `Activity types: ${activityTypes.join(', ')}.` : 'No additional CRM activities were recorded.',
+      conversions.length ? `Conversions: ${conversions.map((row: any) => row.name).filter(Boolean).join(', ')}.` : 'No conversions were recorded.',
+    ].join('\n\n');
+
+    await supabase.from('users').upsert({
+      id: profile.id,
+      full_name: profile.full_name || String(profile.email).split('@')[0],
+      email: profile.email,
+      role: 'Business Development Officer',
+      department: profile.department || 'Asset Management',
+      status: 'Active',
+    }, { onConflict: 'id' });
+
+    const payload = {
+      id: existing?.id || `weekly-${profile.id}-${clock.start}`,
+      user_id: profile.id,
+      user_name: profile.full_name || String(profile.email).split('@')[0],
+      user_email: profile.email,
+      week_start_date: clock.start,
+      week_end_date: clock.end,
+      summary: String(existing?.summary || '').trim() || generatedSummary,
+      prospects_added: weeklyProspects.length,
+      meetings_held: weeklyMeetings.length,
+      follow_ups_completed: weeklyTasks.length,
+      funds_secured: fundsSecured,
+      products_sold: String(existing?.products_sold || '').trim() || (conversions.length ? 'Products or mandates connected to conversions require management confirmation.' : 'None recorded'),
+      challenges: String(existing?.challenges || '').trim() || 'No challenges were entered before the automatic submission deadline.',
+      next_week_plan: String(existing?.next_week_plan || '').trim() || 'No next-week plan was entered before the automatic submission deadline.',
+      status: 'Submitted',
+      submitted_at: now,
+      updated_at: now,
+    };
+    const saved = existing
+      ? await supabase.from('weekly_reports').update(payload).eq('id', existing.id).eq('status', 'Draft')
+      : await supabase.from('weekly_reports').insert(payload);
+    if (saved.error) throw saved.error;
+    submitted += 1;
+  }
+
+  await supabase.from('system_audit_logs').insert({
+    id: `weekly-cron-${Date.now()}`,
+    timestamp: now,
+    user_id: null,
+    user_email: null,
+    user_name: 'SPIP Scheduler',
+    action: 'WEEKLY_REPORT_AUTO_SUBMISSION_COMPLETED',
+    target: clock.start,
+    status: 'SUCCESS',
+    metadata: { submitted, alreadySubmitted, staffCount: (profileResult.data || []).length, timeZone: 'Africa/Lagos' },
+  });
+  return { ok: true, submitted, alreadySubmitted, staffCount: (profileResult.data || []).length, weekStartDate: clock.start, weekEndDate: clock.end };
+}
+
+async function handleWeeklyReportCron(req: any, res: any, path: string) {
+  if (path !== 'weekly-reports/auto-submit' || req.method !== 'GET') return false;
+  const configured = process.env.CRON_SECRET || process.env.WEEKLY_REPORT_CRON_SECRET || '';
+  const supplied = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  if (!configured || !supplied || !safeEqual(configured, supplied)) {
+    res.status(401).json({ error: 'Weekly report scheduler authorization failed.' });
+    return true;
+  }
+  try {
+    res.json(await autoSubmitWeeklyReports());
+  } catch (error: any) {
+    console.error('[WEEKLY REPORT CRON ERROR]', String(error?.message || error).slice(0, 500));
+    res.status(500).json({ error: 'Weekly report auto-submission failed.' });
+  }
+  return true;
+}
+
 async function handleNotificationHotfix(req: any, res: any, path: string) {
   if (path === 'push/public-key' && req.method === 'GET') {
     res.status(vapidPublic ? 200 : 503).json(vapidPublic ? { publicKey: vapidPublic } : { error: 'Push notifications are not configured in the production environment.' });
@@ -305,7 +452,7 @@ async function handlePhase6Ai(req: any, res: any, path: string) {
 
   if (path === 'ai/artifacts' && req.method === 'POST') {
     try {
-      const result = await generateArtifact(req);
+      const result = await generateArtifactV2(req);
       res.setHeader('Cache-Control', 'no-store');
       res.status(result.status).json(result.body);
     } catch (error: any) {
@@ -365,6 +512,8 @@ async function handlePhase6Ai(req: any, res: any, path: string) {
 export default async function handler(req: any, res: any) {
   const rawPath = req.query?.path;
   const path = Array.isArray(rawPath) ? rawPath.join('/') : String(rawPath || '').replace(/^\/+/, '');
+
+  if (await handleWeeklyReportCron(req, res, path)) return;
 
   // Phase 6 AI must bypass the legacy Express/PostgreSQL availability gate. The
   // Copilot uses authenticated Supabase + server-side AI providers and should not

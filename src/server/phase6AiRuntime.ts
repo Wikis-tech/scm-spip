@@ -69,7 +69,7 @@ function providers(): ProviderConfig[] {
 }
 
 function researchProvider(): ProviderConfig | null {
-  if (process.env.GROQ_COMPOUND_ENABLED !== 'true' || !process.env.GROQ_API_KEY?.trim()) return null;
+  if (process.env.GROQ_COMPOUND_ENABLED === 'false' || !process.env.GROQ_API_KEY?.trim()) return null;
   return {
     id: 'groq-compound',
     label: 'Groq Compound Research',
@@ -80,6 +80,53 @@ function researchProvider(): ProviderConfig | null {
     researchCapable: true,
     priority: 1,
   };
+}
+
+function compactRecord(record: Record<string, any>) {
+  return Object.fromEntries(Object.entries(record).filter(([, value]) => value !== null && value !== undefined && value !== '' && !(Array.isArray(value) && value.length === 0)));
+}
+
+async function prospectContext(supabase: SupabaseClient, identity: ActiveIdentity, query: string) {
+  const isAdmin = /admin|super/i.test(identity.permissionLevel);
+  let request = supabase.from('prospects').select('id, name, industry, org_type, location, website, email, status, priority, notes, opportunity_value, conversion_probability, treasury_potential, mmf_potential, wealth_potential, literacy_potential, opportunity_score, next_action, product_interests, relationship_health, updated_at').limit(1000);
+  if (!isAdmin) request = request.eq('assigned_officer_id', identity.id);
+  const { data, error } = await request;
+  if (error || !data?.length) return { text: '', match: null as any };
+
+  const haystack = query.toLowerCase().replace(/[^a-z0-9. ]+/g, ' ');
+  const ranked = data.map((prospect: any) => {
+    const name = String(prospect.name || '').toLowerCase().trim();
+    const domain = String(prospect.website || '').toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0];
+    const score = (name && haystack.includes(name) ? 100 + name.length : 0) + (domain && haystack.includes(domain) ? 80 + domain.length : 0);
+    return { prospect, score };
+  }).filter(({ score }) => score > 0).sort((a, b) => b.score - a.score);
+  const match = ranked[0]?.prospect || null;
+  if (!match) return { text: '', match: null as any };
+  const safe = compactRecord({
+    name: match.name, industry: match.industry, organisationType: match.org_type,
+    location: match.location, website: match.website, email: match.email, status: match.status,
+    priority: match.priority, notes: match.notes, opportunityValue: match.opportunity_value,
+    conversionProbability: match.conversion_probability, treasuryPotential: match.treasury_potential,
+    moneyMarketFundPotential: match.mmf_potential, wealthPotential: match.wealth_potential,
+    financialLiteracyPotential: match.literacy_potential, opportunityScore: match.opportunity_score,
+    nextAction: match.next_action, productInterests: match.product_interests,
+    relationshipHealth: match.relationship_health, lastUpdated: match.updated_at,
+  });
+  return { text: `MATCHED SPIP PROSPECT RECORD (internal evidence; not Apollo):\n${JSON.stringify(safe, null, 2)}`, match };
+}
+
+async function publicResearch(query: string, mode: AiMode, classification: DataClassification, companyName?: string) {
+  if (classification === 'CONFIDENTIAL' || !['research', 'proposal', 'meeting', 'analysis'].includes(mode)) return null;
+  const provider = researchProvider();
+  if (!provider) return null;
+  const searchRequest = companyName
+    ? `Research current, publicly verifiable information about ${companyName}. User objective: ${query.slice(0, 1200)}`
+    : query.slice(0, 1600);
+  const result = await callProvider(provider, [
+    { role: 'system', content: 'Use live public web research. Return concise verified findings with source titles, URLs and dates. Do not guess. This request contains no private CRM record or uploaded-document content.' },
+    { role: 'user', content: searchRequest },
+  ]);
+  return result;
 }
 
 export async function authenticatePhase6(req: any): Promise<ActiveIdentity | null> {
@@ -131,7 +178,6 @@ async function workspaceContext(supabase: SupabaseClient, identity: ActiveIdenti
   const blocks = [
     `Workspace company: ${workspace.company_name || 'Information Not Found'}`,
     workspace.company_profile ? `Company profile:\n${workspace.company_profile}` : '',
-    workspace.apollo_findings ? `Apollo findings:\n${workspace.apollo_findings}` : '',
     workspace.industry_analysis ? `Industry analysis:\n${workspace.industry_analysis}` : '',
     workspace.executive_insights ? `Executive insights:\n${workspace.executive_insights}` : '',
     workspace.investment_opportunities ? `Investment opportunities:\n${workspace.investment_opportunities}` : '',
@@ -149,7 +195,7 @@ async function workspaceContext(supabase: SupabaseClient, identity: ActiveIdenti
       const safeProspect = {
         name: prospect.name,
         industry: prospect.industry,
-        organizationType: prospect.organization_type,
+        organizationType: prospect.org_type,
         website: prospect.website,
         location: prospect.location,
         status: prospect.status,
@@ -173,11 +219,11 @@ async function documentContext(supabase: SupabaseClient, identity: ActiveIdentit
 }
 
 function modeInstructions(mode: AiMode): string {
-  const shared = `Write like an experienced SCM Capital professional, not like a generic chatbot. Use direct Nigerian/West African institutional-business language where relevant, but remain formal. Do not use filler such as "in today's rapidly evolving landscape". Never invent names, emails, phone numbers, revenue, addresses, regulation status, yields, dates or financial figures. Distinguish verified facts from assumptions. If evidence is missing, say "Information Not Found" or ask for the missing input. Never present a draft as approved legal, investment, compliance or regulatory advice.`;
+  const shared = `Write like an experienced SCM Capital professional, not like a generic chatbot. Use direct Nigerian/West African institutional-business language where relevant, but remain formal. Do not use filler such as "in today's rapidly evolving landscape". Never invent names, emails, phone numbers, revenue, addresses, regulation status, yields, dates or financial figures. Distinguish verified facts from assumptions. If evidence is missing, say "Information Not Found" or ask for the missing input. Never present a draft as approved legal, investment, compliance or regulatory advice. When a comparison or structured dataset is useful, produce a valid Markdown table with a header row, separator row, and consistent cell count; keep prose outside the table.`;
   const modes: Record<AiMode, string> = {
     assistant: 'Answer the employee clearly and practically. Prefer useful action over long exposition.',
     research: 'Act as an enterprise research analyst. Separate VERIFIED FACTS, ANALYSIS, GAPS/QUESTIONS, and SOURCES when source material is available. Never manufacture citations.',
-    proposal: 'Create a client-ready proposal draft with executive summary, client context, opportunity/problem, tailored SCM solution, value proposition, implementation/next steps and a clear CTA. Keep it specific to supplied evidence and suitable for later DOCX/PDF/PPTX rendering.',
+    proposal: 'Create a client-ready proposal draft with executive summary, client context, opportunity/problem, tailored SCM solution, value proposition, implementation/next steps and a clear CTA. Keep it specific to supplied evidence and suitable for later DOCX/PDF/PPTX rendering. If a source proposal or presentation was uploaded, follow its section/slide structure and tone while replacing company-specific facts with verified information for the requested prospect.',
     email: 'Write concise, natural professional correspondence. Avoid robotic openings and exaggerated claims. Match the relationship stage and include a clear next action.',
     meeting: 'Prepare a meeting brief with objective, verified company context, stakeholders, talking points, questions to ask, risks/unknowns and next actions.',
     followup: 'Write a natural follow-up tied to the previous interaction, with a specific reason to respond and a clear next step.',
@@ -209,13 +255,13 @@ async function getConversationHistory(
     .select('role, content, created_at')
     .eq('conversation_id', conversation.id)
     .eq('user_id', identity.id)
-    .order('created_at', { ascending: true })
+    .order('created_at', { ascending: false })
     .limit(MAX_HISTORY_MESSAGES);
   if (messageError) throw messageError;
 
   return {
     conversationId: conversation.id,
-    history: (messages || []).map((row: any) => ({ role: row.role, content: row.content })),
+    history: [...(messages || [])].reverse().map((row: any) => ({ role: row.role, content: row.content })),
     classification: conversation.data_classification,
     mode: conversation.mode,
   };
@@ -277,7 +323,7 @@ async function providerAvailable(supabase: SupabaseClient, provider: ProviderCon
   if (!provider.apiKey || !provider.endpoint) return false;
   const health = await providerHealth(supabase, provider.id);
   if (!health) return true;
-  if (health.status === 'DISABLED') return true;
+  if (health.status === 'DISABLED') return false;
   if (health.status === 'COOLDOWN' && health.cooldown_until) return new Date(health.cooldown_until).getTime() <= Date.now();
   return true;
 }
@@ -317,11 +363,9 @@ async function callProvider(provider: ProviderConfig, messages: ChatMessage[]): 
   }
 }
 
-function allowedProviders(classification: DataClassification, mode: AiMode): ProviderConfig[] {
+function allowedProviders(classification: DataClassification, _mode: AiMode): ProviderConfig[] {
   const list = providers();
-  const research = mode === 'research' ? researchProvider() : null;
-  const ordered = research ? [research, ...list] : list;
-  return ordered.filter((provider) => provider.apiKey && provider.endpoint).filter((provider) => classification !== 'CONFIDENTIAL' || provider.confidentialAllowed).sort((a, b) => a.priority - b.priority);
+  return list.filter((provider) => provider.apiKey && provider.endpoint).filter((provider) => classification !== 'CONFIDENTIAL' || provider.confidentialAllowed).sort((a, b) => a.priority - b.priority);
 }
 
 async function routeAcrossProviders(supabase: SupabaseClient, classification: DataClassification, mode: AiMode, messages: ChatMessage[]): Promise<ProviderResult> {
@@ -369,10 +413,11 @@ export async function runPhase6Assistant(req: any) {
   const documentIds = Array.isArray(req.body?.documentIds) ? req.body.documentIds.map(String) : [];
 
   try {
-    const [workspace, saved, sourceDocuments] = await Promise.all([
+    const [workspace, saved, sourceDocuments, prospect] = await Promise.all([
       workspaceContext(phase6Supabase, identity, workspaceId),
       getConversationHistory(phase6Supabase, identity, existingConversationId),
       documentContext(phase6Supabase, identity, documentIds),
+      prospectContext(phase6Supabase, identity, query),
     ]);
 
     if (saved.classification) classification = saved.classification;
@@ -388,8 +433,16 @@ export async function runPhase6Assistant(req: any) {
       }
     }
 
+    let webResearch: ProviderResult | null = null;
+    try {
+      webResearch = await publicResearch(query, effectiveMode, classification, prospect.match?.name);
+      if (webResearch) await markProviderSuccess(phase6Supabase, webResearch.provider);
+    } catch (error: any) {
+      console.warn('[PHASE6 PUBLIC RESEARCH]', String(error?.message || 'research unavailable').slice(0, 220));
+    }
+    const publicEvidence = webResearch ? `LIVE PUBLIC WEB RESEARCH (verify against the included sources):\n${webResearch.text}` : '';
     const messages: ChatMessage[] = [
-      { role: 'system', content: systemPrompt(identity, effectiveMode, classification, [workspace.text, sourceDocuments].filter(Boolean).join('\n\n')) },
+      { role: 'system', content: systemPrompt(identity, effectiveMode, classification, [prospect.text, workspace.text, sourceDocuments, publicEvidence].filter(Boolean).join('\n\n')) },
       ...saved.history,
       { role: 'user', content: query },
     ];
@@ -403,9 +456,10 @@ export async function runPhase6Assistant(req: any) {
     }
 
     const result = await routeAcrossProviders(phase6Supabase, classification, effectiveMode, messages);
+    const combinedCitations = [...(webResearch?.citations || []), ...result.citations].slice(0, 30);
 
     if (conversationId) {
-      const { error: assistantMessageError } = await phase6Supabase.from('spip_ai_messages').insert({ conversation_id: conversationId, user_id: identity.id, role: 'assistant', content: result.text, provider: result.provider, model: result.model, citations: result.citations, input_tokens: result.inputTokens, output_tokens: result.outputTokens, latency_ms: result.latencyMs });
+      const { error: assistantMessageError } = await phase6Supabase.from('spip_ai_messages').insert({ conversation_id: conversationId, user_id: identity.id, role: 'assistant', content: result.text, provider: result.provider, model: result.model, citations: combinedCitations, input_tokens: result.inputTokens, output_tokens: result.outputTokens, latency_ms: result.latencyMs });
       if (assistantMessageError) {
         console.error('[PHASE6 ASSISTANT MESSAGE PERSISTENCE]', String((assistantMessageError as any)?.code || 'UNKNOWN'), String((assistantMessageError as any)?.message || '').slice(0, 220));
         persistenceWarning ||= 'The answer was generated, but conversation history could not be saved.';
@@ -423,7 +477,8 @@ export async function runPhase6Assistant(req: any) {
         conversationId: conversationId || null,
         provider: result.provider,
         model: result.model,
-        citations: result.citations,
+        citations: combinedCitations,
+        research: { usedInternalProspect: Boolean(prospect.match), usedPublicWeb: Boolean(webResearch) },
         classification,
         mode: effectiveMode,
         persistence: { saved: Boolean(conversationId && !persistenceWarning), warning: persistenceWarning },
