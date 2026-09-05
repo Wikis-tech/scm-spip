@@ -9,27 +9,28 @@ import { MobileNavigation } from './components/MobileNavigation';
 import { PwaExperience } from './components/PwaExperience';
 import { Dashboard } from './pages/Dashboard';
 import { Prospects } from './pages/Prospects';
-import { Intelligence } from './pages/Intelligence';
 import { Contacts } from './pages/Contacts';
 import { Activities } from './pages/Activities';
 import { Meetings } from './pages/Meetings';
-import { Reports } from './pages/Reports';
-import { Settings } from './pages/Settings';
 import { Tasks } from './pages/Tasks';
 import { CRM } from './pages/CRM';
 import { Client360 } from './pages/Client360';
 import { Pipeline } from './pages/Pipeline';
 import { CalendarPage } from './pages/CalendarPage';
-import { AdminDashboard } from './pages/AdminDashboard';
-import { WeeklyReport } from './pages/WeeklyReport';
-import { ManagementReports } from './pages/ManagementReports';
-import { Analytics } from './pages/Analytics';
-import { ExecutiveSummary } from './pages/ExecutiveSummary';
-import { Workspaces } from './pages/Workspaces';
-import { IntelligenceCopilot } from './pages/IntelligenceCopilot';
 import { AlertTriangle, HelpCircle, RefreshCw, Sparkles, ShieldCheck } from 'lucide-react';
 import { UserProfile, UserRole, Prospect, Contact, Activity, Meeting, DashboardMetrics, Task, NewsArticle, DiscoveredLead, StaffPerformance } from './types';
 import { supabase } from './lib/supabase';
+
+const Intelligence = React.lazy(() => import('./pages/Intelligence').then(module => ({ default: module.Intelligence })));
+const Reports = React.lazy(() => import('./pages/Reports').then(module => ({ default: module.Reports })));
+const Settings = React.lazy(() => import('./pages/Settings').then(module => ({ default: module.Settings })));
+const AdminDashboard = React.lazy(() => import('./pages/AdminDashboard').then(module => ({ default: module.AdminDashboard })));
+const WeeklyReport = React.lazy(() => import('./pages/WeeklyReport').then(module => ({ default: module.WeeklyReport })));
+const ManagementReports = React.lazy(() => import('./pages/ManagementReports').then(module => ({ default: module.ManagementReports })));
+const Analytics = React.lazy(() => import('./pages/Analytics').then(module => ({ default: module.Analytics })));
+const ExecutiveSummary = React.lazy(() => import('./pages/ExecutiveSummary').then(module => ({ default: module.ExecutiveSummary })));
+const Workspaces = React.lazy(() => import('./pages/Workspaces').then(module => ({ default: module.Workspaces })));
+const IntelligenceCopilot = React.lazy(() => import('./pages/IntelligenceCopilot').then(module => ({ default: module.IntelligenceCopilot })));
 
 export default function App() {
   // Navigation states
@@ -967,7 +968,9 @@ export default function App() {
                 </button>
               </div>
             )}
-            {getActiveTabScreen()}
+            <React.Suspense fallback={<div className="grid min-h-[45vh] place-items-center" role="status"><div className="text-center"><RefreshCw className="mx-auto h-6 w-6 animate-spin text-[#b1191f]"/><p className="mt-3 text-xs font-semibold text-slate-500">Loading workspace…</p></div></div>}>
+              {getActiveTabScreen()}
+            </React.Suspense>
           </div>
         </main>
       </div>
