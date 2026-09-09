@@ -441,12 +441,58 @@ export async function discoverDecisionMakers(companyId: string, domain: string, 
     merged.set(key, { ...existing, ...person, email: person.email || existing.email, phone: person.phone || existing.phone, linkedin: person.linkedin || existing.linkedin, linkedin_url: person.linkedin_url || existing.linkedin_url });
   }
 
-  const rank: Record<string, number> = { owner: 12, founder: 11, c_suite: 10, partner: 9, vp: 8, head: 7, director: 6, manager: 5, senior: 4 };
+  const authorityScore = (person: ApolloPerson) => {
+    const title = `${person.position} ${person.department}`.toLowerCase();
+    let score = 0;
+    if (/chief financial officer|\bcfo\b/.test(title)) score += 150;
+    else if (/treasurer|head of treasury|treasury director|director.*treasury/.test(title)) score += 145;
+    else if (/finance director|head of finance|director.*finance|chief investment officer|\bcio\b/.test(title)) score += 135;
+    else if (/chief executive officer|\bceo\b|managing director|president/.test(title)) score += 125;
+    else if (/chief operating officer|\bcoo\b|executive director/.test(title)) score += 115;
+    else if (/finance|treasury|investment|corporate strategy/.test(title)) score += 95;
+    else if (/chief|director|head|partner|owner|founder|vice president|\bvp\b/.test(title)) score += 75;
+    const rank: Record<string, number> = { c_suite: 40, owner: 38, founder: 36, partner: 34, vp: 32, head: 30, director: 26, manager: 16, senior: 10 };
+    score += rank[String(person.seniority).toLowerCase()] || 0;
+    return score;
+  };
   const result = [...merged.values()].sort((a, b) => {
+    const authority = authorityScore(b) - authorityScore(a);
+    if (authority) return authority;
     const ar = (a.email ? 2 : 0) + (a.phone ? 2 : 0) + (a.linkedin ? 1 : 0);
     const br = (b.email ? 2 : 0) + (b.phone ? 2 : 0) + (b.linkedin ? 1 : 0);
-    return br !== ar ? br - ar : (rank[String(b.seniority).toLowerCase()] || 0) - (rank[String(a.seniority).toLowerCase()] || 0);
+    return br - ar;
   });
+
+  // Enrich only the three highest-authority matches. This can consume Apollo
+  // credits, so personal-email and phone reveal are deliberately disabled.
+  const candidates = result.slice(0, 3);
+  if (candidates.length) {
+    const enriched = await apolloClient.request<any>('https://api.apollo.io/api/v1/people/bulk_match', 'POST', {
+      details: candidates.map((person) => ({
+        id: person.id,
+        name: person.fullName.includes('**') ? undefined : person.fullName,
+        organization_name: companyName || person.companyName,
+        domain: cleanDomain || undefined,
+      })),
+      reveal_personal_emails: false,
+      reveal_phone_number: false,
+    });
+    syncDiagnostics();
+    if (enriched.ok && Array.isArray(enriched.data?.matches)) {
+      enriched.data.matches.forEach((match: any, index: number) => {
+        if (!match || !candidates[index]) return;
+        const mapped = mapFlexible(match);
+        candidates[index].fullName = mapped.fullName || candidates[index].fullName;
+        candidates[index].firstName = mapped.firstName || candidates[index].firstName;
+        candidates[index].lastName = mapped.lastName || candidates[index].lastName;
+        candidates[index].email = mapped.email || candidates[index].email;
+        candidates[index].emailValidationType = mapped.emailValidationType || candidates[index].emailValidationType;
+        candidates[index].linkedin = mapped.linkedin || candidates[index].linkedin;
+        candidates[index].linkedin_url = mapped.linkedin_url || candidates[index].linkedin_url;
+        candidates[index].validationLevel = match.match_confidence === 'high' ? 'Verified' : candidates[index].validationLevel;
+      });
+    }
+  }
   apolloDiagnostics.peopleReturned = result.length;
   apolloDiagnostics.selectedOrganization = selected.name;
   apolloDiagnostics.selectedOrganizationId = selected.id;
