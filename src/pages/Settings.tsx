@@ -27,14 +27,16 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
   const [activeSection, setActiveSection] = useState<SectionKey>('profile');
   const [message, setMessage] = useState<string>('');
   const [busy, setBusy] = useState(false);
-  const [uploadTarget, setUploadTarget] = useState<'logo' | 'favicon' | null>(null);
+  const [uploadTarget, setUploadTarget] = useState<'logo' | 'favicon' | 'appIcon' | null>(null);
   const [logoUrl, setLogoUrl] = useState('');
   const [faviconUrl, setFaviconUrl] = useState('');
+  const [appIconUrl, setAppIconUrl] = useState('');
 
   React.useEffect(() => {
     if (isAdmin) getSpipBranding().then((branding) => {
       setLogoUrl(branding.logoUrl);
       setFaviconUrl(branding.faviconUrl);
+      setAppIconUrl(branding.appIconUrl);
     });
   }, [isAdmin]);
 
@@ -75,6 +77,31 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
         ? 'The logo upload timed out. Please check your connection and try again.'
         : error?.message || 'Unable to upload the logo right now.');
     } finally {
+      setUploadTarget(null);
+    }
+  };
+
+  const uploadAppIcon = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    setMessage('');
+    if (file.type !== 'image/png') return setMessage('Upload the mobile app icon as a square PNG image.');
+    if (file.size > 1024 * 1024) return setMessage('The mobile app icon must be 1 MB or smaller.');
+    setUploadTarget('appIcon');
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 30_000);
+    try {
+      const response = await fetch('/api/admin/branding/app-icon', { method: 'POST', headers: { 'Content-Type': file.type }, body: file, signal: controller.signal });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || 'Unable to upload the mobile app icon.');
+      setAppIconUrl(payload.appIconUrl);
+      refreshSpipBranding();
+      setMessage('The mobile app icon has been updated. Existing installations may need to be removed and installed again.');
+    } catch (error: any) {
+      setMessage(error?.name === 'AbortError' ? 'The app-icon upload timed out. Please try again.' : error?.message || 'Unable to upload the mobile app icon.');
+    } finally {
+      window.clearTimeout(timeout);
       setUploadTarget(null);
     }
   };
@@ -155,7 +182,18 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
         return;
       }
       const success = await registerServiceWorkerAndSubscribe(currentUser.id, currentUser.email, currentUser.role);
-      setMessage(success ? 'Notifications are enabled for this device.' : 'Notification setup was not completed. Check your browser permission and try again.');
+      if (!success) {
+        setMessage('Notification setup was not completed. Check your browser permission and try again.');
+        return;
+      }
+      const { data } = await supabase.auth.getSession();
+      const test = await fetch('/api/push/test', { method: 'POST', headers: { Authorization: `Bearer ${data.session?.access_token || ''}` } });
+      const result = await test.json().catch(() => ({}));
+      setMessage(test.ok
+        ? 'Notifications are enabled. A test notification has been sent to this device.'
+        : result.reason === 'VAPID_NOT_CONFIGURED'
+          ? 'Your device permission is enabled, but the production push keys are not configured yet.'
+          : 'Your device was registered, but the test notification was not delivered. Please retry once.');
     } catch (error: any) {
       setMessage(error?.message || 'Unable to enable notifications right now.');
     } finally {
@@ -298,6 +336,20 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                     <Upload className="h-4 w-4" />
                     {uploadTarget === 'logo' ? 'Uploading…' : 'Upload logo'}
                     <input type="file" accept="image/png,image/jpeg,image/webp" className="sr-only" disabled={uploadTarget !== null} onChange={uploadLogo} />
+                  </label>
+                </div>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-5">
+                <div className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex min-w-0 items-center gap-4">
+                    <div className="flex h-16 w-16 shrink-0 items-center justify-center overflow-hidden rounded-2xl border border-slate-200 bg-white p-1.5">
+                      {appIconUrl ? <img src={appIconUrl} alt="Current mobile app icon" className="h-full w-full rounded-xl object-contain" /> : <ImageIcon className="h-6 w-6 text-slate-300" />}
+                    </div>
+                    <div><div className="font-semibold text-slate-900">Mobile app icon</div><p className="mt-1 text-xs leading-5 text-slate-500">Square 512 × 512 PNG used for new Android and iPhone PWA installations. Maximum size: 1 MB.</p></div>
+                  </div>
+                  <label className="inline-flex shrink-0 cursor-pointer items-center justify-center gap-2 rounded-lg bg-slate-950 px-4 py-2.5 text-xs font-semibold text-white transition hover:bg-slate-800">
+                    <Upload className="h-4 w-4" />{uploadTarget === 'appIcon' ? 'Uploading…' : 'Upload app icon'}
+                    <input type="file" accept="image/png" className="sr-only" disabled={uploadTarget !== null} onChange={uploadAppIcon} />
                   </label>
                 </div>
               </div>
