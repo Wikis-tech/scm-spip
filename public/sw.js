@@ -1,5 +1,5 @@
-const CACHE_VERSION = 'spip-shell-v9-2';
-const SHELL = ['/', '/offline.html', '/manifest.webmanifest', '/icons/spip-icon.svg'];
+const CACHE_VERSION = 'spip-shell-v9-3';
+const SHELL = ['/', '/offline.html', '/icons/spip-icon.svg'];
 self.addEventListener('install', (event) => event.waitUntil(caches.open(CACHE_VERSION).then((cache) => cache.addAll(SHELL))));
 self.addEventListener('activate', (event) => event.waitUntil(Promise.all([caches.keys().then((keys) => Promise.all(keys.filter((key) => key !== CACHE_VERSION).map((key) => caches.delete(key)))), self.clients.claim()])));
 self.addEventListener('message', (event) => { if (event.data?.type === 'SKIP_WAITING') self.skipWaiting(); });
