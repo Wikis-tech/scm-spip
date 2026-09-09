@@ -311,20 +311,24 @@ export function registerPhase7Routes(app: Express, supabase: SupabaseClient) {
     const user = requestUser(req);
     if (!user?.isAdmin) return res.status(403).json({ error: 'Administrator access is required.' });
     const bytes = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
-    if (detectLogoMime(bytes) !== 'image/png') return res.status(400).json({ error: 'Upload a valid square PNG app icon.' });
+    if (detectLogoMime(bytes) !== 'image/png') return res.status(400).json({ error: 'SPIP could not read the prepared PNG app icon.' });
     if (bytes.length > 1024 * 1024) return res.status(413).json({ error: 'App icons must be 1 MB or smaller.' });
     const width = bytes.length >= 24 ? bytes.readUInt32BE(16) : 0;
     const height = bytes.length >= 24 ? bytes.readUInt32BE(20) : 0;
-    if (width !== 512 || height !== 512) return res.status(400).json({ error: 'The mobile app icon must be exactly 512 × 512 pixels.' });
+    if (width !== 512 || height !== 512) return res.status(400).json({ error: `The prepared app icon is ${width || '?'} × ${height || '?'}; 512 × 512 is required.` });
     const path = `app-icons/spip-app-icon-${Date.now()}.png`;
     const { data: previous } = await supabase.from('platform_settings').select('value').eq('key', 'branding').maybeSingle();
     const { error: uploadError } = await supabase.storage.from('spip-brand-assets').upload(path, bytes, { contentType: 'image/png', upsert: false });
-    if (uploadError) return res.status(500).json({ error: 'The mobile app icon could not be uploaded.' });
+    if (uploadError) {
+      console.error('[BRANDING] App icon storage upload failed:', uploadError.message);
+      return res.status(500).json({ error: 'The mobile app icon could not be uploaded.' });
+    }
     const { data: publicData } = supabase.storage.from('spip-brand-assets').getPublicUrl(path);
     const value = { ...(previous?.value || {}), appIconUrl: publicData.publicUrl, appIconPath: path, organisationName: 'SCM CAPITAL', divisionName: 'ASSET MANAGEMENT' };
     const { error } = await supabase.from('platform_settings').upsert({ key: 'branding', value, updated_by: user.userId, updated_at: new Date().toISOString() });
     if (error) {
       await supabase.storage.from('spip-brand-assets').remove([path]);
+      console.error('[BRANDING] App icon setting update failed:', error.message);
       return res.status(500).json({ error: 'The mobile app icon could not be saved.' });
     }
     const previousPath = String(previous?.value?.appIconPath || '');
