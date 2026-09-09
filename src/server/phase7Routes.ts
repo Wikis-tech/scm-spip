@@ -231,6 +231,7 @@ export function registerPhase7Routes(app: Express, supabase: SupabaseClient) {
     return res.json({
       logoUrl: data?.value?.logoUrl || '',
       faviconUrl: data?.value?.faviconUrl || '',
+      appIconUrl: data?.value?.appIconUrl || '',
       organisationName: data?.value?.organisationName || 'SCM CAPITAL',
       divisionName: data?.value?.divisionName || 'ASSET MANAGEMENT',
     });
@@ -302,6 +303,32 @@ export function registerPhase7Routes(app: Express, supabase: SupabaseClient) {
       const { error: cleanupError } = await supabase.storage.from('spip-brand-assets').remove([previousPath]);
       if (cleanupError) console.warn('[BRANDING] Previous favicon cleanup failed:', cleanupError.message);
     }
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json(value);
+  });
+
+  app.post('/api/admin/branding/app-icon', express.raw({ type: 'image/png', limit: 1024 * 1024 }), async (req, res) => {
+    const user = requestUser(req);
+    if (!user?.isAdmin) return res.status(403).json({ error: 'Administrator access is required.' });
+    const bytes = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    if (detectLogoMime(bytes) !== 'image/png') return res.status(400).json({ error: 'Upload a valid square PNG app icon.' });
+    if (bytes.length > 1024 * 1024) return res.status(413).json({ error: 'App icons must be 1 MB or smaller.' });
+    const width = bytes.length >= 24 ? bytes.readUInt32BE(16) : 0;
+    const height = bytes.length >= 24 ? bytes.readUInt32BE(20) : 0;
+    if (width !== 512 || height !== 512) return res.status(400).json({ error: 'The mobile app icon must be exactly 512 × 512 pixels.' });
+    const path = `app-icons/spip-app-icon-${Date.now()}.png`;
+    const { data: previous } = await supabase.from('platform_settings').select('value').eq('key', 'branding').maybeSingle();
+    const { error: uploadError } = await supabase.storage.from('spip-brand-assets').upload(path, bytes, { contentType: 'image/png', upsert: false });
+    if (uploadError) return res.status(500).json({ error: 'The mobile app icon could not be uploaded.' });
+    const { data: publicData } = supabase.storage.from('spip-brand-assets').getPublicUrl(path);
+    const value = { ...(previous?.value || {}), appIconUrl: publicData.publicUrl, appIconPath: path, organisationName: 'SCM CAPITAL', divisionName: 'ASSET MANAGEMENT' };
+    const { error } = await supabase.from('platform_settings').upsert({ key: 'branding', value, updated_by: user.userId, updated_at: new Date().toISOString() });
+    if (error) {
+      await supabase.storage.from('spip-brand-assets').remove([path]);
+      return res.status(500).json({ error: 'The mobile app icon could not be saved.' });
+    }
+    const previousPath = String(previous?.value?.appIconPath || '');
+    if (previousPath.startsWith('app-icons/') && previousPath !== path) await supabase.storage.from('spip-brand-assets').remove([previousPath]);
     res.setHeader('Cache-Control', 'no-store');
     return res.json(value);
   });
