@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'spip-shell-v9-1';
+const CACHE_VERSION = 'spip-shell-v9-2';
 const SHELL = ['/', '/offline.html', '/manifest.webmanifest', '/icons/spip-icon.svg'];
 self.addEventListener('install', (event) => event.waitUntil(caches.open(CACHE_VERSION).then((cache) => cache.addAll(SHELL))));
 self.addEventListener('activate', (event) => event.waitUntil(Promise.all([caches.keys().then((keys) => Promise.all(keys.filter((key) => key !== CACHE_VERSION).map((key) => caches.delete(key)))), self.clients.claim()])));
@@ -18,7 +18,7 @@ self.addEventListener('push', (event) => {
   if (!event.data) return;
   let data = {};
   try { data = event.data.json(); } catch { data = { message: event.data.text() }; }
-  event.waitUntil(self.registration.showNotification(data.title || 'SCM Capital Alert', { body: data.message || 'You have a new SPIP update.', icon: '/icons/spip-icon.svg', badge: '/icons/spip-icon.svg', tag: `scm-alert-${data.id || 'general'}`, renotify: true, data: { url: data.url || '/' } }));
+  event.waitUntil(self.registration.showNotification(data.title || 'SCM Capital Alert', { body: data.message || 'You have a new SPIP update.', icon: data.icon || '/icons/spip-192.png', badge: data.badge || '/icons/spip-192.png', tag: `scm-alert-${data.id || 'general'}`, renotify: true, requireInteraction: Boolean(data.requireInteraction), data: { url: data.url || '/' } }));
 });
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
