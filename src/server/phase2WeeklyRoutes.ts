@@ -2,6 +2,57 @@ import type { Express, Request, Response } from 'express';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 const ADMIN_LEVELS = new Set(['SUPER_ADMIN', 'HOD_ADMIN']);
+const REPORT_TIME_ZONE = 'Africa/Lagos';
+
+function lagosDateParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: REPORT_TIME_ZONE,
+    weekday: 'short',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date);
+  const value = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value || '';
+  return {
+    weekday: value('weekday'),
+    date: `${value('year')}-${value('month')}-${value('day')}`,
+    hour: Number(value('hour')),
+    minute: Number(value('minute')),
+  };
+}
+
+function fridaySubmissionWindow(date = new Date()) {
+  const clock = lagosDateParts(date);
+  return {
+    allowed: clock.weekday === 'Fri',
+    localDate: clock.date,
+    localTime: `${String(clock.hour).padStart(2, '0')}:${String(clock.minute).padStart(2, '0')}`,
+    timeZone: REPORT_TIME_ZONE,
+    autoSubmitTime: '16:30',
+  };
+}
+
+function currentReportingWeek(date = new Date()) {
+  const clock = lagosDateParts(date);
+  const midnight = new Date(`${clock.date}T00:00:00.000Z`);
+  const day = midnight.getUTCDay();
+  const monday = new Date(midnight);
+  monday.setUTCDate(midnight.getUTCDate() + (day === 0 ? -6 : 1 - day));
+  const friday = new Date(monday);
+  friday.setUTCDate(monday.getUTCDate() + 4);
+  return {
+    start: monday.toISOString().slice(0, 10),
+    end: friday.toISOString().slice(0, 10),
+  };
+}
+
+function isCurrentReportingWeek(start: unknown, end: unknown) {
+  const current = currentReportingWeek();
+  return String(start || '') === current.start && String(end || '') === current.end;
+}
 
 function userOf(req: Request): any {
   return (req as any).user || null;
@@ -80,6 +131,11 @@ function isValidReportPayload(body: any) {
 }
 
 export function registerPhase2WeeklyRoutes(app: Express, supabase: SupabaseClient) {
+  app.get('/api/weekly-reports/submission-window', async (req, res) => {
+    if (!requireUser(req, res)) return;
+    return res.json(fridaySubmissionWindow());
+  });
+
   app.get('/api/weekly-reports', async (req, res) => {
     const user = requireUser(req, res);
     if (!user) return;
@@ -95,18 +151,16 @@ export function registerPhase2WeeklyRoutes(app: Express, supabase: SupabaseClien
   app.get('/api/weekly-reports/auto-generate', async (req, res) => {
     const user = requireUser(req, res);
     if (!user) return;
-    const weekStartDate = String(req.query.weekStartDate || '');
-    const weekEndDate = String(req.query.weekEndDate || '');
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(weekStartDate) || !/^\d{4}-\d{2}-\d{2}$/.test(weekEndDate)) {
-      return res.status(400).json({ error: 'A valid weekStartDate and weekEndDate are required.' });
-    }
+    const currentWeek = currentReportingWeek();
+    const weekStartDate = currentWeek.start;
+    const weekEndDate = currentWeek.end;
 
     try {
       const [prospectResult, meetingResult, taskResult, activityResult] = await Promise.all([
-        supabase.from('prospects').select('id, assigned_officer_id, created_at').eq('assigned_officer_id', user.userId),
-        supabase.from('meetings').select('id, officer_id, date').eq('officer_id', user.userId),
-        supabase.from('tasks').select('id, officer_id, due_date, is_completed').eq('officer_id', user.userId),
-        supabase.from('activities').select('id, officer_id, date, activity_type, status').eq('officer_id', user.userId),
+        supabase.from('prospects').select('id, name, status, actual_revenue, assigned_officer_id, created_at, updated_at').eq('assigned_officer_id', user.userId),
+        supabase.from('meetings').select('id, prospect_name, purpose, outcome, officer_id, date').eq('officer_id', user.userId),
+        supabase.from('tasks').select('id, title, prospect_name, officer_id, due_date, is_completed').eq('officer_id', user.userId),
+        supabase.from('activities').select('id, prospect_name, officer_id, date, activity_type, outcome, status').eq('officer_id', user.userId),
       ]);
       for (const result of [prospectResult, meetingResult, taskResult, activityResult]) {
         if (result.error) throw result.error;
@@ -116,9 +170,23 @@ export function registerPhase2WeeklyRoutes(app: Express, supabase: SupabaseClien
         return date >= weekStartDate && date <= weekEndDate;
       };
       const prospectsAdded = (prospectResult.data || []).filter((row: any) => within(row.created_at)).length;
-      const meetingsHeld = (meetingResult.data || []).filter((row: any) => within(row.date)).length;
+      const weeklyProspects = (prospectResult.data || []).filter((row: any) => within(row.created_at));
+      const weeklyMeetings = (meetingResult.data || []).filter((row: any) => within(row.date));
+      const meetingsHeld = weeklyMeetings.length;
       const followUpsCompleted = (taskResult.data || []).filter((row: any) => row.is_completed && within(row.due_date)).length;
-      const activitiesLogged = (activityResult.data || []).filter((row: any) => within(row.date)).length;
+      const weeklyActivities = (activityResult.data || []).filter((row: any) => within(row.date));
+      const activitiesLogged = weeklyActivities.length;
+      const converted = (prospectResult.data || []).filter((row: any) => ['Won', 'Converted'].includes(String(row.status)) && within(row.updated_at));
+      const fundsSecured = converted.reduce((sum: number, row: any) => sum + Number(row.actual_revenue || 0), 0);
+      const prospectNames = weeklyProspects.map((row: any) => row.name).filter(Boolean).slice(0, 8);
+      const meetingNames = weeklyMeetings.map((row: any) => row.prospect_name || row.purpose).filter(Boolean).slice(0, 8);
+      const activityTypes = Array.from(new Set(weeklyActivities.map((row: any) => row.activity_type).filter(Boolean))).slice(0, 8);
+      const detailLines = [
+        prospectNames.length ? `New prospects: ${prospectNames.join(', ')}.` : 'No new prospects were recorded.',
+        meetingNames.length ? `Meetings: ${meetingNames.join(', ')}.` : 'No meetings were recorded.',
+        activityTypes.length ? `Activities logged: ${activityTypes.join(', ')}.` : 'No additional CRM activities were recorded.',
+        converted.length ? `Conversions: ${converted.map((row: any) => row.name).filter(Boolean).join(', ')}.` : 'No conversions were recorded.',
+      ];
 
       return res.json({
         weekStartDate,
@@ -126,9 +194,9 @@ export function registerPhase2WeeklyRoutes(app: Express, supabase: SupabaseClien
         prospectsAdded,
         meetingsHeld,
         followUpsCompleted,
-        fundsSecured: 0,
-        productsSold: 'None',
-        summary: `CRM auto-summary: ${prospectsAdded} prospect(s) added, ${meetingsHeld} meeting(s) held, ${followUpsCompleted} follow-up(s) completed and ${activitiesLogged} activity record(s) logged during the reporting week.`,
+        fundsSecured,
+        productsSold: converted.length ? 'Products or mandates connected to conversions should be confirmed by the officer.' : 'None recorded',
+        summary: `SPIP weekly activity summary: ${prospectsAdded} prospect(s) added, ${meetingsHeld} meeting(s) held, ${followUpsCompleted} follow-up(s) completed, ${activitiesLogged} activity record(s) logged and ${converted.length} conversion(s) recorded.\n\n${detailLines.join('\n')}`,
         challenges: '',
         nextWeekPlan: '',
       });
@@ -147,6 +215,12 @@ export function registerPhase2WeeklyRoutes(app: Express, supabase: SupabaseClien
     const requestedStatus = String(req.body.status || 'Draft');
     if (!['Draft', 'Submitted'].includes(requestedStatus)) {
       return res.status(400).json({ error: 'Invalid report status.' });
+    }
+    if (requestedStatus === 'Submitted' && !fridaySubmissionWindow().allowed) {
+      return res.status(409).json({ error: 'Weekly reports can be submitted only on Friday (Africa/Lagos time). You can save and edit the draft until then.' });
+    }
+    if (!isCurrentReportingWeek(req.body.weekStartDate, req.body.weekEndDate)) {
+      return res.status(409).json({ error: 'Only the current Monday-to-Friday reporting week can be created, edited or submitted.' });
     }
 
     let existing: any = null;
@@ -200,13 +274,19 @@ export function registerPhase2WeeklyRoutes(app: Express, supabase: SupabaseClien
   app.post('/api/weekly-reports/submit/:id', async (req, res) => {
     const user = requireUser(req, res);
     if (!user) return;
+    if (!fridaySubmissionWindow().allowed) {
+      return res.status(409).json({ error: 'Weekly reports can be submitted only on Friday (Africa/Lagos time).' });
+    }
     const now = new Date().toISOString();
+    const currentWeek = currentReportingWeek();
     const { data, error } = await supabase
       .from('weekly_reports')
       .update({ status: 'Submitted', submitted_at: now, updated_at: now })
       .eq('id', req.params.id)
       .eq('user_id', user.userId)
       .eq('status', 'Draft')
+      .eq('week_start_date', currentWeek.start)
+      .eq('week_end_date', currentWeek.end)
       .select('*')
       .single();
     if (error || !data) return res.status(409).json({ error: 'Only your own draft report can be submitted.' });

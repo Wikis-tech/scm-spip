@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
+    "@lofcz/pptxgenjs": "^4.1.17",
     "@supabase/supabase-js": "^2.112.0",
     "@tailwindcss/vite": "^4.1.14",
     "@types/web-push": "^3.6.4",
@@ -23,6 +24,7 @@
     "express": "^4.21.2",
     "firebase": "^12.14.0",
     "firebase-admin": "^14.0.0",
+    "jszip": "^3.10.1",
     "lucide-react": "^0.546.0",
     "mammoth": "^1.10.0",
     "motion": "^12.23.24",
@@ -32,8 +34,7 @@
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "recharts": "^3.1.2",
-    "web-push": "^3.6.7",
-    "@lofcz/pptxgenjs": "^4.1.17"
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",

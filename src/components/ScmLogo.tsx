@@ -1,4 +1,5 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
+import { getSpipBranding, type SpipBranding } from '../lib/branding';
 
 interface ScmLogoProps {
   variant?: 'color' | 'light' | 'dark' | 'white';
@@ -13,12 +14,25 @@ export const ScmLogo: React.FC<ScmLogoProps> = ({
   showText = true,
   className = '',
 }) => {
+  const [branding, setBranding] = useState<SpipBranding | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    const load = () => getSpipBranding(true).then((value) => active && setBranding(value));
+    load();
+    window.addEventListener('spip-branding-updated', load);
+    return () => {
+      active = false;
+      window.removeEventListener('spip-branding-updated', load);
+    };
+  }, []);
+
   // Determine dimensions
   const dimensions = {
-    sm: { svg: 'w-7 h-7', text: 'text-xs text-[10px]' },
-    md: { svg: 'w-9 h-9', text: 'text-base text-[11px]' },
-    lg: { svg: 'w-12 h-12', text: 'text-lg text-xs' },
-    xl: { svg: 'w-16 h-16', text: 'text-2xl text-sm' },
+    sm: { svg: 'h-7 w-7', image: 'h-8 max-w-[132px]', main: 'text-[11px]', sub: 'text-[8px]' },
+    md: { svg: 'h-9 w-9', image: 'h-10 max-w-[168px]', main: 'text-sm', sub: 'text-[9px]' },
+    lg: { svg: 'h-12 w-12', image: 'h-[52px] max-w-[200px]', main: 'text-base', sub: 'text-[10px]' },
+    xl: { svg: 'h-16 w-16', image: 'h-16 max-w-[240px]', main: 'text-xl', sub: 'text-xs' },
   }[size];
 
   // Colors based on variant
@@ -145,9 +159,15 @@ export const ScmLogo: React.FC<ScmLogoProps> = ({
 
   return (
     <div className={`flex items-center gap-3 select-none ${className}`}>
+      {branding?.logoUrl ? (
+        <img src={branding.logoUrl} alt="SCM Capital Asset Management" className={`${dimensions.image} w-auto object-contain`} />
+      ) : (
+        <>
       {/* Real SCM Globe Logo Badge */}
       <svg
         className={`${dimensions.svg} shrink-0`}
+        role="img"
+        aria-label="SCM Capital"
         viewBox="0 0 100 100"
         fill="none"
         xmlns="http://www.w3.org/2000/svg"
@@ -186,13 +206,15 @@ export const ScmLogo: React.FC<ScmLogoProps> = ({
       {/* SCM Branding Typography */}
       {showText && (
         <div className="flex flex-col">
-          <span className={`font-display font-black tracking-tight leading-tight ${dimensions.text.split(' ')[0]} ${logoColors.textMain}`}>
-            SCM CAPITAL
+          <span className={`font-display font-black leading-tight tracking-tight ${dimensions.main} ${logoColors.textMain}`}>
+            {branding?.organisationName || 'SCM CAPITAL'}
           </span>
-          <span className={`font-mono font-bold tracking-widest uppercase block ${dimensions.text.split(' ')[1]} ${logoColors.textSub}`}>
-            ASSET MANAGEMENT
+          <span className={`font-mono block font-bold uppercase tracking-widest ${dimensions.sub} ${logoColors.textSub}`}>
+            {branding?.divisionName || 'ASSET MANAGEMENT'}
           </span>
         </div>
+      )}
+        </>
       )}
     </div>
   );

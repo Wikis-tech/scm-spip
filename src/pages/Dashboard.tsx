@@ -8,6 +8,7 @@ import {
   Search,
   Target,
   WalletCards,
+  FileText,
 } from 'lucide-react';
 import { Activity, DashboardMetrics, Meeting, Prospect, Task } from '../types';
 import { OfficerDashboardCharts } from '../components/analytics/BusinessCharts';
@@ -69,6 +70,9 @@ export const Dashboard: React.FC<DashboardProps> = ({
             <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">Focus on the relationships, meetings and follow-ups that need action today.</p>
           </div>
           <div className="flex flex-wrap gap-2">
+            <button onClick={() => setActiveTab('weekly-report')} className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50">
+              <FileText className="h-4 w-4" /> Weekly report
+            </button>
             <button onClick={() => setActiveTab('intelligence')} className="inline-flex items-center gap-2 rounded-xl bg-[#b1191f] px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-[#94151a]">
               <Search className="h-4 w-4" /> Find prospects
             </button>

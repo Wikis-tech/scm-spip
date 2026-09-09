@@ -59,6 +59,33 @@ interface SelectedCompany {
   linkedinUrl: string;
 }
 
+const authorityScore = (contact: ContactEnrichment): number => {
+  const title = `${contact.position || ''} ${contact.department || ''}`.toLowerCase();
+  const seniority = (contact.seniority || '').toLowerCase();
+  let score = 0;
+  if (/chief financial officer|\bcfo\b/.test(title)) score += 150;
+  else if (/treasurer|head of treasury|treasury director|director.*treasury/.test(title)) score += 145;
+  else if (/finance director|head of finance|director.*finance|chief investment officer|\bcio\b/.test(title)) score += 135;
+  else if (/chief executive officer|\bceo\b|managing director|president/.test(title)) score += 125;
+  else if (/chief operating officer|\bcoo\b|executive director/.test(title)) score += 115;
+  else if (/finance|treasury|investment|corporate strategy/.test(title)) score += 95;
+  else if (/chief|director|head|partner|owner|founder|vice president|\bvp\b/.test(title)) score += 75;
+  const seniorityWeight: Record<string, number> = { c_suite: 40, owner: 38, founder: 36, partner: 34, vp: 32, head: 30, director: 26, manager: 16, senior: 10 };
+  score += seniorityWeight[seniority] || 0;
+  if (contact.email) score += 5;
+  if (contact.phone) score += 4;
+  if (contact.linkedin) score += 2;
+  return score;
+};
+
+const isObscuredApolloName = (name: string): boolean => /\*{2,}|unknown/i.test(name || '');
+const contactStatus = (contact: ContactEnrichment) => {
+  const contactable = Boolean(contact.email || contact.phone || contact.linkedin);
+  return !isObscuredApolloName(contact.fullName) && contactable
+    ? { label: 'Contactable Apollo match', className: 'bg-emerald-50 text-emerald-800 border-emerald-200' }
+    : { label: 'Apollo role match', className: 'bg-amber-50 text-amber-800 border-amber-200' };
+};
+
 export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, scmFetch }) => {
   const apiFetch = scmFetch || fetch;
   const [query, setQuery] = useState('');
@@ -524,6 +551,12 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
     const cat = getContactCategory(c.fullName || '', c.position || '', c.department || '');
     return cat === contactClassifier;
   }) : [];
+
+  const topAuthorityContacts = [...rawContacts]
+    .filter((contact, index, contacts) => contact.fullName && contact.fullName !== 'Unknown'
+      && contacts.findIndex((candidate) => `${candidate.fullName}|${candidate.position}`.toLowerCase() === `${contact.fullName}|${contact.position}`.toLowerCase()) === index)
+    .sort((a, b) => authorityScore(b) - authorityScore(a))
+    .slice(0, 3);
 
   console.log(
     `[CONTACT TRACE] Before Filter: ${rawContacts.length}, After Filter: ${classifiedContacts.length}`
@@ -1469,6 +1502,37 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
                   </div>
                 )}
 
+                {topAuthorityContacts.length > 0 && (
+                  <section className="bg-white border border-slate-200 rounded-xl p-4 shadow-xs space-y-3" aria-labelledby="top-authorities-heading">
+                    <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-2 border-b border-slate-100 pb-3">
+                      <div>
+                        <div className="flex items-center gap-2"><Award className="w-4 h-4 text-[#b1191f]" /><h3 id="top-authorities-heading" className="text-sm font-extrabold text-slate-900">Top 3 decision-makers</h3></div>
+                        <p className="mt-1 text-[10px] text-slate-500">Ranked for SCM prospecting by finance, treasury and executive authority. Details are shown only when returned by Apollo.</p>
+                      </div>
+                      <span className="text-[9px] font-bold text-slate-500 bg-slate-50 border border-slate-200 rounded-md px-2 py-1 w-fit">{topAuthorityContacts.length} strongest match{topAuthorityContacts.length === 1 ? '' : 'es'}</span>
+                    </div>
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+                      {topAuthorityContacts.map((contact, index) => {
+                        const status = contactStatus(contact);
+                        return (
+                          <article key={`${contact.fullName}-${contact.position}`} className="rounded-xl border border-slate-200 p-4 bg-slate-50/40">
+                            <div className="flex items-start justify-between gap-2"><span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[#b1191f] text-white text-xs font-black">{index + 1}</span><span className={`text-[8px] font-extrabold uppercase border rounded-md px-2 py-1 ${status.className}`}>{status.label}</span></div>
+                            <h4 className="mt-3 text-sm font-extrabold text-slate-900">{contact.fullName}</h4>
+                            <p className="mt-1 text-[10px] font-bold text-[#b1191f] uppercase">{contact.position || 'Role unavailable'}</p>
+                            <p className="mt-1 text-[10px] text-slate-500">{contact.department || 'Department unavailable'}</p>
+                            <div className="mt-3 space-y-2 border-t border-slate-200 pt-3 text-[10px]">
+                              {contact.email ? <a href={`mailto:${contact.email}`} className="flex items-center gap-2 text-slate-700 hover:text-[#b1191f] break-all"><Mail className="w-3.5 h-3.5 shrink-0" />{contact.email}</a> : <div className="flex items-center gap-2 text-slate-400"><Mail className="w-3.5 h-3.5" />Business email unavailable</div>}
+                              {contact.phone ? <a href={`tel:${contact.phone}`} className="flex items-center gap-2 text-slate-700 hover:text-[#b1191f]"><Phone className="w-3.5 h-3.5 shrink-0" />{contact.phone}</a> : <div className="flex items-center gap-2 text-slate-400"><Phone className="w-3.5 h-3.5" />Phone unavailable</div>}
+                              {contact.linkedin && /^https?:\/\//i.test(contact.linkedin) ? <a href={contact.linkedin} target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 text-indigo-700 hover:text-[#b1191f]"><Linkedin className="w-3.5 h-3.5 shrink-0" />Open LinkedIn profile</a> : <div className="flex items-center gap-2 text-slate-400"><Linkedin className="w-3.5 h-3.5" />LinkedIn unavailable</div>}
+                            </div>
+                          </article>
+                        );
+                      })}
+                    </div>
+                    <p className="text-[9px] text-slate-400">Apollo People Search may mask identities and does not supply email or phone by default. SPIP never guesses missing contact information.</p>
+                  </section>
+                )}
+
                 {/* Discovered Cards List */}
                 {classifiedContacts.length > 0 ? (
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -1486,9 +1550,9 @@ export const Intelligence: React.FC<IntelligenceProps> = ({ onImportProspect, sc
                         >
                           <div className="space-y-3">
                             {/* Phase 6 Badge: APOLLO PERSON MATCH */}
-                            <div className="flex items-center gap-1.5 bg-emerald-50 text-emerald-800 border border-emerald-100 rounded-lg px-2.5 py-1 text-[9px] font-extrabold uppercase w-fit">
+                            <div className={`flex items-center gap-1.5 border rounded-lg px-2.5 py-1 text-[9px] font-extrabold uppercase w-fit ${contactStatus(c).className}`}>
                               <ShieldCheck className="w-3.5 h-3.5 text-emerald-700" />
-                              VERIFIED APOLLO CONTACT
+                              {contactStatus(c).label}
                             </div>
 
                             <div className="flex items-start justify-between">

@@ -5,33 +5,39 @@ import { AuthScreen } from './components/AuthScreen';
 import { TrustHelpCenter } from './components/TrustHelpCenter';
 import { OnboardingWizard } from './components/OnboardingWizard';
 import { MeetingReminderManager } from './components/MeetingReminderManager';
+import { MobileNavigation } from './components/MobileNavigation';
+import { PwaExperience } from './components/PwaExperience';
 import { Dashboard } from './pages/Dashboard';
 import { Prospects } from './pages/Prospects';
-import { Intelligence } from './pages/Intelligence';
 import { Contacts } from './pages/Contacts';
 import { Activities } from './pages/Activities';
 import { Meetings } from './pages/Meetings';
-import { Reports } from './pages/Reports';
-import { Settings } from './pages/Settings';
 import { Tasks } from './pages/Tasks';
 import { CRM } from './pages/CRM';
 import { Client360 } from './pages/Client360';
 import { Pipeline } from './pages/Pipeline';
 import { CalendarPage } from './pages/CalendarPage';
-import { AdminDashboard } from './pages/AdminDashboard';
-import { WeeklyReport } from './pages/WeeklyReport';
-import { ManagementReports } from './pages/ManagementReports';
-import { ExecutiveSummary } from './pages/ExecutiveSummary';
-import { Workspaces } from './pages/Workspaces';
-import { IntelligenceCopilot } from './pages/IntelligenceCopilot';
-import { HelpCircle, Sparkles, ShieldCheck } from 'lucide-react';
+import { AlertTriangle, HelpCircle, RefreshCw, Sparkles, ShieldCheck } from 'lucide-react';
 import { UserProfile, UserRole, Prospect, Contact, Activity, Meeting, DashboardMetrics, Task, NewsArticle, DiscoveredLead, StaffPerformance } from './types';
-import { registerServiceWorkerAndSubscribe, isPushSupported } from './services/pushService';
 import { supabase } from './lib/supabase';
+
+const Intelligence = React.lazy(() => import('./pages/Intelligence').then(module => ({ default: module.Intelligence })));
+const Reports = React.lazy(() => import('./pages/Reports').then(module => ({ default: module.Reports })));
+const Settings = React.lazy(() => import('./pages/Settings').then(module => ({ default: module.Settings })));
+const AdminDashboard = React.lazy(() => import('./pages/AdminDashboard').then(module => ({ default: module.AdminDashboard })));
+const WeeklyReport = React.lazy(() => import('./pages/WeeklyReport').then(module => ({ default: module.WeeklyReport })));
+const ManagementReports = React.lazy(() => import('./pages/ManagementReports').then(module => ({ default: module.ManagementReports })));
+const Analytics = React.lazy(() => import('./pages/Analytics').then(module => ({ default: module.Analytics })));
+const ExecutiveSummary = React.lazy(() => import('./pages/ExecutiveSummary').then(module => ({ default: module.ExecutiveSummary })));
+const Workspaces = React.lazy(() => import('./pages/Workspaces').then(module => ({ default: module.Workspaces })));
+const IntelligenceCopilot = React.lazy(() => import('./pages/IntelligenceCopilot').then(module => ({ default: module.IntelligenceCopilot })));
 
 export default function App() {
   // Navigation states
-  const [activeTab, setActiveTab] = useState<string>('dashboard');
+  const [activeTab, setActiveTab] = useState<string>(() => {
+    const requested = new URLSearchParams(window.location.search).get('view');
+    return ['dashboard', 'prospects', 'copilot', 'analytics'].includes(requested || '') ? requested! : 'dashboard';
+  });
   const [crmSubTab, setCrmSubTab] = useState<string>('contacts');
   const [searchTerm, setSearchTerm] = useState<string>('');
   
@@ -127,23 +133,6 @@ export default function App() {
     };
   }, []);
 
-  // Auto-register background service worker and push subscription for authenticated user
-  useEffect(() => {
-    if (currentUser && isPushSupported()) {
-      if (Notification.permission !== 'denied') {
-        registerServiceWorkerAndSubscribe(currentUser.id, currentUser.email, currentUser.role)
-          .then((success) => {
-            if (success) {
-              console.log('[PUSH SERVICE] Successfully auto-registered and synchronized web push subscription.');
-            }
-          })
-          .catch((err) => {
-            console.error('[PUSH SERVICE ERROR] Failed to register or synchronize:', err);
-          });
-      }
-    }
-  }, [currentUser]);
-
   // SCM CRM Database states
   const [metrics, setMetrics] = useState<DashboardMetrics>({
     totalProspects: 0,
@@ -165,6 +154,7 @@ export default function App() {
   const [staffPerformance, setStaffPerformance] = useState<StaffPerformance[]>([]);
   
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [dataLoadError, setDataLoadError] = useState<string>('');
 
   const scmFetch = async (url: string, options: RequestInit = {}) => {
     const { data } = await supabase.auth.getSession();
@@ -178,23 +168,47 @@ export default function App() {
   const refreshDatabase = async () => {
     if (!currentUser) return;
     setIsLoading(true);
+    setDataLoadError('');
+
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 20_000);
 
     const isAdminUser = currentUser.permissionLevel === 'SUPER_ADMIN' || currentUser.permissionLevel === 'HOD_ADMIN';
 
     try {
+      let failedRequests = 0;
+      const loadJson = async <T,>(url: string, fallback: T): Promise<T> => {
+        try {
+          const response = await scmFetch(url, { signal: controller.signal });
+          if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+          return await response.json();
+        } catch (error) {
+          failedRequests += 1;
+          console.error(`[SCM DATA] Unable to load ${url}:`, error);
+          return fallback;
+        }
+      };
+
       const [resMetrics, resProspects, resContacts, resActivities, resMeetings, resTasks, resNews, resLeads, resStaff] = await Promise.all([
-        scmFetch('/api/dashboard/metrics').then(r => r.json()).catch(() => ({})),
-        scmFetch('/api/crm/prospects').then(r => r.json()).catch(() => []),
-        scmFetch('/api/crm/contacts').then(r => r.json()).catch(() => []),
-        scmFetch('/api/crm/activities').then(r => r.json()).catch(() => []),
-        scmFetch('/api/crm/meetings').then(r => r.json()).catch(() => []),
-        scmFetch('/api/crm/tasks').then(r => r.json()).catch(() => []),
-        scmFetch('/api/news').then(r => r.json()).catch(() => []),
-        scmFetch('/api/discovery/leads').then(r => r.json()).catch(() => []),
+        loadJson('/api/dashboard/metrics', {}),
+        loadJson('/api/crm/prospects', []),
+        loadJson('/api/crm/contacts', []),
+        loadJson('/api/crm/activities', []),
+        loadJson('/api/crm/meetings', []),
+        loadJson('/api/crm/tasks', []),
+        loadJson('/api/news', []),
+        loadJson('/api/discovery/leads', []),
         isAdminUser 
-          ? scmFetch('/api/team/performance').then(r => r.json()).catch(() => [])
+          ? loadJson('/api/team/performance', [])
           : Promise.resolve([])
       ]);
+
+      const requestCount = isAdminUser ? 9 : 8;
+      if (failedRequests === requestCount) {
+        setDataLoadError('SPIP could not reach the secure CRM service. Your session is still active; please retry.');
+      } else if (failedRequests > 0) {
+        setDataLoadError('Some workspace information could not be refreshed. Available records are shown below.');
+      }
 
       const safeProspects = Array.isArray(resProspects) ? resProspects : [];
       const safeContacts = Array.isArray(resContacts) ? resContacts : [];
@@ -223,7 +237,9 @@ export default function App() {
       setStaffPerformance(safeStaff);
     } catch (err) {
       console.error('Core synchronizer engine encountering lags accessing Node server:', err);
+      setDataLoadError('SPIP could not refresh the secure CRM data. Please check your connection and try again.');
     } finally {
+      window.clearTimeout(timeout);
       setIsLoading(false);
     }
   };
@@ -264,7 +280,7 @@ export default function App() {
   // Launch welcome onboarding wizard for first-time session logins
   useEffect(() => {
     if (currentUser) {
-      const hasOnboarded = localStorage.getItem('scm_completed_onboarding');
+      const hasOnboarded = localStorage.getItem(`spip_onboarding_${currentUser.id}_v10`);
       if (hasOnboarded !== 'true') {
         setOnboardingActive(true);
       }
@@ -620,9 +636,12 @@ export default function App() {
     if (!currentUser) return null;
     if (isLoading) {
       return (
-        <div className="flex flex-col items-center justify-center p-20 space-y-4">
-          <div className="w-10 h-10 border-4 border-slate-200 border-t-primary-brand rounded-full animate-spin"></div>
-          <span className="text-xs font-semibold text-slate-500 animate-pulse uppercase tracking-widest font-mono">Loading secure CRM data...</span>
+        <div className="flex min-h-[55vh] flex-col items-center justify-center space-y-4 p-8" role="status" aria-live="polite">
+          <div className="h-10 w-10 animate-spin rounded-full border-4 border-slate-200 border-t-primary-brand" />
+          <div className="text-center">
+            <span className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-600">Loading secure CRM data</span>
+            <p className="mt-2 text-xs text-slate-400">Synchronising your permitted workspace records.</p>
+          </div>
         </div>
       );
     }
@@ -830,6 +849,8 @@ export default function App() {
             currentUser={currentUser}
           />
         );
+      case 'analytics':
+        return <Analytics currentUser={currentUser} scmFetch={scmFetch} />;
       case 'weekly-report':
         return (
           <WeeklyReport
@@ -869,8 +890,11 @@ export default function App() {
 
   if (!authReady) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-950 text-white">
-        <div className="text-sm text-slate-300">Loading secure SPIP session...</div>
+      <div className="spip-auth-grid flex min-h-screen items-center justify-center text-white">
+        <div className="flex flex-col items-center gap-4" role="status" aria-live="polite">
+          <div className="h-10 w-10 animate-spin rounded-full border-4 border-white/15 border-t-[#d82d35]" />
+          <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-300">Loading secure SPIP session</div>
+        </div>
       </div>
     );
   }
@@ -889,7 +913,10 @@ export default function App() {
   }
 
   return (
-    <div id="scm-app-layout" className="flex h-screen bg-slate-50 text-slate-800 overflow-hidden font-sans">
+    <div id="scm-app-layout" className="spip-shell flex h-screen overflow-hidden font-sans text-slate-800">
+      <a href="#main-content" className="fixed left-3 top-3 z-[100] -translate-y-24 rounded-lg bg-white px-4 py-2 text-sm font-semibold text-slate-900 shadow-xl transition focus:translate-y-0">
+        Skip to main content
+      </a>
       {/* Sidebar - Handles platform navigation and active role simulations */}
       <Sidebar
         activeTab={activeTab}
@@ -909,12 +936,13 @@ export default function App() {
       {!sidebarCollapsed && (
         <div 
           onClick={handleToggleSidebar}
-          className="fixed inset-0 bg-slate-950/45 md:hidden z-25 transition-opacity duration-350"
+          className="fixed inset-0 z-25 bg-slate-950/55 backdrop-blur-[2px] transition-opacity duration-300 md:hidden"
+          aria-label="Close navigation"
         />
       )}
 
       {/* Main Container */}
-      <div className={`flex-1 flex flex-col min-w-0 overflow-hidden relative transition-all duration-300 ${sidebarCollapsed ? 'pl-0 md:pl-16' : 'pl-0 md:pl-64'}`}>
+      <div className={`relative flex min-w-0 flex-1 flex-col overflow-hidden transition-all duration-300 ${sidebarCollapsed ? 'pl-0 md:pl-[72px]' : 'pl-0 md:pl-[272px]'}`}>
         {/* Header - Holds clocks, status checks and query triggers */}
         <Header
           currentUser={currentUser}
@@ -927,32 +955,45 @@ export default function App() {
         />
 
         {/* Dynamic page content rendering */}
-        <main className="flex-1 overflow-y-auto p-6 focus:outline-none bg-slate-50/50">
-          <div className="max-w-7xl mx-auto">
-            {getActiveTabScreen()}
+        <main id="main-content" className="flex-1 overflow-y-auto bg-transparent p-3 focus:outline-none sm:p-5 lg:p-7">
+          <div className="spip-page-content">
+            {dataLoadError && (
+              <div className="mb-4 flex flex-col gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-amber-950 shadow-sm sm:flex-row sm:items-center sm:justify-between" role="alert">
+                <div className="flex min-w-0 items-start gap-3">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                  <p className="text-xs font-medium leading-relaxed">{dataLoadError}</p>
+                </div>
+                <button onClick={refreshDatabase} className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-900 transition hover:bg-amber-100">
+                  <RefreshCw className="h-3.5 w-3.5" /> Retry sync
+                </button>
+              </div>
+            )}
+            <React.Suspense fallback={<div className="grid min-h-[45vh] place-items-center" role="status"><div className="text-center"><RefreshCw className="mx-auto h-6 w-6 animate-spin text-[#b1191f]"/><p className="mt-3 text-xs font-semibold text-slate-500">Loading workspace…</p></div></div>}>
+              {getActiveTabScreen()}
+            </React.Suspense>
           </div>
         </main>
       </div>
 
       {/* Floating Unified Help & Onboarding Trigger (Phase 9 & 10) */}
-      <div className="fixed bottom-6 right-6 z-40 flex items-center gap-2">
+      <div className="fixed bottom-[calc(5.25rem+env(safe-area-inset-bottom))] right-3 z-30 flex items-center gap-2 md:bottom-5 md:right-5 md:z-40">
         <button
           id="global-onboarding-restart-btn"
           onClick={() => setOnboardingActive(true)}
-          className="bg-slate-900 border border-slate-700 hover:bg-slate-800 text-white font-bold text-[10px] px-3 py-2.5 rounded-xl transition-all shadow-lg flex items-center gap-1 cursor-pointer"
+          className="flex min-h-11 items-center gap-1 rounded-xl border border-slate-700 bg-slate-900 px-3 text-[10px] font-bold text-white shadow-lg transition-all hover:bg-slate-800"
           title="Restart Guided Interactive Welcome Tour"
         >
-          <Sparkles className="w-3.5 h-3.5 text-amber-500 animate-pulse" />
-          <span>Tour Guide</span>
+          <Sparkles className="h-3.5 w-3.5 text-amber-400" />
+          <span className="hidden sm:inline">Tour Guide</span>
         </button>
         <button 
           id="global-help-center-toggle-btn"
           onClick={() => setHelpCenterActive(true)}
-          className="bg-[#b1191f] hover:bg-[#8e1217] text-white font-bold text-xs px-4 py-3 rounded-xl transition-all shadow-lg hover:scale-105 active:scale-95 flex items-center gap-1.5 cursor-pointer animate-pulse"
+          className="flex min-h-11 items-center gap-1.5 rounded-xl bg-[#b1191f] px-3 text-xs font-bold text-white shadow-lg transition-all hover:bg-[#8e1217] active:translate-y-px sm:px-4"
           title="Open SCM Support & FAQ Help Center"
         >
           <HelpCircle className="w-4 h-4 text-white" />
-          <span>Help & Support</span>
+          <span className="hidden sm:inline">Help & Support</span>
         </button>
       </div>
 
@@ -961,7 +1002,7 @@ export default function App() {
         <OnboardingWizard
           onClose={() => {
             setOnboardingActive(false);
-            localStorage.setItem('scm_completed_onboarding', 'true');
+            localStorage.setItem(`spip_onboarding_${currentUser.id}_v10`, 'true');
           }}
           setActiveTab={setActiveTab}
         />
@@ -971,12 +1012,20 @@ export default function App() {
       {helpCenterActive && (
         <TrustHelpCenter
           onClose={() => setHelpCenterActive(false)}
-          setActiveTab={setActiveTab}
+          onStartTour={() => setOnboardingActive(true)}
+          currentUser={currentUser}
+          scmFetch={scmFetch}
         />
       )}
 
       {/* SCM Browser-Based Meeting Reminders Engine */}
       <MeetingReminderManager meetings={meetings} />
+      <PwaExperience />
+      <MobileNavigation
+        activeTab={activeTab}
+        onNavigate={(tab) => { setActiveTab(tab); setSidebarCollapsed(true); }}
+        onMore={() => setSidebarCollapsed(false)}
+      />
     </div>
   );
 }

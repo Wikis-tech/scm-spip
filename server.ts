@@ -1,6 +1,7 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
+import { randomUUID } from "crypto";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
@@ -26,6 +27,9 @@ import { registerPhase2WeeklyRoutes } from "./src/server/phase2WeeklyRoutes.ts";
 import { registerPublicAuthRoutes } from "./src/server/publicAuthRoutes.ts";
 import { registerPhase3Routes } from "./src/server/phase3Routes.ts";
 import { registerPhase3CrudRoutes } from "./src/server/phase3CrudRoutes.ts";
+import { registerPhase7Routes } from "./src/server/phase7Routes.ts";
+import { registerPhase8Routes } from "./src/server/phase8Routes.ts";
+import { registerPhase10Routes } from "./src/server/phase10Routes.ts";
 import { discoveryQueueEngine, DBClientContext } from "./src/services/discovery/discoveryQueueEngine.ts";
 
 // Helper to validate corporate email domain and format
@@ -333,7 +337,20 @@ async function robustGenerateContent(params: { model?: string; contents: any; co
 }
 
 const app = express();
-app.use(express.json());
+app.disable('x-powered-by');
+app.set('query parser', 'simple');
+app.use((req, res, next) => {
+  const supplied = String(req.headers['x-request-id'] || '');
+  const requestId = /^[a-zA-Z0-9._-]{8,100}$/.test(supplied) ? supplied : randomUUID();
+  (req as any).requestId = requestId;
+  res.setHeader('X-Request-ID', requestId);
+  if (req.path.startsWith('/api')) {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Pragma', 'no-cache');
+  }
+  next();
+});
+app.use(express.json({ limit: '256kb' }));
 
 const supabaseUrl = process.env.SUPABASE_URL?.trim();
 const supabaseServerKey = (process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY)?.trim();
@@ -358,7 +375,9 @@ const PUBLIC_API_PATHS = new Set([
   '/api/auth/register',
   '/api/auth/verify',
   '/api/auth/forgot-password',
-  '/api/auth/reset-password'
+  '/api/auth/reset-password',
+  '/api/branding',
+  '/api/health'
 ]);
 
 app.use(async (req, res, next) => {
@@ -457,6 +476,9 @@ registerPhase2WeeklyRoutes(app, supabaseServer);
 // the legacy direct-PostgreSQL health gate.
 registerPhase3Routes(app, supabaseServer);
 registerPhase3CrudRoutes(app, supabaseServer);
+registerPhase7Routes(app, supabaseServer);
+registerPhase8Routes(app, supabaseServer);
+registerPhase10Routes(app, supabaseServer);
 
 const PORT = Number(process.env.PORT || 3000);
 

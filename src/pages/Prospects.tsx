@@ -172,7 +172,7 @@ export const Prospects: React.FC<ProspectsProps> = ({
 
   const handleRunScan = async () => {
     setIsScanning(true);
-    setRadarMessage("Running SCM Apex AI Discovery Scan across public sectors, corporate registries and intelligence channels...");
+    setRadarMessage("Finding one new company that has not been allocated to another SPIP employee...");
     setRadarError(null);
     try {
       if (onScanDiscovery) {
@@ -184,7 +184,10 @@ export const Prospects: React.FC<ProspectsProps> = ({
           revenueRange: scanRevenueRange,
           targetProduct: scanTargetProduct
         });
-        setRadarMessage(`Scan completed successfully! Discovered ${result.newDiscoveredCount || result.discoveredCount || 0} target leads matching your specific criteria.`);
+        const allocated = result.leads?.[0];
+        setRadarMessage(allocated
+          ? `${allocated.name} has been reserved exclusively for your private discovery queue.`
+          : (result.message || 'No unallocated company matched these filters. Try another sector or location.'));
       } else {
         await onTriggerDiscovery();
         setRadarMessage("SCM Apex Discovery Radar scan completed successfully!");
@@ -207,7 +210,7 @@ export const Prospects: React.FC<ProspectsProps> = ({
     setRadarError(null);
     try {
       await onImportDiscovery(id);
-      setRadarMessage(`Success! Mapped ${name} into active SCM CRM. Automatically initialized dedicated Research Workspace and primary CFO Contact for seamless outreach.`);
+      setRadarMessage(`Success! ${name} is now assigned to you in Prospects. Only genuinely verified contact details were imported.`);
       await fetchDiscoveryHistoryAndAnalytics();
     } catch (err: any) {
       setRadarError(err.message || `Failed to import ${name}.`);
@@ -785,13 +788,13 @@ export const Prospects: React.FC<ProspectsProps> = ({
                 <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-3 pb-3 border-b border-slate-100">
                   <div>
                     <div className="flex items-center gap-2">
-                      <h3 className="font-display font-semibold text-sm text-slate-800 uppercase tracking-wide">Apex Enterprise AI Prospect Discovery Radar</h3>
+                      <h3 className="font-display font-semibold text-sm text-slate-800 uppercase tracking-wide">Apex Discovery</h3>
                       <span className="bg-[#b1191f]/10 text-[#b1191f] text-[9px] font-extrabold px-2 py-0.5 rounded-full border border-[#b1191f]/20 uppercase">
                         AI Engine v4.0
                       </span>
                     </div>
                     <p className="text-[11px] text-slate-500 mt-0.5">
-                      Targeted multi-source scanner & SCM product matching algorithm for Nigerian institutional treasury prospects.
+                      Finds one suitable company per click, reserves it to your private queue, then enriches available facts with Apollo. A company allocated to one employee cannot be allocated to another.
                     </p>
                   </div>
 
@@ -804,12 +807,12 @@ export const Prospects: React.FC<ProspectsProps> = ({
                     {isScanning ? (
                       <>
                         <RefreshCw className="w-4 h-4 animate-spin" />
-                        <span>Executing SCM AI Scan...</span>
+                        <span>Finding your next prospect...</span>
                       </>
                     ) : (
                       <>
                         <Zap className="w-4 h-4 text-amber-300 fill-amber-300" />
-                        <span>Run SCM AI Discovery Scan</span>
+                        <span>Find next prospect</span>
                       </>
                     )}
                   </button>
@@ -1003,7 +1006,7 @@ export const Prospects: React.FC<ProspectsProps> = ({
                       </div>
                       <h4 className="font-display font-semibold text-sm text-slate-800">Your AI Discovery Queue is Empty</h4>
                       <p className="text-xs text-slate-500 max-w-md mx-auto">
-                        No target leads cached in your personal workspace queue. Configure the scanner filters above and click "Run SCM AI Discovery Scan" to generate new institutional leads.
+                        Choose your filters and ask Apex Discovery for one prospect. The company will be reserved to you and will not appear in another employee's queue.
                       </p>
                       <button
                         onClick={handleRunScan}
@@ -1011,7 +1014,7 @@ export const Prospects: React.FC<ProspectsProps> = ({
                         className="bg-[#b1191f] text-white hover:bg-[#8e1217] font-semibold text-xs px-4 py-2 rounded-lg transition-all cursor-pointer inline-flex items-center gap-2"
                       >
                         <Zap className="w-4 h-4 fill-amber-300 text-amber-300" />
-                        <span>Run Discovery Scan Now</span>
+                        <span>Find my first prospect</span>
                       </button>
                     </div>
                   ) : (
@@ -1047,6 +1050,10 @@ export const Prospects: React.FC<ProspectsProps> = ({
 
                               <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded border border-slate-200 font-medium">
                                 {lead.source || 'NGX Listed'}
+                              </span>
+
+                              <span className={`text-[10px] px-2 py-0.5 rounded border font-semibold ${lead.enrichmentStatus === 'Enriched' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-amber-50 text-amber-700 border-amber-200'}`}>
+                                {lead.enrichmentStatus === 'Enriched' ? 'Apollo verified' : 'Public-source lead'}
                               </span>
 
                               <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded border border-slate-200 font-medium">
