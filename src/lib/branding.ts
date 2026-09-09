@@ -1,6 +1,7 @@
 export type SpipBranding = {
   logoUrl: string;
   faviconUrl: string;
+  appIconUrl: string;
   organisationName: string;
   divisionName: string;
 };
@@ -8,6 +9,7 @@ export type SpipBranding = {
 const FALLBACK: SpipBranding = {
   logoUrl: '',
   faviconUrl: '',
+  appIconUrl: '',
   organisationName: 'SCM CAPITAL',
   divisionName: 'ASSET MANAGEMENT',
 };
