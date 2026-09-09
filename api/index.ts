@@ -98,6 +98,8 @@ async function sendPushToUser(userId: string, reminder: any) {
   if (error) throw error;
   if (!subscriptions?.length) return { delivered: 0, failed: 0, reason: 'NO_ACTIVE_DEVICE' };
 
+  const { data: branding } = await supabase.from('platform_settings').select('value').eq('key', 'branding').maybeSingle();
+  const notificationIcon = branding?.value?.appIconUrl || branding?.value?.faviconUrl || '/icons/spip-192.png';
   const payload = JSON.stringify({
     id: reminder.id,
     title: reminder.title,
@@ -108,6 +110,8 @@ async function sendPushToUser(userId: string, reminder: any) {
     url: reminder.metadata?.url || '/calendar',
     requireInteraction: reminder.priority === 'critical' || Boolean(reminder.metadata?.requireInteraction),
     timestamp: Date.now(),
+    icon: notificationIcon,
+    badge: notificationIcon,
   });
 
   let delivered = 0;
@@ -132,6 +136,30 @@ async function sendPushToUser(userId: string, reminder: any) {
     }
   }
   return { delivered, failed, reason: delivered ? null : 'DELIVERY_FAILED' };
+}
+
+async function handlePwaManifest(req: any, res: any, path: string) {
+  if (path !== 'pwa/manifest.webmanifest' || req.method !== 'GET') return false;
+  const { data } = await supabase.from('platform_settings').select('value').eq('key', 'branding').maybeSingle();
+  const icon = data?.value?.appIconUrl || '/icons/spip-512.png';
+  res.setHeader('Content-Type', 'application/manifest+json');
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    name: 'SCM Prospect Intelligence Platform', short_name: 'SPIP',
+    description: 'Secure prospect intelligence, relationship management and analytics for SCM Capital Asset Management.',
+    id: '/', start_url: '/?source=pwa', scope: '/', display: 'standalone', orientation: 'any',
+    background_color: '#f4f7fa', theme_color: '#07192b', categories: ['business', 'finance', 'productivity'],
+    icons: [
+      { src: icon, sizes: '512x512', type: 'image/png', purpose: 'any' },
+      { src: icon, sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+    ],
+    shortcuts: [
+      { name: 'My Dashboard', short_name: 'Dashboard', url: '/?view=dashboard' },
+      { name: 'Prospects', short_name: 'Prospects', url: '/?view=prospects' },
+      { name: 'Intelligence Copilot', short_name: 'Copilot', url: '/?view=copilot' },
+    ],
+  });
+  return true;
 }
 
 async function dispatchDueReminders() {
@@ -514,6 +542,8 @@ export default async function handler(req: any, res: any) {
   const path = Array.isArray(rawPath) ? rawPath.join('/') : String(rawPath || '').replace(/^\/+/, '');
 
   if (await handleWeeklyReportCron(req, res, path)) return;
+
+  if (await handlePwaManifest(req, res, path)) return;
 
   // Phase 6 AI must bypass the legacy Express/PostgreSQL availability gate. The
   // Copilot uses authenticated Supabase + server-side AI providers and should not
