@@ -321,10 +321,12 @@ async function autoSubmitWeeklyReports() {
       week_start_date: clock.start,
       week_end_date: clock.end,
       summary: String(existing?.summary || '').trim() || generatedSummary,
-      prospects_added: weeklyProspects.length,
-      meetings_held: weeklyMeetings.length,
-      follow_ups_completed: weeklyTasks.length,
-      funds_secured: fundsSecured,
+      // Preserve the employee's reviewed edits when a draft exists. For an
+      // employee who never prepared a draft, submit the live CRM totals.
+      prospects_added: existing ? Number(existing.prospects_added || 0) : weeklyProspects.length,
+      meetings_held: existing ? Number(existing.meetings_held || 0) : weeklyMeetings.length,
+      follow_ups_completed: existing ? Number(existing.follow_ups_completed || 0) : weeklyTasks.length,
+      funds_secured: existing ? Number(existing.funds_secured || 0) : fundsSecured,
       products_sold: String(existing?.products_sold || '').trim() || (conversions.length ? 'Products or mandates connected to conversions require management confirmation.' : 'None recorded'),
       challenges: String(existing?.challenges || '').trim() || 'No challenges were entered before the automatic submission deadline.',
       next_week_plan: String(existing?.next_week_plan || '').trim() || 'No next-week plan was entered before the automatic submission deadline.',
