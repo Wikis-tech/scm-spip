@@ -36,6 +36,8 @@ export interface ApolloClientTelemetry {
 export class ApolloClient {
   private static instance: ApolloClient | null = null;
   private apiKey = '';
+  private apiKeys: string[] = [];
+  private activeKeyIndex = 0;
   private baseUrl = 'https://api.apollo.io/api/v1';
   private timeoutMs = 12000;
   private maxRetries = 2;
@@ -83,6 +85,10 @@ export class ApolloClient {
     }
 
     this.apiKey = key;
+    const secondary = String(process.env.APOLLO_API_KEY_SECONDARY || '').trim().replace(/^['"]|['"]$/g, '');
+    this.apiKeys = [key, secondary].filter((value, index, values) => Boolean(value) && values.indexOf(value) === index);
+    this.activeKeyIndex = Math.min(this.activeKeyIndex, Math.max(0, this.apiKeys.length - 1));
+    this.apiKey = this.apiKeys[this.activeKeyIndex] || '';
     this.baseUrl = (config?.baseUrl || process.env.APOLLO_BASE_URL || 'https://api.apollo.io/api/v1').replace(/\/+$/, '');
     this.timeoutMs = config?.timeoutMs || Number(process.env.APOLLO_TIMEOUT) || 12000;
     this.maxRetries = config?.maxRetries ?? (Number(process.env.APOLLO_MAX_RETRIES) || 2);
@@ -168,6 +174,7 @@ export class ApolloClient {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
       try {
+        headers['X-Api-Key'] = this.apiKeys[this.activeKeyIndex] || this.apiKey;
         const response = await fetch(fullUrl, { ...fetchOptions, signal: controller.signal });
         clearTimeout(timeoutId);
         const latencyMs = Date.now() - start;
@@ -187,6 +194,14 @@ export class ApolloClient {
         lastError = `Apollo returned HTTP ${response.status}.`;
         this.telemetry.lastError = lastError;
         const retryable = [429, 500, 502, 503, 504].includes(response.status);
+        const canFailOver = [401, 402, 403, 429].includes(response.status) && this.activeKeyIndex + 1 < this.apiKeys.length;
+        if (canFailOver) {
+          this.activeKeyIndex += 1;
+          this.apiKey = this.apiKeys[this.activeKeyIndex];
+          this.telemetry.apiKeySource = 'process.env.APOLLO_API_KEY_SECONDARY';
+          this.telemetry.apiKeyLength = this.apiKey.length;
+          continue;
+        }
         if (!retryable || attempt === this.maxRetries) {
           return { ok: false, status: response.status, data: parsedData, statusText: response.statusText, error: lastError, latencyMs };
         }
