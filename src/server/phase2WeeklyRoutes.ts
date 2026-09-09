@@ -35,6 +35,25 @@ function fridaySubmissionWindow(date = new Date()) {
   };
 }
 
+function currentReportingWeek(date = new Date()) {
+  const clock = lagosDateParts(date);
+  const midnight = new Date(`${clock.date}T00:00:00.000Z`);
+  const day = midnight.getUTCDay();
+  const monday = new Date(midnight);
+  monday.setUTCDate(midnight.getUTCDate() + (day === 0 ? -6 : 1 - day));
+  const friday = new Date(monday);
+  friday.setUTCDate(monday.getUTCDate() + 4);
+  return {
+    start: monday.toISOString().slice(0, 10),
+    end: friday.toISOString().slice(0, 10),
+  };
+}
+
+function isCurrentReportingWeek(start: unknown, end: unknown) {
+  const current = currentReportingWeek();
+  return String(start || '') === current.start && String(end || '') === current.end;
+}
+
 function userOf(req: Request): any {
   return (req as any).user || null;
 }
@@ -132,11 +151,9 @@ export function registerPhase2WeeklyRoutes(app: Express, supabase: SupabaseClien
   app.get('/api/weekly-reports/auto-generate', async (req, res) => {
     const user = requireUser(req, res);
     if (!user) return;
-    const weekStartDate = String(req.query.weekStartDate || '');
-    const weekEndDate = String(req.query.weekEndDate || '');
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(weekStartDate) || !/^\d{4}-\d{2}-\d{2}$/.test(weekEndDate)) {
-      return res.status(400).json({ error: 'A valid weekStartDate and weekEndDate are required.' });
-    }
+    const currentWeek = currentReportingWeek();
+    const weekStartDate = currentWeek.start;
+    const weekEndDate = currentWeek.end;
 
     try {
       const [prospectResult, meetingResult, taskResult, activityResult] = await Promise.all([
@@ -202,6 +219,9 @@ export function registerPhase2WeeklyRoutes(app: Express, supabase: SupabaseClien
     if (requestedStatus === 'Submitted' && !fridaySubmissionWindow().allowed) {
       return res.status(409).json({ error: 'Weekly reports can be submitted only on Friday (Africa/Lagos time). You can save and edit the draft until then.' });
     }
+    if (!isCurrentReportingWeek(req.body.weekStartDate, req.body.weekEndDate)) {
+      return res.status(409).json({ error: 'Only the current Monday-to-Friday reporting week can be created, edited or submitted.' });
+    }
 
     let existing: any = null;
     if (req.body.id) {
@@ -258,12 +278,15 @@ export function registerPhase2WeeklyRoutes(app: Express, supabase: SupabaseClien
       return res.status(409).json({ error: 'Weekly reports can be submitted only on Friday (Africa/Lagos time).' });
     }
     const now = new Date().toISOString();
+    const currentWeek = currentReportingWeek();
     const { data, error } = await supabase
       .from('weekly_reports')
       .update({ status: 'Submitted', submitted_at: now, updated_at: now })
       .eq('id', req.params.id)
       .eq('user_id', user.userId)
       .eq('status', 'Draft')
+      .eq('week_start_date', currentWeek.start)
+      .eq('week_end_date', currentWeek.end)
       .select('*')
       .single();
     if (error || !data) return res.status(409).json({ error: 'Only your own draft report can be submitted.' });
