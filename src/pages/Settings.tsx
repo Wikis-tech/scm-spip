@@ -31,6 +31,7 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
   const [logoUrl, setLogoUrl] = useState('');
   const [faviconUrl, setFaviconUrl] = useState('');
   const [appIconUrl, setAppIconUrl] = useState('');
+  const [appIconMessage, setAppIconMessage] = useState('');
 
   React.useEffect(() => {
     if (isAdmin) getSpipBranding().then((branding) => {
@@ -86,20 +87,52 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
     event.target.value = '';
     if (!file) return;
     setMessage('');
-    if (file.type !== 'image/png') return setMessage('Upload the mobile app icon as a square PNG image.');
-    if (file.size > 1024 * 1024) return setMessage('The mobile app icon must be 1 MB or smaller.');
+    setAppIconMessage('');
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
+      setAppIconMessage('Choose a PNG, JPEG or WebP image. SPIP will prepare the required 512 × 512 app icon.');
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setAppIconMessage('The source image must be 5 MB or smaller.');
+      return;
+    }
     setUploadTarget('appIcon');
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 30_000);
     try {
-      const response = await fetch('/api/admin/branding/app-icon', { method: 'POST', headers: { 'Content-Type': file.type }, body: file, signal: controller.signal });
+      const sourceUrl = URL.createObjectURL(file);
+      const image = new Image();
+      try {
+        await new Promise<void>((resolve, reject) => {
+          image.onload = () => resolve();
+          image.onerror = () => reject(new Error('The selected image could not be read.'));
+          image.src = sourceUrl;
+        });
+      } finally {
+        URL.revokeObjectURL(sourceUrl);
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = 512;
+      canvas.height = 512;
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('This browser could not prepare the app icon.');
+      context.clearRect(0, 0, 512, 512);
+      const scale = Math.min(512 / image.naturalWidth, 512 / image.naturalHeight);
+      const width = Math.max(1, Math.round(image.naturalWidth * scale));
+      const height = Math.max(1, Math.round(image.naturalHeight * scale));
+      context.drawImage(image, Math.round((512 - width) / 2), Math.round((512 - height) / 2), width, height);
+      const icon = await new Promise<Blob>((resolve, reject) => canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('The app icon could not be prepared.')), 'image/png'));
+      if (icon.size > 1024 * 1024) throw new Error('The prepared icon is larger than 1 MB. Please use a simpler image.');
+      const response = await fetch('/api/admin/branding/app-icon', { method: 'POST', headers: { 'Content-Type': 'image/png' }, body: icon, signal: controller.signal });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.error || 'Unable to upload the mobile app icon.');
-      setAppIconUrl(payload.appIconUrl);
+      const saved = await getSpipBranding(true);
+      if (!saved.appIconUrl || saved.appIconUrl !== payload.appIconUrl) throw new Error('The uploaded icon could not be confirmed. Please retry.');
+      setAppIconUrl(saved.appIconUrl);
       refreshSpipBranding();
-      setMessage('The mobile app icon has been updated. Existing installations may need to be removed and installed again.');
+      setAppIconMessage('App icon saved successfully. New notifications use it immediately; reinstall an existing phone app to update its home-screen icon.');
     } catch (error: any) {
-      setMessage(error?.name === 'AbortError' ? 'The app-icon upload timed out. Please try again.' : error?.message || 'Unable to upload the mobile app icon.');
+      setAppIconMessage(error?.name === 'AbortError' ? 'The app-icon upload timed out. Please try again.' : error?.message || 'Unable to upload the mobile app icon.');
     } finally {
       window.clearTimeout(timeout);
       setUploadTarget(null);
@@ -345,11 +378,11 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                     <div className="flex h-16 w-16 shrink-0 items-center justify-center overflow-hidden rounded-2xl border border-slate-200 bg-white p-1.5">
                       {appIconUrl ? <img src={appIconUrl} alt="Current mobile app icon" className="h-full w-full rounded-xl object-contain" /> : <ImageIcon className="h-6 w-6 text-slate-300" />}
                     </div>
-                    <div><div className="font-semibold text-slate-900">Mobile app icon</div><p className="mt-1 text-xs leading-5 text-slate-500">Square 512 × 512 PNG used for new Android and iPhone PWA installations. Maximum size: 1 MB.</p></div>
+                    <div><div className="font-semibold text-slate-900">Mobile app icon</div><p className="mt-1 text-xs leading-5 text-slate-500">PNG, JPEG or WebP. SPIP securely prepares a square 512 × 512 PNG for Android, iPhone and notifications.</p>{appIconMessage ? <p role="status" aria-live="polite" className={`mt-2 text-xs font-medium ${appIconUrl && appIconMessage.startsWith('App icon saved') ? 'text-emerald-700' : 'text-red-700'}`}>{appIconMessage}</p> : null}</div>
                   </div>
                   <label className="inline-flex shrink-0 cursor-pointer items-center justify-center gap-2 rounded-lg bg-slate-950 px-4 py-2.5 text-xs font-semibold text-white transition hover:bg-slate-800">
                     <Upload className="h-4 w-4" />{uploadTarget === 'appIcon' ? 'Uploading…' : 'Upload app icon'}
-                    <input type="file" accept="image/png" className="sr-only" disabled={uploadTarget !== null} onChange={uploadAppIcon} />
+                    <input type="file" accept="image/png,image/jpeg,image/webp" className="sr-only" disabled={uploadTarget !== null} onChange={uploadAppIcon} />
                   </label>
                 </div>
               </div>
