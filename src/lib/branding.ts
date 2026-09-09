@@ -18,15 +18,27 @@ let cachedBranding: SpipBranding | null = null;
 let pendingBranding: Promise<SpipBranding> | null = null;
 
 function applyBrowserBranding(branding: SpipBranding) {
-  if (!branding.faviconUrl) return;
-  let favicon = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
-  if (!favicon) {
-    favicon = document.createElement('link');
-    favicon.rel = 'icon';
-    document.head.appendChild(favicon);
+  if (branding.faviconUrl) {
+    let favicon = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
+    if (!favicon) {
+      favicon = document.createElement('link');
+      favicon.rel = 'icon';
+      document.head.appendChild(favicon);
+    }
+    favicon.type = 'image/png';
+    favicon.href = branding.faviconUrl;
   }
-  favicon.type = 'image/png';
-  favicon.href = branding.faviconUrl;
+
+  const installIcon = branding.appIconUrl || branding.faviconUrl;
+  if (installIcon) {
+    let appleIcon = document.querySelector<HTMLLinkElement>('link[rel="apple-touch-icon"]');
+    if (!appleIcon) {
+      appleIcon = document.createElement('link');
+      appleIcon.rel = 'apple-touch-icon';
+      document.head.appendChild(appleIcon);
+    }
+    appleIcon.href = installIcon;
+  }
 }
 
 export async function getSpipBranding(force = false): Promise<SpipBranding> {
