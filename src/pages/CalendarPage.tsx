@@ -19,6 +19,7 @@ import {
   Phone
 } from 'lucide-react';
 import { Meeting, Task, Prospect, UserProfile, Activity as SCMActivity } from '../types';
+import { TimeSelector } from '../components/TimeSelector';
 
 const getLocalDateString = (date: Date): string => {
   const y = date.getFullYear();
@@ -720,16 +721,10 @@ export const CalendarPage: React.FC<CalendarPageProps> = ({
                     />
                   </div>
 
-                  <div className="grid grid-cols-2 gap-3 bg-white">
+                  <div className="grid grid-cols-1 gap-3 bg-white sm:grid-cols-[1.8fr_1fr]">
                     <div className="flex flex-col gap-1">
                       <label className="font-bold text-slate-500 uppercase tracking-wider text-[10px]">Time Slot</label>
-                      <input
-                        type="text"
-                        value={schedData.time}
-                        onChange={(e) => setSchedData({ ...schedData, time: e.target.value })}
-                        placeholder="11:00 AM"
-                        className="w-full bg-slate-50 border border-slate-200 hover:border-slate-300 focus:bg-white focus:border-[#b1191f] focus:ring-1 focus:ring-[#b1191f] rounded-lg p-2.5 outline-none font-semibold text-brand-neutral"
-                      />
+                      <TimeSelector idPrefix="calendar-meeting-time" value={schedData.time} onChange={(time) => setSchedData({ ...schedData, time })} />
                     </div>
 
                     <div className="flex flex-col gap-1">
