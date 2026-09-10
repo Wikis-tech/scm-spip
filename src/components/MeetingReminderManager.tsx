@@ -239,7 +239,17 @@ export const MeetingReminderManager: React.FC<MeetingReminderManagerProps> = ({ 
     meetings.forEach((m) => {
       if (!m.date || !m.time) return;
       
-      const meetingStartTime = new Date(`${m.date}T${m.time}`).getTime();
+      const timeMatch = String(m.time || '').trim().toUpperCase().match(/^(0?[1-9]|1[0-2]):([0-5]\d)\s*(AM|PM)$/);
+      const time24Match = String(m.time || '').trim().match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
+      let canonicalTime = '';
+      if (timeMatch) {
+        let hour = Number(timeMatch[1]) % 12;
+        if (timeMatch[3] === 'PM') hour += 12;
+        canonicalTime = `${String(hour).padStart(2, '0')}:${timeMatch[2]}`;
+      } else if (time24Match) {
+        canonicalTime = `${String(Number(time24Match[1])).padStart(2, '0')}:${time24Match[2]}`;
+      }
+      const meetingStartTime = canonicalTime ? new Date(`${m.date}T${canonicalTime}:00`).getTime() : Number.NaN;
       if (isNaN(meetingStartTime)) return;
 
       const triggers = [

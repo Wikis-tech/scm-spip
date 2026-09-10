@@ -15,6 +15,7 @@ import {
   HelpCircle
 } from 'lucide-react';
 import { Meeting, Prospect, UserProfile } from '../types';
+import { TimeSelector } from '../components/TimeSelector';
 
 interface MeetingsProps {
   meetings: Meeting[];
@@ -291,7 +292,7 @@ export const Meetings: React.FC<MeetingsProps> = ({
               </div>
 
               {/* Date, Time, Duration Row */}
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-[1fr_1.8fr_1fr]">
                 <div className="space-y-1">
                   <label className="font-bold text-slate-700">Date *</label>
                   <input
@@ -305,13 +306,7 @@ export const Meetings: React.FC<MeetingsProps> = ({
 
                 <div className="space-y-1">
                   <label className="font-bold text-slate-700">Time</label>
-                  <input
-                    type="text"
-                    value={formData.time || ''}
-                    placeholder="10:00 AM"
-                    onChange={(e) => setFormData({ ...formData, time: e.target.value })}
-                    className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 outline-none focus:ring-1 focus:ring-primary-brand"
-                  />
+                  <TimeSelector idPrefix="meeting-form-time" value={formData.time} onChange={(time) => setFormData({ ...formData, time })} />
                 </div>
 
                 <div className="space-y-1">

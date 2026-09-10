@@ -5,6 +5,7 @@ import {
   FileDown,
   FileText,
   Mail,
+  Menu,
   MessageSquarePlus,
   Paperclip,
   Search,
@@ -13,6 +14,7 @@ import {
   Trash2,
   Upload,
   Users,
+  X,
 } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { UserProfile } from '../types';
@@ -189,6 +191,7 @@ export const IntelligenceCopilot: React.FC<IntelligenceCopilotProps> = ({ curren
   const [notice, setNotice] = useState('');
   const [providersReady, setProvidersReady] = useState(false);
   const [providers, setProviders] = useState<ProviderStatus[]>([]);
+  const [mobileHistoryOpen, setMobileHistoryOpen] = useState(false);
   const endRef = useRef<HTMLDivElement | null>(null);
   const activeConversationKey = `spip-copilot-active:${currentUser.id}`;
 
@@ -270,6 +273,7 @@ export const IntelligenceCopilot: React.FC<IntelligenceCopilotProps> = ({ curren
     setNotice('');
     setMode('assistant');
     setClassification('INTERNAL');
+    setMobileHistoryOpen(false);
   };
 
   const sendPrompt = async () => {
@@ -394,10 +398,47 @@ export const IntelligenceCopilot: React.FC<IntelligenceCopilotProps> = ({ curren
         </div>
       </aside>
 
+      {mobileHistoryOpen && (
+        <div className="fixed inset-0 z-[70] lg:hidden" role="dialog" aria-modal="true" aria-label="Copilot conversations">
+          <button type="button" aria-label="Close conversation menu" onClick={() => setMobileHistoryOpen(false)} className="absolute inset-0 bg-slate-950/55 backdrop-blur-[1px]" />
+          <aside className="absolute inset-y-0 left-0 flex w-[min(88vw,340px)] flex-col bg-white p-4 shadow-2xl">
+            <div className="mb-4 flex items-center justify-between border-b border-slate-100 pb-3">
+              <div>
+                <h2 className="text-sm font-bold text-slate-900">Copilot conversations</h2>
+                <p className="mt-0.5 text-[10px] text-slate-500">Private to your employee account</p>
+              </div>
+              <button type="button" onClick={() => setMobileHistoryOpen(false)} className="rounded-xl border border-slate-200 p-2 text-slate-600" aria-label="Close conversation menu"><X className="h-4 w-4" /></button>
+            </div>
+            <button type="button" onClick={startNew} className="mb-3 flex w-full items-center justify-center gap-2 rounded-xl bg-[#b1191f] px-3 py-3 text-sm font-semibold text-white hover:bg-[#93151a]">
+              <MessageSquarePlus className="h-4 w-4" /> New conversation
+            </button>
+            <div className="mb-2 px-2 text-[10px] font-bold uppercase tracking-[0.18em] text-slate-400">Private history</div>
+            <div className="min-h-0 flex-1 space-y-1 overflow-y-auto overscroll-contain">
+              {historyLoading && <div className="rounded-xl bg-slate-50 p-3 text-xs text-slate-500">Loading your conversations…</div>}
+              {!historyLoading && conversations.length === 0 && <div className="rounded-xl bg-slate-50 p-3 text-xs text-slate-500">No saved conversations yet.</div>}
+              {conversations.slice(0, 30).map((conversation) => (
+                <div key={conversation.id} className={`flex items-center gap-1 rounded-xl ${conversation.id === conversationId ? 'bg-slate-100' : 'hover:bg-slate-50'}`}>
+                  <button type="button" onClick={async () => { if (await loadConversation(conversation.id)) setMobileHistoryOpen(false); }} className="min-w-0 flex-1 px-3 py-3 text-left">
+                    <div className="truncate text-xs font-medium text-slate-800">{conversation.title || 'Untitled conversation'}</div>
+                    <div className="mt-0.5 text-[10px] uppercase tracking-wide text-slate-400">{conversation.mode || 'assistant'}</div>
+                  </button>
+                  <button type="button" onClick={() => deleteConversation(conversation.id)} title="Delete conversation" aria-label={`Delete ${conversation.title || 'conversation'}`} className="mr-1 rounded-lg p-2 text-slate-400 hover:bg-white hover:text-red-600">
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </aside>
+        </div>
+      )}
+
       <section className="flex min-h-[720px] min-w-0 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
         <header className="border-b border-slate-200 px-4 py-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="flex items-center gap-2.5">
+              <button type="button" onClick={() => setMobileHistoryOpen(true)} className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-700 lg:hidden" aria-label="Open conversation history">
+                <Menu className="h-4 w-4" />
+              </button>
               <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#091b2d] text-white"><Bot className="h-4 w-4" /></div>
               <div>
                 <h2 className="text-base font-bold text-slate-900">SCM Intelligence Copilot</h2>
